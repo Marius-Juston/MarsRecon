@@ -1,0 +1,12 @@
+[project]
+name = "marsrecon"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = "==3.12.*"
+dependencies = [
+    "pdr",
+    "torchgeo>=0.9.0",
+]
+
+[tool.uv.sources]
+pdr = { git = "https://github.com/MillionConcepts/pdr", rev = "develop" }

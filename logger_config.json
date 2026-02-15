@@ -1,0 +1,47 @@
+{
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {
+        "simple": {
+            "format": "%(levelname)-8s - %(message)s"
+        },
+      "detailed": {
+          "format": "%(asctime)s - %(name)s - %(levelname)-8s - %(message)s"
+      }
+    },
+    "filters": {
+        "warnings_and_below": {
+            "()" : "__main__.filter_maker",
+            "level": "WARNING"
+        }
+    },
+    "handlers": {
+        "stdout": {
+            "class": "logging.StreamHandler",
+            "level": "INFO",
+            "formatter": "simple",
+            "stream": "ext://sys.stdout",
+            "filters": ["warnings_and_below"]
+        },
+        "stderr": {
+            "class": "logging.StreamHandler",
+            "level": "ERROR",
+            "formatter": "simple",
+            "stream": "ext://sys.stderr"
+        },
+        "file": {
+            "class": "logging.FileHandler",
+            "formatter": "detailed",
+            "filename": "app.log",
+            "mode": "w"
+        }
+    },
+    "root": {
+        "level": "DEBUG",
+        "handlers": [
+            "stderr",
+            "stdout",
+            "file"
+        ]
+    }
+}
