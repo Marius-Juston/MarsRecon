@@ -10,6 +10,7 @@ import multiprocessing
 import os.path
 import pathlib
 import random
+import shutil
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 
@@ -37,18 +38,34 @@ def filter_maker(level):
     return filter
 
 
+# Define our boundary condition: 100 GB in bytes
+E_MIN_BYTES = 100 * (1024 ** 3)
 
-async def download_file(session, url, path, max_retries=8, base_delay=1.0, max_delay=60.0):
+async def download_file(session, url, path, stop_event, max_retries=8, base_delay=1.0, max_delay=60.0):
     """
     Downloads a file with an Exponential Backoff and Jitter control loop
     to handle 503 and 429 server saturation errors.
     """
+    if stop_event.is_set():
+        return
+
+    disk_usage = shutil.disk_usage(path.parent if path.parent.exists() else "/")
+    if disk_usage.free < E_MIN_BYTES:
+        if not stop_event.is_set():
+            logger.critical(
+                f"CRITICAL: Available disk space {disk_usage.free / (1024 ** 3):.2f}GB fell below threshold. Halting system.")
+            stop_event.set()  # Trip the global kill switch
+        return
+
     if path.exists():
         logger.warning(f"File {path} already exists. Skipping download.")
         return
 
     attempt = 0
     while attempt <= max_retries:
+        if stop_event.is_set():
+            break
+
         try:
             async with session.get(url) as resp:
                 resp.raise_for_status()
@@ -58,6 +75,10 @@ async def download_file(session, url, path, max_retries=8, base_delay=1.0, max_d
 
                 with open(path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(chunk_size):
+                        if stop_event.is_set():
+                            logger.error(f"System halted. Aborting inflight write for {path.name}")
+                            return
+
                         await asyncio.to_thread(f.write, chunk)
 
             # If successful, break the loop and return
@@ -93,19 +114,16 @@ async def download_file(session, url, path, max_retries=8, base_delay=1.0, max_d
             logger.error(f"Max retries ({max_retries}) exhausted for {url}. File skipped.")
 
 
-async def download_many(tasks, concurrency=None):
-    if concurrency is None:
-        concurrency = os.cpu_count()
-
+async def download_many(tasks, concurrency, stop_event):
     connector = aiohttp.TCPConnector(limit=concurrency)
     async with aiohttp.ClientSession(connector=connector) as session:
         await asyncio.gather(
-            *(download_file(session, url, path) for url, path in tasks)
+            *(download_file(session, url, path, stop_event) for url, path in tasks)
         )
 
 
-def worker_process(tasks, concurrency_per_process):
-    asyncio.run(download_many(tasks, concurrency_per_process))
+def worker_process(tasks, concurrency_per_process, stop_event):
+    asyncio.run(download_many(tasks, concurrency_per_process, stop_event))
 
 
 # We want to use
@@ -201,8 +219,9 @@ class MarsHiRISE(NonGeoDataset):
 
         num_cores = multiprocessing.cpu_count()
 
-        active_processes = min(num_cores, 64)
-        concurrency_per_process = 8
+        # Need to finetune for the specific server
+        active_processes = 8
+        concurrency_per_process = 2
 
         chunk_size = (total_tasks + active_processes - 1) // active_processes
         task_chunks = [
@@ -212,14 +231,20 @@ class MarsHiRISE(NonGeoDataset):
 
         logger.info(f"Distributing payload across {active_processes} processes.")
 
+        manager = multiprocessing.Manager()
+        global_stop_event = manager.Event()
+
         with ProcessPoolExecutor(max_workers=active_processes) as executor:
             futures = [
-                executor.submit(worker_process, chunk, concurrency_per_process)
+                executor.submit(worker_process, chunk, concurrency_per_process, global_stop_event)
                 for chunk in task_chunks if chunk
             ]
 
             for future in futures:
                 future.result()
+
+        if global_stop_event.is_set():
+            logger.warning("Download strictly terminated to preserve OS stability.")
 
 
 def setup_logging():
