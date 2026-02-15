@@ -15,6 +15,7 @@ from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 
 import aiohttp
+import pandas as pd
 import pdr
 from aiohttp import ClientResponseError, ClientConnectorError
 from torchgeo.datasets.geo import NonGeoDataset
@@ -40,6 +41,7 @@ def filter_maker(level):
 
 # Define our boundary condition: 100 GB in bytes
 E_MIN_BYTES = 100 * (1024 ** 3)
+
 
 async def download_file(session, url, path, stop_event, max_retries=8, base_delay=1.0, max_delay=60.0):
     """
@@ -152,10 +154,12 @@ class MarsHiRISE(NonGeoDataset):
             self,
             root: Path = '/scratch/mars_hirise',
             split: str = 'train',
+            target: str = None,
             transforms: Callable[[Sample], Sample] | None = None,
             download: bool = False,
             checksum: bool = False,
     ) -> None:
+        self.target = target
         self.root = root
         self.split = split
         self.transforms = transforms
@@ -163,6 +167,7 @@ class MarsHiRISE(NonGeoDataset):
         self.checksum = checksum
 
         self._cache_index_data = None
+        self._filtered_data: pd.DataFrame | None = None
 
         self._verify()
 
@@ -184,6 +189,15 @@ class MarsHiRISE(NonGeoDataset):
 
         self._cache_index_data = data
 
+        self._filtered_data = self._cache_index_data['RDR_INDEX_TABLE']
+
+        if self.target is not None:
+            string_cols = self._filtered_data.select_dtypes(include=["object", "string"])
+            mask = string_cols.apply(
+                lambda col: col.str.contains(self.target, na=False, regex=False, case=False)
+            ).any(axis=1)
+            self._filtered_data = self._filtered_data[mask]
+
     def _download_index(self) -> None:
         for path in [".LBL", ".TAB"]:
             full_name = self.rdr_name + path
@@ -191,7 +205,7 @@ class MarsHiRISE(NonGeoDataset):
             download_url(os.path.join(self.url, "INDEX", full_name), self.root, full_name)
 
     def _get_file_list(self) -> list[str]:
-        return self._cache_index_data['RDR_INDEX_TABLE']["FILE_NAME_SPECIFICATION"]
+        return self._filtered_data["FILE_NAME_SPECIFICATION"]
 
     def build_tasks(self):
         tasks = []
@@ -202,6 +216,8 @@ class MarsHiRISE(NonGeoDataset):
             raw = pathlib.Path(rel[:-suffix])
 
             for suffix in [".JP2", ".LBL"]:
+                # Download only the small metadata for now
+                # for suffix in [".LBL", ]:
                 url = f"{self.url}/{raw}{suffix}"
                 local = pathlib.Path(self.root) / "images" / f"{raw.name}{suffix}"
                 tasks.append((url, local))
@@ -267,7 +283,7 @@ def main():
     # print(data)
     #
     # get_data_column_index = "FILE_NAME_SPECIFICATION"
-    # index_table = data['RDR_INDEX_TABLE']
+    # index_table: pd.DataFrame = data['RDR_INDEX_TABLE']
     #
     # file_names = index_table["FILE_NAME_SPECIFICATION"]
     #
@@ -278,7 +294,9 @@ def main():
     # val = index_table['RATIONALE_DESC'].unique()
     # print(val)
 
-    dataset = MarsHiRISE()
+    keyword = 'Olympus'
+
+    dataset = MarsHiRISE(target=keyword)
 
 
 if __name__ == '__main__':
