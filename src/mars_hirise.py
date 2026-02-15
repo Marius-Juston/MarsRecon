@@ -184,7 +184,7 @@ class MarsHiRISE(NonGeoDataset):
         self._download_images_high_speed()
 
     def _read_index(self):
-        data = pdr.read(f"{self.rdr_name}.LBL")
+        data = pdr.read(os.path.join(self.root, f"{self.rdr_name}.LBL"))
         data.load('all')
 
         self._cache_index_data = data
