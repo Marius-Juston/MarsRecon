@@ -18,15 +18,13 @@ import aiohttp
 import pandas as pd
 import pdr
 from aiohttp import ClientResponseError, ClientConnectorError
-from torchgeo.datasets.geo import NonGeoDataset
+from matplotlib.figure import Figure
+from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import (
     Path,
     Sample,
-    download_url
+    download_url, GeoSlice
 )
-
-from matplotlib.figure import Figure
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +126,8 @@ def worker_process(tasks, concurrency_per_process, stop_event):
 
 
 # We want to use
-#TODO should actually make this into a GeoDataset instead of a NonGeoDataset as an example https://github.com/torchgeo/torchgeo/blob/main/torchgeo/datasets/eddmaps.py
-class MarsHiRISE(NonGeoDataset):
+# TODO should actually make this into a GeoDataset instead of a NonGeoDataset as an example https://github.com/torchgeo/torchgeo/blob/main/torchgeo/datasets/eddmaps.py
+class MarsHiRISE(GeoDataset):
     """Mars HiRISE Experiment Data Records dataset.
 
     HiRISE <https://pds-imaging.jpl.nasa.gov/volumes/mro.html> is a large dataset containing high resolution
@@ -203,7 +201,8 @@ class MarsHiRISE(NonGeoDataset):
             ).any(axis=1)
             self._filtered_data = self._filtered_data[mask]
 
-            logger.info(f"Filtered out to find target {self.target}, final filtered size {self._filtered_data.shape[0]}")
+            logger.info(
+                f"Filtered out to find target {self.target}, final filtered size {self._filtered_data.shape[0]}")
 
     def _download_index(self) -> None:
         for path in [".LBL", ".TAB"]:
@@ -269,8 +268,19 @@ class MarsHiRISE(NonGeoDataset):
         if global_stop_event.is_set():
             logger.warning("Download strictly terminated to preserve OS stability.")
 
-    def __getitem__(self, index: int) -> Sample:
-        raise NotImplementedError() #TODO Do this
+    def __getitem__(self, index: GeoSlice) -> Sample:
+        """Retrieve input, target, and/or metadata indexed by spatiotemporal slice.
+
+        Args:
+            index: [xmin:xmax:xres, ymin:ymax:yres, tmin:tmax:tres] coordinates to index.
+
+        Returns:
+            Sample of input, target, and/or metadata at that index.
+
+        Raises:
+            IndexError: If *index* is not found in the dataset.
+        """
+        raise NotImplementedError()  # TODO Do this
 
     def plot(
             self, sample: Sample, show_titles: bool = True, suptitle: str | None = None
@@ -284,8 +294,6 @@ class MarsHiRISE(NonGeoDataset):
 
         Returns:
             a matplotlib Figure with the rendered sample
-
-        .. versionadded:: 0.2
         """
         # if self.bands == 's2':
         #     image = np.rollaxis(sample['image'][[3, 2, 1]].numpy(), 0, 3)
@@ -316,7 +324,7 @@ class MarsHiRISE(NonGeoDataset):
         # if suptitle is not None:
         #     plt.suptitle(suptitle)
         # return fig
-        raise NotImplementedError() #TODO
+        raise NotImplementedError()  # TODO
 
 
 def setup_logging():
