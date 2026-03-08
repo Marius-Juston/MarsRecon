@@ -141,10 +141,7 @@ class MarsHiRISE(NonGeoDataset):
     """
 
     def __getitem__(self, index: int) -> Sample:
-        pass
-
-    def __len__(self) -> int:
-        pass
+        raise NotImplementedError() #TODO Do this
 
     url = 'https://hirise-pds.lpl.arizona.edu/PDS'
 
@@ -171,6 +168,15 @@ class MarsHiRISE(NonGeoDataset):
 
         self._verify()
 
+    def __len__(self) -> int:
+        """Return the number of data points in the dataset.
+
+        Returns:
+            length of the dataset
+        """
+
+        return self._filtered_data.shape[0]
+
     def _verify(self):
         self._download()
 
@@ -191,12 +197,16 @@ class MarsHiRISE(NonGeoDataset):
 
         self._filtered_data = self._cache_index_data['RDR_INDEX_TABLE']
 
+        logger.info(f"Loaded all cumulative data of size {self._filtered_data.shape[0]}")
+
         if self.target is not None:
             string_cols = self._filtered_data.select_dtypes(include=["object", "string"])
             mask = string_cols.apply(
                 lambda col: col.str.contains(self.target, na=False, regex=False, case=False)
             ).any(axis=1)
             self._filtered_data = self._filtered_data[mask]
+
+            logger.info(f"Filtered out to find target {self.target}, final filtered size {self._filtered_data.shape[0]}")
 
     def _download_index(self) -> None:
         for path in [".LBL", ".TAB"]:
