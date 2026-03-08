@@ -4,9 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = "==3.12.*"
 dependencies = [
-    "pdr",
+    "pandas-stubs>=3.0.0.260204",
+    "pdr>=1.4.1",
     "torchgeo>=0.9.0",
 ]
-
-[tool.uv.sources]
-pdr = { git = "https://github.com/MillionConcepts/pdr", rev = "develop" }
