@@ -132,6 +132,7 @@ def worker_process(tasks, concurrency_per_process, stop_event):
 
 
 # We want to use
+#TODO should actually make this into a GeoDataset instead ofa NonGeoDataset as an example https://github.com/torchgeo/torchgeo/blob/main/torchgeo/datasets/eddmaps.py
 class MarsHiRISE(NonGeoDataset):
     """Mars HiRISE Experiment Data Records dataset.
 
