@@ -25,6 +25,9 @@ from torchgeo.datasets.utils import (
     download_url
 )
 
+from matplotlib.figure import Figure
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 CONFIG = 'logger_config.json'
@@ -139,9 +142,6 @@ class MarsHiRISE(NonGeoDataset):
 
     Further description of the dataset is located in <https://hirise-pds.lpl.arizona.edu/PDS/AAREADME.TXT>
     """
-
-    def __getitem__(self, index: int) -> Sample:
-        raise NotImplementedError() #TODO Do this
 
     url = 'https://hirise-pds.lpl.arizona.edu/PDS'
 
@@ -271,6 +271,55 @@ class MarsHiRISE(NonGeoDataset):
 
         if global_stop_event.is_set():
             logger.warning("Download strictly terminated to preserve OS stability.")
+
+    def __getitem__(self, index: int) -> Sample:
+        raise NotImplementedError() #TODO Do this
+
+    def plot(
+            self, sample: Sample, show_titles: bool = True, suptitle: str | None = None
+    ) -> Figure:
+        """Plot a sample from the dataset.
+
+        Args:
+            sample: a sample returned by :meth:`__getitem__`
+            show_titles: flag indicating whether to show titles above each panel
+            suptitle: optional string to use as a suptitle
+
+        Returns:
+            a matplotlib Figure with the rendered sample
+
+        .. versionadded:: 0.2
+        """
+        # if self.bands == 's2':
+        #     image = np.rollaxis(sample['image'][[3, 2, 1]].numpy(), 0, 3)
+        #     image = np.clip(image / 2000, 0, 1)
+        # elif self.bands == 'all':
+        #     image = np.rollaxis(sample['image'][[5, 4, 3]].numpy(), 0, 3)
+        #     image = np.clip(image / 2000, 0, 1)
+        # elif self.bands == 's1':
+        #     image = sample['image'][0].numpy()
+        #
+        # label_mask = sample['label'].numpy().astype(np.bool_)
+        # labels = self._onehot_labels_to_names(label_mask)
+        #
+        # showing_predictions = 'prediction' in sample
+        # if showing_predictions:
+        #     prediction_mask = sample['prediction'].numpy().astype(np.bool_)
+        #     predictions = self._onehot_labels_to_names(prediction_mask)
+        #
+        # fig, ax = plt.subplots(figsize=(4, 4))
+        # ax.imshow(image)
+        # ax.axis('off')
+        # if show_titles:
+        #     title = f'Labels: {", ".join(labels)}'
+        #     if showing_predictions:
+        #         title += f'\nPredictions: {", ".join(predictions)}'
+        #     ax.set_title(title)
+        #
+        # if suptitle is not None:
+        #     plt.suptitle(suptitle)
+        # return fig
+        raise NotImplementedError() #TODO
 
 
 def setup_logging():
