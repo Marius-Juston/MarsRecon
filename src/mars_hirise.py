@@ -42,15 +42,11 @@ def filter_maker(level):
     return filter
 
 
-# Define our boundary condition: 100 GB in bytes
+# Define our minimum disk size: 100 GB in bytes
 E_MIN_BYTES = 100 * (1024 ** 3)
 
 
 async def download_file(session, url, path, stop_event, max_retries=8, base_delay=1.0, max_delay=60.0):
-    """
-    Downloads a file with an Exponential Backoff and Jitter control loop
-    to handle 503 and 429 server saturation errors.
-    """
     if stop_event.is_set():
         return
 
@@ -132,6 +128,7 @@ def worker_process(tasks, concurrency_per_process, stop_event):
 
 
 # We want to use
+#TODO should actually make this into a GeoDataset instead of a NonGeoDataset as an example https://github.com/torchgeo/torchgeo/blob/main/torchgeo/datasets/eddmaps.py
 class MarsHiRISE(NonGeoDataset):
     """Mars HiRISE Experiment Data Records dataset.
 
