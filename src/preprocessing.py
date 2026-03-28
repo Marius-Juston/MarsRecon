@@ -350,6 +350,7 @@ def convert_all(
         max_workers=actual_workers,
         mp_context=multiprocessing.get_context("spawn"),
         initializer=_worker_init,
+        max_tasks_per_child=1,  # fresh process per JP2 — OS reclaims all heap
     )
     future_to_path = {
         pool.submit(jp2_to_cog, p, overwrite): p for p in jp2_files
