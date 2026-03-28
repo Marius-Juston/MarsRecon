@@ -36,6 +36,7 @@ from matplotlib.patches import Patch, Rectangle
 from pyproj import CRS
 from rasterio.enums import Resampling
 from rasterio.warp import reproject, transform_bounds
+from shapely import MultiPoint
 from shapely.geometry import Polygon, box
 from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
@@ -576,7 +577,7 @@ class MarsHiRISE(GeoDataset):
         if img_out.ndim == 3:
             for c in range(img_out.shape[2]):
                 band = img_out[..., c]
-                data_pixels = band[band > 0]
+                data_pixels = band[band > 1e-6]
                 if len(data_pixels) > 0:
                     p2, p98 = np.percentile(data_pixels, [2, 98])
                     if p98 > p2:
@@ -750,6 +751,99 @@ class MarsHiRISE(GeoDataset):
     # Spatial index
     # ------------------------------------------------------------------
 
+    def _extract_data_footprint(
+            self,
+            jp2_path: pathlib.Path,
+    ) -> "Polygon | None":
+        """Return the convex hull of non-zero pixels in *jp2_path*.
+
+        Reads at the coarsest available overview level so even multi-GB
+        images resolve to a few hundred pixels.  The convex hull is
+        computed in pixel coordinates (cheap) then only the hull vertices
+        are reprojected to the dataset's geographic CRS.
+
+        Returns ``None`` if the file cannot be opened or contains no data.
+        """
+        from rasterio.warp import transform as warp_transform
+
+        path = self._prefer_cog(jp2_path)
+        if path is None or not path.exists():
+            return None
+
+        dst_crs = rasterio.crs.CRS.from_user_input(self.mars_crs)
+
+        try:
+            with rasterio.open(path) as src:
+                src_crs = src.crs
+                if src_crs is None:
+                    return None
+
+                # Pick the coarsest overview — or downsample manually.
+                overviews = src.overviews(1)  # list of reduction factors
+                if overviews:
+                    factor = max(overviews)
+                else:
+                    # No overviews (raw JP2) — target ~500 px on the
+                    # shorter axis so we don't decompress the full image.
+                    factor = max(1, min(src.height, src.width) // 500)
+
+                out_h = max(1, src.height // factor)
+                out_w = max(1, src.width // factor)
+
+                # Read a single band at reduced resolution.
+                data = src.read(1, out_shape=(out_h, out_w))
+
+                # Non-zero pixel coordinates.
+                ys, xs = np.where(data > 0)
+                if len(xs) < 3:
+                    return None
+
+                # ── Convex hull in pixel space (fast) ─────────────────
+                # Subsample to at most ~4000 points for the hull input;
+                # shapely's convex_hull is O(n log n) so this is fine.
+                step = max(1, len(xs) // 4000)
+                xs_sub = xs[::step]
+                ys_sub = ys[::step]
+
+                hull_shapely = MultiPoint(
+                    list(zip(xs_sub.tolist(), ys_sub.tolist()))
+                ).convex_hull
+
+                if hull_shapely.is_empty:
+                    return None
+
+                # Extract hull vertices (typically 4–20 points).
+                hull_px = np.array(hull_shapely.exterior.coords)
+                hx = hull_px[:, 0]  # pixel x (column)
+                hy = hull_px[:, 1]  # pixel y (row)
+
+                # ── Pixel → source CRS ───────────────────────────────
+                # Build an affine for the reduced-resolution grid.
+                ovr_transform = rasterio.transform.from_bounds(
+                    *src.bounds, out_w, out_h
+                )
+                # rasterio.transform.xy wants (row, col)
+                src_xs, src_ys = rasterio.transform.xy(
+                    ovr_transform, hy.tolist(), hx.tolist()
+                )
+
+                # ── Source CRS → geographic CRS ──────────────────────
+                geo_xs, geo_ys = warp_transform(
+                    src_crs, dst_crs, list(src_xs), list(src_ys)
+                )
+
+                # Normalise longitudes to [−180, 180].
+                geo_xs = [((x + 180.0) % 360.0) - 180.0 for x in geo_xs]
+
+                footprint = Polygon(zip(geo_xs, geo_ys))
+                if not footprint.is_valid:
+                    footprint = footprint.buffer(0)
+                return footprint if (footprint.is_valid and not footprint.is_empty) else None
+
+        except Exception as exc:
+            logger.debug("Could not extract footprint from %s: %s", jp2_path, exc)
+            return None
+
     @property
     def spatial_index_cache(self) -> pathlib.Path:
         parts = []
@@ -758,8 +852,8 @@ class MarsHiRISE(GeoDataset):
         if self.bbox:
             parts.append(f"{self.bbox[0]}_{self.bbox[1]}_{self.bbox[2]}_{self.bbox[3]}")
         suffix = f"_{'_'.join(parts)}" if parts else ""
-        # v2: added JP2-bounds intersection for accurate strip footprints.
-        return self.root / f"spatial_cache{suffix}_v2.gpkg"
+        # v3: actual strip footprint from JP2 pixel data.
+        return self.root / f"spatial_cache{suffix}_v3.gpkg"
 
     def _build_spatial_index(self, force_rebuild: bool = False) -> None:
         """Build the GeoDataFrame spatial index from the cumulative PDS index.
@@ -843,62 +937,31 @@ class MarsHiRISE(GeoDataset):
                 red_rows.iloc[0]["_local_path"] if not red_rows.empty else None
             )
 
-            # ----------------------------------------------------------------
-            # Geometry resolution:
-            #
-            # The most accurate footprint is the INTERSECTION of the corners
-            # polygon (which gives the correct parallelogram shape of the strip)
-            # and the JP2 bounds (which reflect exactly what rasterio can read).
-            # Using only the corners polygon caused IndexErrors because the
-            # cumulative index corner coordinates can extend slightly beyond the
-            # JP2's actual reprojected bounds, leading the sampler to generate
-            # patch centres that the early-exit check in _load_from_jp2 rejects.
-            #
-            # Priority:
-            #   A. corners polygon ∩ JP2 bbox  ← ideal (both sources available)
-            #   B. JP2 bbox alone              ← no corners in index
-            #   C. corners polygon alone       ← JP2 not yet downloaded
-            #   D. cumulative-index min/max    ← last resort
-            # ----------------------------------------------------------------
-            corners_geom = _corners_to_polygon(ref)
+            geom = None
 
-            file_bounds = None
+            # Try the primary JP2 file (COLOR first, RED as fallback).
             for p in (color_path, red_path):
                 if p is not None:
-                    file_bounds = self._read_jp2_bounds(pathlib.Path(p))
-                    if file_bounds is not None:
+                    footprint = self._extract_data_footprint(pathlib.Path(p))
+                    if footprint is not None:
+                        geom = footprint
+                        n_polygon += 1
                         break
 
-            if file_bounds is not None:
-                jp2_bbox = box(*file_bounds)
-                if corners_geom is not None:
-                    try:
-                        candidate = corners_geom.intersection(jp2_bbox)
-                        if (
-                                not candidate.is_empty
-                                and candidate.is_valid
-                                and candidate.area > 1e-12
-                        ):
-                            geom = candidate  # Case A
-                        else:
-                            geom = jp2_bbox  # intersection degenerate → Case B
-                    except Exception:
-                        geom = jp2_bbox  # Case B
-                else:
-                    geom = jp2_bbox  # Case B
-                n_polygon += 1
-            elif corners_geom is not None:
-                geom = corners_geom  # Case C — JP2 not downloaded yet
-                n_polygon += 1
-            else:
-                # Case D: cumulative index min/max bbox
-                logger.warning(
-                    "No corner data or JP2 bounds for %s; using index bbox.",
-                    obs_id,
-                )
+            # Case B: JP2 exists but footprint extraction failed.
+            if geom is None:
+                for p in (color_path, red_path):
+                    if p is not None:
+                        file_bounds = self._read_jp2_bounds(pathlib.Path(p))
+                        if file_bounds is not None:
+                            geom = box(*file_bounds)
+                            n_jp2_bbox += 1
+                            break
+
+            # Case C: no JP2 available — cumulative index bbox.
+            if geom is None:
                 lon_min = ((float(ref["MINIMUM_LONGITUDE"]) + 180.0) % 360.0) - 180.0
                 lon_max = ((float(ref["MAXIMUM_LONGITUDE"]) + 180.0) % 360.0) - 180.0
-
                 if lon_min > lon_max:
                     logger.warning(
                         "Observation %s straddles antimeridian. Skipping.", obs_id
@@ -1233,9 +1296,13 @@ class MarsHiRISE(GeoDataset):
                             jp2_path.name, band_idx, exc,
                         )
                         continue
+                    nodata_mask = dest == 0.0
+
                     dest *= meta.scaling_factor
                     dest += meta.offset
                     np.clip(dest, 0.0, 1.0, out=dest)
+                    dest[nodata_mask] = 0.0
+
                     result[ch_name] = dest
 
         except rasterio.errors.RasterioIOError as exc:
