@@ -115,7 +115,7 @@ The dataset transparently prefers `.tif` COG sidecars when they exist alongside 
 
 ```bash
 # Generate coverage map + sample patches (saves to Figures/)
-uv run python src/temp.py
+uv run python src/mars_hirise.py
 ```
 
 ## Tests
@@ -169,13 +169,13 @@ The file uses **synthetic data only** — no real HiRISE files are required.
 
 ## Architecture
 
-| File | Purpose |
-|---|---|
-| `src/temp.py` | `MarsHiRISE` — main `GeoDataset` subclass; index loading, spatial index, tile loading, radiometric calibration |
+| File                    | Purpose |
+|-------------------------|---|
+| `src/mars_hirise.py`    | `MarsHiRISE` — main `GeoDataset` subclass; index loading, spatial index, tile loading, radiometric calibration |
 | `src/hirise_sampler.py` | `HiRISEGeoSampler` — strip-polygon-aware geospatial sampler |
-| `src/preprocessing.py` | JP2 → COG conversion pipeline; geographic train/test split |
-| `tests/conftest.py` | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
-| `tests/helpers.py` | `make_mock_dataset()` — minimal GeoSampler-compatible mock |
+| `src/preprocessing.py`  | JP2 → COG conversion pipeline; geographic train/test split |
+| `tests/conftest.py`     | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
+| `tests/helpers.py`      | `make_mock_dataset()` — minimal GeoSampler-compatible mock |
 
 ### CRS design
 
