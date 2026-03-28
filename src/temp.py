@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import logging.config
+import math
 import multiprocessing
 import pathlib
 import random
@@ -35,11 +36,11 @@ from matplotlib.patches import Patch, Rectangle
 from pyproj import CRS
 from rasterio.enums import Resampling
 from rasterio.warp import reproject, transform_bounds
-from shapely.geometry import box
+from shapely.geometry import Polygon, box
 from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import GeoSlice, Path, Sample, download_url
-from torchgeo.samplers import GridGeoSampler, RandomBatchGeoSampler, Units
+from torchgeo.samplers import Units
 
 logger = logging.getLogger(__name__)
 
@@ -189,21 +190,52 @@ async def _download_file(
         logger.debug("Already downloaded, skipping: %s", path)
         return
 
+    # Write to a hidden temp file in the same directory; rename to the final
+    # path only on success.  This makes the download atomic: a partial file
+    # from a previous interrupted run is invisible to the "already exists"
+    # guard above and is simply overwritten on the next attempt.
+    tmp_path = path.with_name(f".tmp.{path.name}")
+
     for attempt in range(max_retries + 1):
         if stop_event.is_set():
             return
         try:
             async with session.get(url) as resp:
                 resp.raise_for_status()
+                expected_bytes: int | None = None
+                cl = resp.headers.get("Content-Length")
+                if cl is not None:
+                    try:
+                        expected_bytes = int(cl)
+                    except ValueError:
+                        pass
+
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "wb") as fh:
+                bytes_written = 0
+                with open(tmp_path, "wb") as fh:
                     async for chunk in resp.content.iter_chunked(1 << 20):
                         if stop_event.is_set():
                             logger.error("Halted mid-write: %s", path.name)
+                            tmp_path.unlink(missing_ok=True)
                             return
                         await asyncio.to_thread(fh.write, chunk)
-            return
+                        bytes_written += len(chunk)
+
+                # Validate Content-Length if the server provided one.
+                if expected_bytes is not None and bytes_written != expected_bytes:
+                    logger.warning(
+                        "Truncated response for %s: expected %d bytes, got %d. "
+                        "Will retry.",
+                        path.name, expected_bytes, bytes_written,
+                    )
+                    tmp_path.unlink(missing_ok=True)
+                    # Treat as a retriable error — fall through to back-off.
+                else:
+                    tmp_path.rename(path)
+                    return
+
         except ClientResponseError as exc:
+            tmp_path.unlink(missing_ok=True)
             if exc.status in {429, 503, 504}:
                 logger.warning(
                     "Server saturated (%s) for %s. Attempt %d/%d.",
@@ -213,11 +245,13 @@ async def _download_file(
                 logger.error("Fatal HTTP %s for %s: %s", exc.status, url, exc.message)
                 return
         except (ClientConnectorError, asyncio.TimeoutError) as exc:
+            tmp_path.unlink(missing_ok=True)
             logger.warning(
                 "Connection error for %s. Attempt %d/%d. %s",
                 url, attempt + 1, max_retries, exc,
             )
         except Exception as exc:  # noqa: BLE001
+            tmp_path.unlink(missing_ok=True)
             logger.error("Unexpected failure downloading %s: %s", url, exc)
             return
 
@@ -247,6 +281,49 @@ def _worker_process(
         stop_event: threading.Event,
 ) -> None:
     asyncio.run(_download_many(tasks, concurrency_per_process, stop_event))
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Tolerance (degrees) added to the JP2 bounds early-exit check in
+# _load_from_jp2.  Absorbs floating-point rounding between the index geometry
+# (computed at dataset construction time) and the bounds rasterio reports at
+# load time.  1e-5° ≈ 0.6 m on Mars — far below HiRISE pixel size (~0.25 m).
+_SPATIAL_TOL: float = 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+
+def _corners_to_polygon(row: "pd.Series") -> Polygon | None:
+    """Build a Shapely Polygon from CORNER1-4 lat/lon columns in *row*.
+
+    Longitudes are normalised from the PDS [0°, 360°] convention to
+    [−180°, 180°].  Returns ``None`` if any coordinate is NaN, a column is
+    missing, or the resulting polygon is degenerate.
+    """
+    try:
+        coords = [
+            (
+                ((float(row[f"CORNER{i}_LONGITUDE"]) + 180.0) % 360.0) - 180.0,
+                float(row[f"CORNER{i}_LATITUDE"]),
+            )
+            for i in (1, 2, 3, 4)
+        ]
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    if any(math.isnan(lon) or math.isnan(lat) for lon, lat in coords):
+        return None
+
+    poly = Polygon(coords)
+    if not poly.is_valid:
+        poly = poly.buffer(0)  # standard fix for self-intersecting rings
+    return poly if (poly.is_valid and not poly.is_empty) else None
 
 
 # ---------------------------------------------------------------------------
@@ -434,17 +511,12 @@ class MarsHiRISE(GeoDataset):
 
         tiles: list[torch.Tensor] = []
         for _, row in candidates.iterrows():
+            # GeoPackage stores None as NaN on round-trip; guard against both.
+            cp = row["color_path"]
+            rp = row["red_path"]
             tile = self._load_tile(
-                color_path=(
-                    pathlib.Path(row["color_path"])
-                    if row["color_path"] is not None
-                    else None
-                ),
-                red_path=(
-                    pathlib.Path(row["red_path"])
-                    if row["red_path"] is not None
-                    else None
-                ),
+                color_path=pathlib.Path(cp) if isinstance(cp, str) else None,
+                red_path=pathlib.Path(rp) if isinstance(rp, str) else None,
                 x=x,
                 y=y,
             )
@@ -480,9 +552,20 @@ class MarsHiRISE(GeoDataset):
         ch = self.channels
         if set(ch) >= {"NEAR-INFRARED", "RED", "BLUE-GREEN"}:
             idx = [ch.index("NEAR-INFRARED"), ch.index("RED"), ch.index("BLUE-GREEN")]
-            img_np = image[idx].permute(1, 2, 0).numpy()
-            cmap = None
-            title = "MarsHiRISE — false colour (NIR→R, RED→G, BG→B)"
+            rgb = image[idx]
+            # If only one channel has non-zero data (e.g. COLOR file absent),
+            # fall back to grayscale rather than a misleadingly coloured render.
+            nonzero = [(rgb[i] > 0).any().item() for i in range(3)]
+            if sum(nonzero) == 1:
+                active_i = nonzero.index(True)
+                active_name = ["NEAR-INFRARED", "RED", "BLUE-GREEN"][active_i]
+                img_np = rgb[active_i].numpy()
+                cmap = "grey"
+                title = f"MarsHiRISE — {active_name} (COLOR file unavailable)"
+            else:
+                img_np = rgb.permute(1, 2, 0).numpy()
+                cmap = None
+                title = "MarsHiRISE — false colour (NIR→R, RED→G, BG→B)"
         else:
             img_np = image[0].numpy()
             cmap = "grey"
@@ -675,7 +758,8 @@ class MarsHiRISE(GeoDataset):
         if self.bbox:
             parts.append(f"{self.bbox[0]}_{self.bbox[1]}_{self.bbox[2]}_{self.bbox[3]}")
         suffix = f"_{'_'.join(parts)}" if parts else ""
-        return self.root / f"spatial_cache{suffix}.gpkg"
+        # v2: added JP2-bounds intersection for accurate strip footprints.
+        return self.root / f"spatial_cache{suffix}_v2.gpkg"
 
     def _build_spatial_index(self, force_rebuild: bool = False) -> None:
         """Build the GeoDataFrame spatial index from the cumulative PDS index.
@@ -684,36 +768,52 @@ class MarsHiRISE(GeoDataset):
         :attr:`index` represents one unique observation and carries both
         ``color_path`` and ``red_path`` (either may be ``None`` if absent).
 
-        Geometries are degree-valued bounding boxes with :attr:`mars_crs`
-        (geographic degrees).  Longitudes are normalised from [0°, 360°] to
-        [−180°, 180°]; antimeridian-crossing tiles are skipped.
+        Geometries are degree-valued strip polygons built from the four corner
+        coordinates (CORNER1-4) in the cumulative index.  This accurately
+        represents the long, thin, rotated parallelogram of each HiRISE pass
+        and avoids sampling patches in the empty corners of the bounding box.
+        Falls back to JP2-derived bounds, then to cumulative-index min/max
+        bounds (as an axis-aligned rectangle), when corner data are unavailable.
+
+        Longitudes are normalised from [0°, 360°] to [−180°, 180°];
+        antimeridian-crossing tiles are skipped.
         """
         if self.reuse_cache and not force_rebuild and self.spatial_index_cache.exists() and self.index is None:
-            logger.info(f"Loading spatial index from cache ({self.spatial_index_cache}).")
+            logger.info("Loading spatial index from cache (%s).", self.spatial_index_cache)
 
             gdf = gpd.read_file(self.spatial_index_cache)
-            t_start = pd.to_datetime(gdf.pop("t_start"), utc=True)
-            t_stop = pd.to_datetime(gdf.pop("t_stop"), utc=True)
-            gdf.index = pd.IntervalIndex.from_arrays(
-                t_start, t_stop, closed="both", name="datetime"
-            )
-            self.index = gdf
 
-            bounds = self.index['geometry'].bounds
+            # Detect legacy bbox-only cache (all geometries are axis-aligned
+            # rectangles).  If so, fall through to rebuild with polygon footprints.
+            sample_geoms = gdf.geometry.iloc[: min(5, len(gdf))]
+            is_legacy = all(g.equals(box(*g.bounds)) for g in sample_geoms)
+            if is_legacy:
+                logger.info(
+                    "Legacy axis-aligned-bbox cache detected at %s; rebuilding "
+                    "with strip polygon footprints.",
+                    self.spatial_index_cache,
+                )
+            else:
+                t_start = pd.to_datetime(gdf.pop("t_start"), utc=True)
+                t_stop = pd.to_datetime(gdf.pop("t_stop"), utc=True)
+                gdf.index = pd.IntervalIndex.from_arrays(
+                    t_start, t_stop, closed="both", name="datetime"
+                )
+                self.index = gdf
 
-            minx, miny = bounds[['minx', 'miny']].min()
-            maxx, maxy = bounds[['maxx', 'maxy']].max()
+                bounds = self.index["geometry"].bounds
+                minx, miny = bounds[["minx", "miny"]].min()
+                maxx, maxy = bounds[["maxx", "maxy"]].max()
 
-            logger.info(
-                "Spatial index: %d observations, lon [%.2f, %.2f] lat [%.2f, %.2f].",
-                len(self.index),
-                minx,
-                maxx,
-                miny,
-                maxy
-            )
-
-            return
+                logger.info(
+                    "Spatial index: %d observations, lon [%.2f, %.2f] lat [%.2f, %.2f].",
+                    len(self.index),
+                    minx,
+                    maxx,
+                    miny,
+                    maxy,
+                )
+                return
 
         df = self._raw_index.copy()
 
@@ -727,6 +827,9 @@ class MarsHiRISE(GeoDataset):
         )
 
         records: list[dict] = []
+        n_polygon = 0
+        n_jp2_bbox = 0
+        n_index_bbox = 0
         for obs_id, grp in df.groupby("_obs_id", sort=False):
             ref = grp.iloc[0]
 
@@ -740,6 +843,25 @@ class MarsHiRISE(GeoDataset):
                 red_rows.iloc[0]["_local_path"] if not red_rows.empty else None
             )
 
+            # ----------------------------------------------------------------
+            # Geometry resolution:
+            #
+            # The most accurate footprint is the INTERSECTION of the corners
+            # polygon (which gives the correct parallelogram shape of the strip)
+            # and the JP2 bounds (which reflect exactly what rasterio can read).
+            # Using only the corners polygon caused IndexErrors because the
+            # cumulative index corner coordinates can extend slightly beyond the
+            # JP2's actual reprojected bounds, leading the sampler to generate
+            # patch centres that the early-exit check in _load_from_jp2 rejects.
+            #
+            # Priority:
+            #   A. corners polygon ∩ JP2 bbox  ← ideal (both sources available)
+            #   B. JP2 bbox alone              ← no corners in index
+            #   C. corners polygon alone       ← JP2 not yet downloaded
+            #   D. cumulative-index min/max    ← last resort
+            # ----------------------------------------------------------------
+            corners_geom = _corners_to_polygon(ref)
+
             file_bounds = None
             for p in (color_path, red_path):
                 if p is not None:
@@ -748,37 +870,60 @@ class MarsHiRISE(GeoDataset):
                         break
 
             if file_bounds is not None:
-                lon_min, lat_min, lon_max, lat_max = file_bounds
+                jp2_bbox = box(*file_bounds)
+                if corners_geom is not None:
+                    try:
+                        candidate = corners_geom.intersection(jp2_bbox)
+                        if (
+                                not candidate.is_empty
+                                and candidate.is_valid
+                                and candidate.area > 1e-12
+                        ):
+                            geom = candidate  # Case A
+                        else:
+                            geom = jp2_bbox  # intersection degenerate → Case B
+                    except Exception:
+                        geom = jp2_bbox  # Case B
+                else:
+                    geom = jp2_bbox  # Case B
+                n_polygon += 1
+            elif corners_geom is not None:
+                geom = corners_geom  # Case C — JP2 not downloaded yet
+                n_polygon += 1
             else:
+                # Case D: cumulative index min/max bbox
                 logger.warning(
-                    f"Unable to find the specific .LBL file for the observation {color_path} or {red_path}. Lat / long will be inaccurate.")
-
-                # Fall back to cumulative index coords (may be inaccurate)
-                lon_min = float(ref["MINIMUM_LONGITUDE"])
-                lon_max = float(ref["MAXIMUM_LONGITUDE"])
-
-                lon_min = ((lon_min + 180.0) % 360.0) - 180.0
-                lon_max = ((lon_max + 180.0) % 360.0) - 180.0
+                    "No corner data or JP2 bounds for %s; using index bbox.",
+                    obs_id,
+                )
+                lon_min = ((float(ref["MINIMUM_LONGITUDE"]) + 180.0) % 360.0) - 180.0
+                lon_max = ((float(ref["MAXIMUM_LONGITUDE"]) + 180.0) % 360.0) - 180.0
 
                 if lon_min > lon_max:
-                    logger.warning("Observation %s straddles antimeridian. Skipping.", obs_id)
+                    logger.warning(
+                        "Observation %s straddles antimeridian. Skipping.", obs_id
+                    )
                     continue
                 lat_min = float(ref["MINIMUM_LATITUDE"])
                 lat_max = float(ref["MAXIMUM_LATITUDE"])
+                geom = box(lon_min, lat_min, lon_max, lat_max)
+                n_index_bbox += 1
 
             records.append(
                 {
                     "obs_id": str(obs_id),
                     "color_path": color_path,
                     "red_path": red_path,
-                    "lon_min": lon_min,
-                    "lon_max": lon_max,
-                    "lat_min": lat_min,
-                    "lat_max": lat_max,
+                    "geometry": geom,
                     "t_start": ref["START_TIME"],
                     "t_stop": ref["STOP_TIME"],
                 }
             )
+
+        logger.info(
+            "Footprint sources — polygon: %d, JP2 bbox: %d, index bbox: %d.",
+            n_polygon, n_jp2_bbox, n_index_bbox,
+        )
 
         obs_df = pd.DataFrame(records)
         if obs_df.empty:
@@ -788,14 +933,7 @@ class MarsHiRISE(GeoDataset):
         t_stop = pd.to_datetime(obs_df["t_stop"], utc=True, errors="coerce")
         t_stop = t_stop.fillna(t_start)
 
-        # Degree-valued geometries paired with the geographic CRS.
-        geometries = gpd.GeoSeries(
-            [
-                box(r.lon_min, r.lat_min, r.lon_max, r.lat_max)
-                for r in obs_df.itertuples()
-            ],
-            crs=self.mars_crs,
-        )
+        geometries = gpd.GeoSeries(obs_df["geometry"].tolist(), crs=self.mars_crs)
 
         self.index = gpd.GeoDataFrame(
             {
@@ -810,13 +948,16 @@ class MarsHiRISE(GeoDataset):
             crs=self.mars_crs,
         )
 
+        total_bounds = self.index["geometry"].bounds
+        minx, miny = total_bounds[["minx", "miny"]].min()
+        maxx, maxy = total_bounds[["maxx", "maxy"]].max()
         logger.info(
             "Spatial index: %d observations, lon [%.2f, %.2f] lat [%.2f, %.2f].",
             len(self.index),
-            obs_df["lon_min"].min(),
-            obs_df["lon_max"].max(),
-            obs_df["lat_min"].min(),
-            obs_df["lat_max"].max(),
+            minx,
+            maxx,
+            miny,
+            maxy,
         )
 
     def _read_jp2_bounds(
@@ -905,6 +1046,21 @@ class MarsHiRISE(GeoDataset):
     # Tile loading
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _prefer_cog(path: pathlib.Path | None) -> pathlib.Path | None:
+        """Return the COG sidecar (.tif) for *path* if it exists, else *path* itself.
+
+        When preprocessing.py converts JP2 files to Cloud-Optimized GeoTIFFs,
+        it creates a sidecar ``<stem>.tif`` next to the original JP2.  Loading
+        from the COG is significantly faster for small random-access patches
+        because its internal 512×512 tiling avoids decompressing large JP2
+        codeblocks.
+        """
+        if path is None:
+            return None
+        cog = path.with_suffix(".tif")
+        return cog if cog.exists() else path
+
     def _load_tile(
             self,
             color_path: pathlib.Path | None,
@@ -913,6 +1069,10 @@ class MarsHiRISE(GeoDataset):
             y: slice,
     ) -> torch.Tensor | None:
         """Load and assemble the requested channels from one observation."""
+        # Prefer pre-converted COG sidecars for faster windowed reads.
+        color_path = self._prefer_cog(color_path)
+        red_path = self._prefer_cog(red_path)
+
         requested = set(self.channels)
         color_available = color_path is not None and color_path.exists()
         red_available = red_path is not None and red_path.exists()
@@ -970,12 +1130,20 @@ class MarsHiRISE(GeoDataset):
         if not band_arrays:
             return None
 
-        tensors = [
-            torch.from_numpy(band_arrays[ch])
-            for ch in self.channels
-            if ch in band_arrays
-        ]
-        return torch.stack(tensors, dim=0) if tensors else None
+        # Determine output spatial shape from first loaded band.
+        first = next(iter(band_arrays.values()))
+        out_h, out_w = first.shape
+
+        # Build channel tensors in self.channels order.
+        # Missing channels (e.g. NIR/BG when COLOR file is absent) are filled
+        # with zeros so every tile always has exactly len(self.channels) channels.
+        tensors = []
+        for ch in self.channels:
+            if ch in band_arrays:
+                tensors.append(torch.from_numpy(band_arrays[ch]))
+            else:
+                tensors.append(torch.zeros(out_h, out_w, dtype=torch.float32))
+        return torch.stack(tensors, dim=0)
 
     def _load_from_jp2(
             self,
@@ -1017,6 +1185,9 @@ class MarsHiRISE(GeoDataset):
                     src_crs = dst_crs
 
                 # Early-exit if the file doesn't overlap the query window.
+                # _SPATIAL_TOL absorbs floating-point imprecision between the
+                # index geometry (built at dataset construction time) and the
+                # bounds that rasterio recomputes here at load time.
                 try:
                     fl, fb, fr, ft = transform_bounds(src_crs, dst_crs, *src.bounds)
                     # Normalize to [-180, 180] to match the index/query convention.
@@ -1026,7 +1197,13 @@ class MarsHiRISE(GeoDataset):
                     fr = ((fr + 180.0) % 360.0) - 180.0
                     # Only apply the check when bounds are non-inverted (i.e., no antimeridian wrap).
                     if fl <= fr:
-                        if fr < x.start or fl > x.stop or ft < y.start or fb > y.stop:
+                        _tol = _SPATIAL_TOL
+                        if (
+                                fr + _tol < x.start
+                                or fl - _tol > x.stop
+                                or ft + _tol < y.start
+                                or fb - _tol > y.stop
+                        ):
                             logger.debug(
                                 "Query [%.4f,%.4f,%.4f,%.4f] doesn't overlap "
                                 "file bounds [%.4f,%.4f,%.4f,%.4f]: %s",
@@ -1039,16 +1216,23 @@ class MarsHiRISE(GeoDataset):
 
                 for ch_name, band_idx in band_map.items():
                     dest = np.empty((out_h, out_w), dtype=np.float32)
-                    reproject(
-                        source=rasterio.band(src, band_idx),
-                        destination=dest,
-                        src_transform=src.transform,
-                        src_crs=src_crs,
-                        dst_transform=dst_transform,
-                        dst_crs=dst_crs,
-                        resampling=Resampling.bilinear,
-                        dst_nodata=0.0,
-                    )
+                    try:
+                        reproject(
+                            source=rasterio.band(src, band_idx),
+                            destination=dest,
+                            src_transform=src.transform,
+                            src_crs=src_crs,
+                            dst_transform=dst_transform,
+                            dst_crs=dst_crs,
+                            resampling=Resampling.bilinear,
+                            dst_nodata=0.0,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Reprojection failed for %s band %d: %s",
+                            jp2_path.name, band_idx, exc,
+                        )
+                        continue
                     dest *= meta.scaling_factor
                     dest += meta.offset
                     np.clip(dest, 0.0, 1.0, out=dest)
@@ -1065,12 +1249,28 @@ class MarsHiRISE(GeoDataset):
         if len(tiles) == 1:
             return tiles[0]
 
-
         max_h = max(t.shape[1] for t in tiles)
         max_w = max(t.shape[2] for t in tiles)
-        n_ch = tiles[0].shape[0]
+        n_ch = max(t.shape[0] for t in tiles)
 
-        assert all(t.shape[0] == n_ch for t in tiles), "Channel count mismatch in tiles"
+        # Pad any tile that has fewer channels than the maximum (e.g. due to a
+        # partially-unavailable COLOR file).  This should not happen after
+        # _load_tile zero-fills missing channels, but guard here for safety.
+        if not all(t.shape[0] == n_ch for t in tiles):
+            logger.warning(
+                "_merge_tiles: channel count mismatch across %d tiles "
+                "(max %d channels) — zero-padding narrower tiles.",
+                len(tiles), n_ch,
+            )
+            padded = []
+            for t in tiles:
+                if t.shape[0] < n_ch:
+                    pad = torch.zeros(
+                        n_ch - t.shape[0], t.shape[1], t.shape[2], dtype=t.dtype
+                    )
+                    t = torch.cat([t, pad], dim=0)
+                padded.append(t)
+            tiles = padded
 
         merged = torch.zeros((n_ch, max_h, max_w), dtype=torch.float32)
         for tile in tiles:
@@ -1078,11 +1278,6 @@ class MarsHiRISE(GeoDataset):
             empty = merged[:, :h, :w] == 0.0
             merged[:, :h, :w][empty] = tile[empty]
         return merged
-
-    # Add to imports at top of file:
-    # from matplotlib.colors import LogNorm
-    # from matplotlib.collections import PatchCollection
-    # from matplotlib.patches import Patch, Rectangle
 
     def plot_coverage(
             self,
@@ -1343,8 +1538,12 @@ def setup_logging(config_path: str = CONFIG) -> None:
 def main() -> None:
     setup_logging()
 
+    torch.manual_seed(42)
+    np.random.seed(42)
+
     from torch.utils.data import DataLoader
-    from torchgeo.samplers import RandomGeoSampler
+
+    from hirise_sampler import HiRISEGeoSampler
 
     # dataset = MarsHiRISE(
     #     target="Olympus",
@@ -1365,17 +1564,24 @@ def main() -> None:
 
     logger.info("saved fig")
 
+    # HiRISEGeoSampler pre-computes a grid of valid patch centers within each
+    # strip polygon, so every yielded patch is guaranteed to intersect real data.
     # size= is in degrees (units of self.crs = geographic Mars CRS).
-    # 0.01 deg ≈ 1 185 pixels ≈ 593 m at the equator.
-    sampler = RandomGeoSampler(dataset, size=0.005, length=200,
-                               units=Units.CRS)
+    # 0.005 deg ≈ 593 pixels ≈ 296 m at the equator.
+    sampler = HiRISEGeoSampler(dataset, size=0.005, length=200, units=Units.CRS)
     dataloader = DataLoader(dataset, sampler=sampler)
 
+    output_path = pathlib.Path("Figures")
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
     for i, sample in enumerate(dataloader):
+        if i >= 10:
+            break
 
         fig = dataset.plot(sample)
-        fig.savefig(f"output{i}.png")
-        logger.info(f"Saved fig output{i}.png")
+        fig.savefig(output_path / f"output{i}.png")
+        logger.info("Saved fig output%d.png", i)
 
         plt.close(fig)
 
