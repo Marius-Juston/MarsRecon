@@ -38,9 +38,9 @@ The dataset lifecycle:
 1. `_verify()` — checks local files; triggers download pipeline if missing
 2. `_download_index()` — fetches `RDRCUMINDEX.LBL` + `RDRCUMINDEX.TAB` from NASA PDS
 3. `_load_index()` — parses PDS index into a pandas DataFrame, normalizes longitudes from [0°,360°] to [-180°,180°]
-4. `_build_spatial_index()` — groups by product ID, creates a GeoDataFrame with spatial geometry + temporal interval; cached to `spatial_cache.gpkg`
+4. `_build_spatial_index()` — groups by product ID, creates a GeoDataFrame with spatial geometry + temporal interval; cached to `spatial_cache{suffix}_v2.gpkg` (suffix encodes `target`/`bbox` filters)
 5. `_download_images()` — concurrent async JP2 download using 8 worker processes × 2 concurrent requests (tuned for NASA server limits)
-6. `__getitem__(index)` — spatiotemporal slice → calls `_load_tile()` → returns `{"image": Tensor, "crs": ..., "bbox": ...}`
+6. `__getitem__(index)` — spatiotemporal slice → calls `_load_tile()` → returns `{"image": Tensor, "bounds": Tensor, "crs": str}`
 
 ### Sampling: `HiRISEGeoSampler` (`src/hirise_sampler.py`)
 
@@ -79,11 +79,12 @@ Parses PDS3 `.LBL` label files to extract per-product `SCALING_FACTOR` and `OFFS
 | Parameter | Description |
 |-----------|-------------|
 | `root` | Local storage directory (default: `/scratch/mars_hirise`) |
+| `split` | Informational split label (`"train"`, `"val"`, `"test"`); no filtering yet |
 | `bbox` | (lon_min, lat_min, lon_max, lat_max) bounding box filter |
-| `target` | Optional keyword filter on product names (e.g., `"Olympus"`) |
+| `target` | Optional case-insensitive substring filter on product name columns |
 | `channels` | List from `["NEAR-INFRARED", "RED", "BLUE-GREEN"]` |
 | `download` | Fetch missing files from NASA PDS if `True` |
-| `reuse_cache` | Reuse cached `spatial_cache.gpkg` if `True` |
+| `reuse_cache` | Reuse cached `spatial_cache_v2.gpkg` if `True` |
 
 ## Data Products
 

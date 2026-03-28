@@ -68,7 +68,7 @@ sampler = HiRISEGeoSampler(dataset, size=0.005, length=200, units=Units.CRS)
 loader = DataLoader(dataset, sampler=sampler)
 
 for sample in loader:
-    image = sample["image"]   # (1, C, H, W) float32 in [0, 1]
+    image = sample["image"]   # (C, H, W) float32 in [0, 1]
     print(image.shape)
     break
 ```
@@ -127,9 +127,45 @@ uv run pytest tests/ -m "not integration" -v
 # With coverage
 uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing
 
+# Preprocessing-only coverage (100%)
+uv run pytest tests/test_preprocessing.py --cov=preprocessing --cov-report=term-missing
+
 # Integration tests (require real data at /scratch/mars_hirise)
 uv run pytest tests/ -m integration -v
 ```
+
+### Test suite overview
+
+| Test file | What it covers |
+|---|---|
+| `test_preprocessing.py` | All of `src/preprocessing.py` — 100% line coverage; 73 tests |
+| `test_download.py` | Async download helpers, retry logic, disk-space guard |
+| `test_spatial_index.py` | Spatial index construction (Cases A–D), GeoPackage cache |
+| `test_dataset.py` | `MarsHiRISE.__getitem__`, tile loading, radiometric calibration |
+| `test_sampler.py` | `HiRISEGeoSampler` grid pre-computation and epoch sampling |
+| `test_lbl_parsing.py` | PDS3 `.LBL` label parsing and `_ProductMeta` extraction |
+| `test_coordinates.py` | Longitude normalisation and CRS helpers |
+| `conftest.py` | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
+| `helpers.py` | `make_mock_dataset()` — minimal `GeoSampler`-compatible mock |
+
+### `test_preprocessing.py` in detail
+
+The file uses **synthetic data only** — no real HiRISE files are required.
+
+| Test class | Functions under test | Key scenarios |
+|---|---|---|
+| `TestAvailableMemoryBytes` | `_available_memory_bytes` | `/proc/meminfo` read, sysconf fallback, 8 GiB hard fallback, missing `MemAvailable` line |
+| `TestSafeWorkerCount` | `_safe_worker_count` | Ample/tight RAM, never-below-1 floor, never-exceeds-requested cap, largest-files-first sampling, warning logged when capped |
+| `TestIsCorruptJp2Error` | `_is_corrupt_jp2_error` | All recognised corrupt tokens, case-insensitivity, non-corrupt I/O errors |
+| `TestFilterMaker` | `filter_maker` | Records at/below/above the configured level |
+| `TestWorkerInit` | `_worker_init` | SIGINT restored to `SIG_DFL`, `basicConfig` called at INFO |
+| `TestJp2ToCog` | `jp2_to_cog` | Success path, skip-existing, overwrite, corrupted JP2 (delete+None), ungeoreferenced input (no spurious warnings) |
+| `TestJp2ToCogErrorPaths` | `jp2_to_cog` | Non-corrupt `RasterioIOError` (source preserved), generic `Exception` (source preserved, COG/tmp cleaned up) |
+| `TestConvertAll` | `convert_all` | Counts accuracy, corrupt-file deletion, valid conversion, pre-existing COG skip, empty directory |
+| `TestConvertAllExtra` | `convert_all` | `skipped` counter (COG older than JP2), `overwrite=True` reconverts, worker future exception → `failed`, `KeyboardInterrupt` → `SystemExit(130)` + `shutdown(cancel_futures=True)` |
+| `TestGeographicSplit` | `geographic_split` | Sizes sum, no overlap, test-fraction accuracy, reproducibility, different seeds differ, longitude/latitude axes |
+| `TestGeographicSplitExtra` | `geographic_split` | Returns `GeoDataFrame`, CRS preserved, small/large `test_fraction` (block-count `max(5, ...)` boundary), `n_test_blocks ≥ 1` guarantee |
+| `TestCLI` | `__main__` block | Empty-root run, `--overwrite` flag, `basicConfig` fallback when `logger_config.json` absent |
 
 ## Architecture
 
@@ -143,11 +179,11 @@ uv run pytest tests/ -m integration -v
 
 ### CRS design
 
-The dataset CRS is the Mars IAU 2000 geographic CRS (`+proj=longlat +a=3396190 +b=3376200`). Each HiRISE JP2 has its own per-observation Equirectangular projection; rasterio reprojects into the common geographic CRS at load time. `self.res` is in degrees/pixel (~8.44 × 10⁻⁶ °/px at HiRISE native resolution).
+The dataset CRS is the Mars IAU 2000 geographic CRS (`+proj=longlat +a=3396190 +b=3376200`). Each HiRISE JP2 has its own per-observation Equirectangular projection; rasterio reprojects into the common geographic CRS at load time. `self.res` is a scalar float in degrees/pixel (`1.0 / 118_502.26` ≈ 8.44 × 10⁻⁶ °/px at HiRISE native resolution).
 
 ### Spatial index
 
-Built once at dataset construction and cached as a GeoPackage (`_v2` suffix). For each observation:
+Built once at dataset construction and cached as a GeoPackage (`spatial_cache{suffix}_v2.gpkg`; suffix encodes any `target`/`bbox` filters). For each observation:
 
 1. Compute `corners_polygon ∩ JP2_bounds` (accurate strip polygon clipped to the JP2's actual coverage) — **Case A**
 2. Fall back to JP2 bounding box if no corners or degenerate intersection — **Case B**
