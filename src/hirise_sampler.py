@@ -61,21 +61,23 @@ class HiRISEGeoSampler(GeoSampler):
     """
 
     def __init__(
-        self,
-        dataset: GeoDataset,
-        size: float | tuple[float, float],
-        length: int | None = None,
-        stride: float | tuple[float, float] | None = None,
-        roi=None,
-        toi=None,
-        units: Units = Units.CRS,
-        generator: torch.Generator | None = None,
+            self,
+            dataset: GeoDataset,
+            size: float | tuple[float, float],
+            length: int | None = None,
+            stride: float | tuple[float, float] | None = None,
+            roi=None,
+            toi=None,
+            units: Units = Units.CRS,
+            generator: torch.Generator | None = None,
+            min_overlap: int = 0.5
     ) -> None:
         super().__init__(dataset, roi, toi)
 
         # ----------------------------------------------------------------
         # Resolve size / stride to (height_deg, width_deg)
         # ----------------------------------------------------------------
+
         size_h, size_w = _to_tuple(size)
         if units == Units.PIXELS:
             xres, yres = dataset.res  # GeoDataset.res is always a (xres, yres) tuple
@@ -93,6 +95,7 @@ class HiRISEGeoSampler(GeoSampler):
         self.size = (size_h, size_w)
         self.stride = (stride_h, stride_w)
         self.generator = generator
+        self.min_overlap = min_overlap
 
         # ----------------------------------------------------------------
         # Pre-compute valid patch centres once at construction time
@@ -171,7 +174,10 @@ class HiRISEGeoSampler(GeoSampler):
                     patch = shapely_box(
                         cx - half_w, cy - half_h, cx + half_w, cy + half_h
                     )
-                    if effective.intersects(patch):
+
+                    overlap = effective.intersection(patch).area / patch.area
+
+                    if overlap > self.min_overlap:
                         self._centers.append((cx, cy, pd_interval))
                         n_added += 1
 
