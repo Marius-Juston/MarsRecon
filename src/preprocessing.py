@@ -24,8 +24,12 @@ CLI usage::
 """
 
 import concurrent.futures
+import gc
 import logging
+import multiprocessing
+import os
 import pathlib
+import warnings
 from collections.abc import Iterator
 from typing import Callable
 
@@ -57,6 +61,78 @@ _COG_CREATION_OPTIONS: dict = {
     "blockysize": 512,
     "copy_src_overviews": True,
 }
+
+
+# ---------------------------------------------------------------------------
+# Memory helpers
+# ---------------------------------------------------------------------------
+
+def _available_memory_bytes() -> int:
+    """Return available (not just free) system RAM in bytes.
+
+    Tries ``/proc/meminfo`` first (Linux), then falls back to the POSIX
+    ``sysconf`` interface.  Returns 8 GiB when neither source is readable so
+    that callers can still make a conservative decision.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024  # kB → bytes
+    except OSError:
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError):
+        return 8 * 1024 ** 3  # conservative fallback: 8 GiB
+
+
+def _safe_worker_count(jp2_files: list[pathlib.Path], requested: int) -> int:
+    """Return the largest worker count that fits in available RAM.
+
+    Each worker fully decompresses one JP2 at a time.  HiRISE JP2 files
+    compress at roughly 3-6× so we use 5× the on-disk size as a conservative
+    per-worker memory estimate, then reserve 25 % of available RAM for the OS
+    and GDAL internals.
+
+    The returned value is clamped to ``[1, requested]``.
+    """
+    if not jp2_files:
+        return requested
+
+    # Sample up to 8 files (sorted by size, worst-case first) to estimate
+    # average decompressed footprint.
+    sample = sorted(jp2_files, key=lambda p: p.stat().st_size, reverse=True)[:8]
+    avg_on_disk = sum(p.stat().st_size for p in sample) / len(sample)
+
+    # JP2000 → raw numpy is typically 3-6× the compressed file size for
+    # HiRISE imagery; 5× is a conservative (safe) upper bound.
+    per_worker_bytes = avg_on_disk * 5
+
+    available = _available_memory_bytes()
+    usable = available * 0.75  # keep 25 % headroom
+
+    safe = max(1, int(usable / per_worker_bytes))
+    chosen = min(safe, requested)
+
+    if chosen < requested:
+        logger.warning(
+            "Capping workers at %d (requested %d): estimated %.1f GiB per JP2, "
+            "%.1f GiB usable RAM.",
+            chosen,
+            requested,
+            per_worker_bytes / 1024 ** 3,
+            usable / 1024 ** 3,
+        )
+    else:
+        logger.debug(
+            "Worker count %d fits within %.1f GiB usable RAM "
+            "(%.1f GiB estimated per JP2).",
+            chosen,
+            usable / 1024 ** 3,
+            per_worker_bytes / 1024 ** 3,
+        )
+    return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -124,28 +200,44 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
 
     tmp = cog.with_suffix(".tmp.tif")
     try:
-        with rasterio.open(jp2_path) as src:
-            profile = src.profile.copy()
-            profile.update(
-                driver="GTiff",
-                compress="deflate",
-                predictor=2,
-                tiled=True,
-                blockxsize=512,
-                blockysize=512,
+        # Some HiRISE JP2s carry no embedded geotransform; rasterio emits
+        # NotGeoreferencedWarning on open (identity matrix assumed) and again
+        # on the intermediate write.  Both are expected — we copy whatever
+        # spatial metadata is present — so suppress them for the whole pass.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message=".*geotransform.*|.*identity matrix.*",
             )
-            # Remove JP2-specific keys that GTiff doesn't understand.
-            for key in ("lossless", "quality"):
-                profile.pop(key, None)
-
-            logger.debug("Writing intermediate GeoTIFF for %s …", jp2_path.name)
-            with rasterio.open(tmp, "w", **profile) as dst:
-                for band_idx in src.indexes:
-                    dst.write(src.read(band_idx), band_idx)
-                dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
-                dst.update_tags(
-                    ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name
+            with rasterio.open(jp2_path) as src:
+                profile = src.profile.copy()
+                profile.update(
+                    driver="GTiff",
+                    compress="deflate",
+                    predictor=2,
+                    tiled=True,
+                    blockxsize=512,
+                    blockysize=512,
                 )
+                # Remove JP2-specific keys that GTiff doesn't understand.
+                for key in ("lossless", "quality"):
+                    profile.pop(key, None)
+
+                logger.debug("Writing intermediate GeoTIFF for %s …", jp2_path.name)
+                with rasterio.open(tmp, "w", **profile) as dst:
+                    for band_idx in src.indexes:
+                        band_data = src.read(band_idx)
+                        dst.write(band_data, band_idx)
+                        del band_data  # release decompressed array before next band
+                    dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
+                    dst.update_tags(
+                        ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name
+                    )
+
+        # Source JP2 is now closed; release any lingering references before the
+        # second pass so the decompressed pixel data can be reclaimed.
+        gc.collect()
 
         # Second pass: copy to final COG with overviews embedded.
         # rasterio.shutil.copy takes GDAL creation options only — strip
@@ -158,7 +250,13 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
             k: v for k, v in profile.items() if k not in _PROFILE_META_KEYS
         }
         cog_creation_opts["copy_src_overviews"] = True
-        rasterio.shutil.copy(tmp, cog, driver="GTiff", **cog_creation_opts)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message=".*geotransform.*|.*identity matrix.*",
+            )
+            rasterio.shutil.copy(tmp, cog, driver="GTiff", **cog_creation_opts)
 
         logger.info("COG written: %s", cog.name)
         return cog
@@ -206,8 +304,10 @@ def convert_all(
 
     .. note::
         Large JP2 files (up to 2.5 GB) are fully decompressed in memory during
-        the intermediate write step.  With ``workers=4`` this may require
-        ~10 GB of RAM.  Use ``workers=1`` on memory-constrained machines.
+        the intermediate write step.  The actual worker count is automatically
+        capped by :func:`_safe_worker_count` based on available RAM and the
+        estimated decompressed size of the JP2 files found under *root*; the
+        ``workers`` argument is therefore treated as an upper bound.
 
     Args:
         root: Dataset root directory containing JP2 files.
@@ -222,7 +322,12 @@ def convert_all(
 
     counts: dict[str, int] = {"converted": 0, "skipped": 0, "failed": 0}
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+    actual_workers = _safe_worker_count(jp2_files, workers)
+
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=actual_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+    ) as pool:
         future_to_path = {
             pool.submit(jp2_to_cog, p, overwrite): p for p in jp2_files
         }
@@ -288,7 +393,10 @@ def geographic_split(
         dataset = MarsHiRISE(bbox=..., ...)
         train_idx, test_idx = geographic_split(dataset.index, test_fraction=0.2)
     """
-    centroids = index.geometry.centroid
+    # Project to a planar CRS before computing centroids to avoid the
+    # "Geometry is in a geographic CRS" UserWarning from geopandas.
+    projected = index.to_crs("+proj=eqc +a=3396190 +b=3376200 +no_defs")
+    centroids = projected.geometry.centroid.to_crs(index.crs)
     coords: np.ndarray = (
         centroids.x.to_numpy() if split_axis == "longitude"
         else centroids.y.to_numpy()

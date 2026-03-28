@@ -1,12 +1,15 @@
 """Tests for src/preprocessing.py.
 
-Covers jp2_to_cog, convert_all, and geographic_split using synthetic data only.
+Covers jp2_to_cog, convert_all, geographic_split, _available_memory_bytes,
+and _safe_worker_count using synthetic data only.
 No real HiRISE files are required.
 """
 
+import io
 import pathlib
 import sys
 import time
+import unittest.mock as mock
 
 import geopandas as gpd
 import numpy as np
@@ -21,7 +24,14 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from preprocessing import _is_corrupt_jp2_error, convert_all, geographic_split, jp2_to_cog
+from preprocessing import (
+    _available_memory_bytes,
+    _is_corrupt_jp2_error,
+    _safe_worker_count,
+    convert_all,
+    geographic_split,
+    jp2_to_cog,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +64,22 @@ def valid_jp2(tmp_path: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
+def ungeoreferenced_jp2(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A tiny GeoTIFF with no CRS or geotransform (identity matrix), saved as .JP2."""
+    p = tmp_path / "PSP_001430_1780_RED_nogeo.JP2"
+    profile = {
+        "driver": "GTiff",
+        "dtype": "float32",
+        "width": 64,
+        "height": 64,
+        "count": 1,
+    }
+    with rasterio.open(p, "w", **profile) as dst:
+        dst.write(np.random.rand(64, 64).astype(np.float32), 1)
+    return p
+
+
+@pytest.fixture
 def corrupted_jp2(tmp_path: pathlib.Path) -> pathlib.Path:
     """A file with a .JP2 extension containing garbage bytes."""
     p = tmp_path / "PSP_002000_1780_RED.JP2"
@@ -78,6 +104,184 @@ def split_index(tmp_path: pathlib.Path) -> gpd.GeoDataFrame:
         crs=mars_crs,
         index=interval_index,
     )
+
+
+# ---------------------------------------------------------------------------
+# _available_memory_bytes
+# ---------------------------------------------------------------------------
+
+_PROC_MEMINFO = (
+    "MemTotal:       32768000 kB\n"
+    "MemFree:         4096000 kB\n"
+    "MemAvailable:   16384000 kB\n"   # 16 GiB available
+    "Buffers:         1024000 kB\n"
+)
+
+
+class TestAvailableMemoryBytes:
+    def test_reads_proc_meminfo(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data=_PROC_MEMINFO)):
+            result = _available_memory_bytes()
+        assert result == 16384000 * 1024  # 16 GiB in bytes
+
+    def test_returns_positive_integer(self):
+        # Against the real system — just sanity-check the type and sign.
+        result = _available_memory_bytes()
+        assert isinstance(result, int)
+        assert result > 0
+
+    def test_falls_back_to_sysconf_on_oserror(self):
+        page_size = 4096
+        phys_pages = 1024 * 1024  # 4 GiB
+
+        def fake_sysconf(name):
+            return page_size if "PAGE_SIZE" in str(name) else phys_pages
+
+        with mock.patch("builtins.open", side_effect=OSError("no proc")):
+            with mock.patch("os.sysconf", side_effect=fake_sysconf):
+                result = _available_memory_bytes()
+        assert result == phys_pages * page_size
+
+    def test_falls_back_to_8gib_when_both_fail(self):
+        with mock.patch("builtins.open", side_effect=OSError):
+            with mock.patch("os.sysconf", side_effect=ValueError):
+                result = _available_memory_bytes()
+        assert result == 8 * 1024 ** 3
+
+    def test_missing_memavailable_line_falls_back(self):
+        # /proc/meminfo exists but has no MemAvailable line → open succeeds
+        # but the loop never matches → function falls through to sysconf.
+        minimal = "MemTotal: 32768000 kB\nMemFree: 4096000 kB\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=minimal)):
+            with mock.patch("os.sysconf", side_effect=ValueError):
+                result = _available_memory_bytes()
+        assert result == 8 * 1024 ** 3
+
+
+# ---------------------------------------------------------------------------
+# _safe_worker_count
+# ---------------------------------------------------------------------------
+
+
+def _fake_jp2s(tmp_path: pathlib.Path, sizes_bytes: list[int]) -> list[pathlib.Path]:
+    """Create zero-byte placeholder paths whose stat().st_size is mocked."""
+    files = []
+    for i, _ in enumerate(sizes_bytes):
+        p = tmp_path / f"fake_{i}.JP2"
+        p.touch()
+        files.append(p)
+    return files
+
+
+def _patch_sizes(files: list[pathlib.Path], sizes_bytes: list[int]):
+    """Return a context manager that patches stat() on each file with a fake size."""
+    size_map = {str(p): s for p, s in zip(files, sizes_bytes)}
+    real_stat = pathlib.Path.stat
+
+    def fake_stat(self, **kwargs):
+        key = str(self)
+        if key in size_map:
+            result = real_stat(self, **kwargs)
+            result = mock.MagicMock(wraps=result)
+            result.st_size = size_map[key]
+            return result
+        return real_stat(self, **kwargs)
+
+    return mock.patch.object(pathlib.Path, "stat", fake_stat)
+
+
+class TestSafeWorkerCount:
+    def test_empty_list_returns_requested(self):
+        assert _safe_worker_count([], 8) == 8
+
+    def test_returns_requested_when_memory_is_ample(self, tmp_path):
+        # 4 × 100 MiB files; decompressed estimate = 500 MiB each.
+        # 64 GiB available → all 4 workers fit easily.
+        mb100 = 100 * 1024 ** 2
+        files = _fake_jp2s(tmp_path, [mb100] * 4)
+        with _patch_sizes(files, [mb100] * 4):
+            with mock.patch("preprocessing._available_memory_bytes", return_value=64 * 1024 ** 3):
+                result = _safe_worker_count(files, 4)
+        assert result == 4
+
+    def test_caps_workers_when_memory_is_tight(self, tmp_path):
+        # 4 × 1 GiB files → 5 GiB decompressed each.
+        # Only 6 GiB usable → safe = floor(6 / 5) = 1 worker.
+        gib1 = 1024 ** 3
+        files = _fake_jp2s(tmp_path, [gib1] * 4)
+        usable = 6 * gib1
+        available = int(usable / 0.75)
+        with _patch_sizes(files, [gib1] * 4):
+            with mock.patch("preprocessing._available_memory_bytes", return_value=available):
+                result = _safe_worker_count(files, 4)
+        assert result == 1
+
+    def test_result_never_below_one(self, tmp_path):
+        # Even if a single file exceeds all available RAM, return at least 1.
+        gib4 = 4 * 1024 ** 3
+        files = _fake_jp2s(tmp_path, [gib4])
+        with _patch_sizes(files, [gib4]):
+            with mock.patch("preprocessing._available_memory_bytes", return_value=1024 ** 3):
+                result = _safe_worker_count(files, 8)
+        assert result >= 1
+
+    def test_result_never_exceeds_requested(self, tmp_path):
+        mb10 = 10 * 1024 ** 2
+        files = _fake_jp2s(tmp_path, [mb10] * 100)
+        with _patch_sizes(files, [mb10] * 100):
+            with mock.patch("preprocessing._available_memory_bytes", return_value=512 * 1024 ** 3):
+                result = _safe_worker_count(files, 3)
+        assert result <= 3
+
+    def test_samples_largest_files_first(self, tmp_path):
+        # 20 small (10 MiB) + 4 large (1 GiB) files.
+        # Sorted descending, sample = top-8 = [4 × 1 GiB, 4 × 10 MiB].
+        # avg = (4×1 GiB + 4×10 MiB) / 8 ≈ 517 MiB → per-worker = 2.52 GiB.
+        # With 10 GiB usable → safe = floor(10 / 2.52) = 3.
+        # If sorted ascending (worst case: all small) avg ≈ 10 MiB →
+        # per-worker = 50 MiB → safe = floor(10 GiB / 50 MiB) = 204.
+        # The large-first sort must produce a strictly smaller cap.
+        mb10 = 10 * 1024 ** 2
+        gib1 = 1024 ** 3
+        (tmp_path / "s").mkdir()
+        (tmp_path / "l").mkdir()
+        small = _fake_jp2s(tmp_path / "s", [mb10] * 20)
+        large = _fake_jp2s(tmp_path / "l", [gib1] * 4)
+        all_files = small + large
+        all_sizes = [mb10] * 20 + [gib1] * 4
+        usable = 10 * gib1
+        available = int(usable / 0.75)
+        with _patch_sizes(all_files, all_sizes):
+            with mock.patch("preprocessing._available_memory_bytes", return_value=available):
+                result_largest_first = _safe_worker_count(all_files, 8)
+
+        # If we sampled only the 20 small files the cap would be 200+.
+        # Sampling the largest first must cap well below the request of 8.
+        assert result_largest_first < 8
+        # Specifically the 4 large files dominate the 8-file sample enough
+        # that we get ≤ 4 workers (not the 200+ we'd get from only small files).
+        assert result_largest_first <= 4
+
+    def test_logs_warning_when_capped(self, tmp_path, caplog):
+        import logging
+        gib1 = 1024 ** 3
+        files = _fake_jp2s(tmp_path, [gib1] * 2)
+        available = int((1 * gib1) / 0.75)  # forces cap to 1 worker
+        with _patch_sizes(files, [gib1] * 2):
+            with mock.patch("preprocessing._available_memory_bytes", return_value=available):
+                with caplog.at_level(logging.WARNING, logger="preprocessing"):
+                    _safe_worker_count(files, 4)
+        assert any("Capping workers" in r.message for r in caplog.records)
+
+    def test_no_warning_when_not_capped(self, tmp_path, caplog):
+        import logging
+        mb10 = 10 * 1024 ** 2
+        files = _fake_jp2s(tmp_path, [mb10])
+        with _patch_sizes(files, [mb10]):
+            with mock.patch("preprocessing._available_memory_bytes", return_value=512 * 1024 ** 3):
+                with caplog.at_level(logging.WARNING, logger="preprocessing"):
+                    _safe_worker_count(files, 2)
+        assert not any("Capping workers" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +382,29 @@ class TestJp2ToCog:
     def test_corrupted_jp2_no_tmp_left(self, corrupted_jp2):
         jp2_to_cog(corrupted_jp2)
         assert not corrupted_jp2.with_suffix(".tmp.tif").exists()
+
+    def test_ungeoreferenced_jp2_no_warning(self, ungeoreferenced_jp2):
+        """jp2_to_cog must not surface NotGeoreferencedWarning to the caller."""
+        import warnings as _warnings
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            jp2_to_cog(ungeoreferenced_jp2)
+        geo_warnings = [
+            w for w in caught
+            if issubclass(w.category, UserWarning)
+            and ("geotransform" in str(w.message).lower()
+                 or "identity matrix" in str(w.message).lower())
+        ]
+        assert geo_warnings == [], f"Unexpected warnings: {geo_warnings}"
+
+    def test_ungeoreferenced_jp2_still_produces_cog(self, ungeoreferenced_jp2):
+        """Conversion succeeds even when the source has no geotransform."""
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            result = jp2_to_cog(ungeoreferenced_jp2)
+        assert result is not None
+        assert result.exists()
 
 
 # ---------------------------------------------------------------------------
