@@ -61,6 +61,7 @@ _COG_CREATION_OPTIONS: dict = {
     "blockxsize": 512,
     "blockysize": 512,
     "copy_src_overviews": True,
+    "bigtiff": "IF_SAFER",
 }
 
 
@@ -218,6 +219,7 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                     tiled=True,
                     blockxsize=512,
                     blockysize=512,
+                    bigtiff="IF_SAFER",  # switch to 64-bit offsets when >4 GiB
                 )
                 # The intermediate is a scratch file deleted in `finally` —
                 # compressing it with deflate is the main conversion bottleneck
