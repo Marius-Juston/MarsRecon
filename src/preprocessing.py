@@ -29,6 +29,7 @@ import logging
 import multiprocessing
 import os
 import pathlib
+import signal
 import warnings
 from collections.abc import Iterator
 from typing import Callable
@@ -214,14 +215,16 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                 profile = src.profile.copy()
                 profile.update(
                     driver="GTiff",
-                    compress="deflate",
-                    predictor=2,
                     tiled=True,
                     blockxsize=512,
                     blockysize=512,
                 )
-                # Remove JP2-specific keys that GTiff doesn't understand.
-                for key in ("lossless", "quality"):
+                # The intermediate is a scratch file deleted in `finally` —
+                # compressing it with deflate is the main conversion bottleneck
+                # (CPU-intensive on gigabytes of data that are immediately
+                # discarded).  Compression is applied only in the final
+                # rasterio.shutil.copy call below.
+                for key in ("lossless", "quality", "compress", "predictor"):
                     profile.pop(key, None)
 
                 logger.debug("Writing intermediate GeoTIFF for %s …", jp2_path.name)
@@ -240,23 +243,16 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
         gc.collect()
 
         # Second pass: copy to final COG with overviews embedded.
-        # rasterio.shutil.copy takes GDAL creation options only — strip
-        # dataset-metadata keys (dtype, width, height, …) that are valid in a
-        # rasterio profile dict but are not GTiff creation options.
-        _PROFILE_META_KEYS = frozenset(
-            ("dtype", "nodata", "width", "height", "count", "crs", "transform", "driver")
-        )
-        cog_creation_opts = {
-            k: v for k, v in profile.items() if k not in _PROFILE_META_KEYS
-        }
-        cog_creation_opts["copy_src_overviews"] = True
+        # Use _COG_CREATION_OPTIONS directly — it already carries compress,
+        # predictor, tiling, and copy_src_overviews.  Deriving opts from
+        # `profile` would omit compression because we stripped it above.
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
                 category=UserWarning,
                 message=".*geotransform.*|.*identity matrix.*",
             )
-            rasterio.shutil.copy(tmp, cog, driver="GTiff", **cog_creation_opts)
+            rasterio.shutil.copy(tmp, cog, **_COG_CREATION_OPTIONS)
 
         logger.info("COG written: %s", cog.name)
         return cog
@@ -284,6 +280,32 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
 # ---------------------------------------------------------------------------
 # Batch conversion
 # ---------------------------------------------------------------------------
+
+
+def _worker_init() -> None:
+    """Initialise each spawned worker process.
+
+    Two responsibilities:
+
+    1. **SIGINT**: Python's ``ProcessPoolExecutor`` installs ``SIG_IGN`` for
+       SIGINT in spawned workers, which means Ctrl+C reaches the parent (raising
+       ``KeyboardInterrupt``) but workers keep running.  Restoring ``SIG_DFL``
+       lets the OS kill workers immediately when the terminal sends SIGINT to the
+       foreground process group.
+
+    2. **Logging**: ``spawn`` starts a fresh Python interpreter, so the parent's
+       ``dictConfig`` (from ``logger_config.json``) is never applied in workers.
+       The root logger therefore defaults to ``WARNING``, silently dropping all
+       ``logger.info()`` calls — including the "COG written" confirmation.
+       ``basicConfig`` at ``INFO`` routes worker log records to stderr (which is
+       inherited from the parent at the OS level) so progress is visible on the
+       terminal without unsafe concurrent writes to ``app.log``.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  [worker] %(message)s",
+    )
 
 
 def _iter_jp2_files(root: pathlib.Path) -> Iterator[pathlib.Path]:
@@ -324,13 +346,15 @@ def convert_all(
 
     actual_workers = _safe_worker_count(jp2_files, workers)
 
-    with concurrent.futures.ProcessPoolExecutor(
+    pool = concurrent.futures.ProcessPoolExecutor(
         max_workers=actual_workers,
         mp_context=multiprocessing.get_context("spawn"),
-    ) as pool:
-        future_to_path = {
-            pool.submit(jp2_to_cog, p, overwrite): p for p in jp2_files
-        }
+        initializer=_worker_init,
+    )
+    future_to_path = {
+        pool.submit(jp2_to_cog, p, overwrite): p for p in jp2_files
+    }
+    try:
         for future in concurrent.futures.as_completed(future_to_path):
             jp2_path = future_to_path[future]
             try:
@@ -347,6 +371,15 @@ def convert_all(
             except Exception as exc:
                 logger.error("Worker error for %s: %s", jp2_path.name, exc)
                 counts["failed"] += 1
+    except KeyboardInterrupt:
+        # cancel_futures=True drops queued-but-not-started work immediately;
+        # wait=False returns without blocking on already-running workers (which
+        # are killed by SIGINT via _worker_init restoring SIG_DFL above).
+        pool.shutdown(wait=False, cancel_futures=True)
+        logger.warning("Interrupted — %d converted so far.", counts["converted"])
+        raise SystemExit(130)
+    else:
+        pool.shutdown(wait=True)
 
     logger.info(
         "COG conversion complete — converted: %d, skipped: %d, failed: %d.",
