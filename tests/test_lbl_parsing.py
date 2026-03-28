@@ -7,13 +7,10 @@ Covers:
 """
 
 import pathlib
-import textwrap
 
 import pytest
-
 # src/ is on sys.path via conftest.py
-from temp import _ProductMeta
-
+from mars_hirise import _ProductMeta
 
 # ---------------------------------------------------------------------------
 # Default constants (replicate the values from temp.py for comparison)

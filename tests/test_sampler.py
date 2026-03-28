@@ -66,7 +66,7 @@ class TestHiRISESamplerCorrectness:
             )
 
     def test_no_patch_is_entirely_outside_strip_bbox(
-        self, strip_polygon, single_strip_dataset
+            self, strip_polygon, single_strip_dataset
     ):
         bbox = box(*strip_polygon.bounds)
         sampler = HiRISEGeoSampler(

@@ -7,12 +7,7 @@ real HiRISE files under /scratch/mars_hirise.
 
 import pathlib
 import sys
-import types
-from unittest.mock import MagicMock, patch
 
-import geopandas as gpd
-import numpy as np
-import pandas as pd
 import pytest
 from shapely.geometry import Polygon, box
 
@@ -22,7 +17,7 @@ if str(_SRC) not in sys.path:
 
 import torch
 
-from temp import _SPATIAL_TOL, MarsHiRISE, _corners_to_polygon
+from mars_hirise import _SPATIAL_TOL, MarsHiRISE, _corners_to_polygon
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +54,7 @@ class TestMergeTiles:
 
     def test_mismatched_channels_padded_to_max(self):
         """Tiles with different channel counts must be zero-padded, not raise."""
-        t3 = torch.ones(3, 8, 8)       # 3-channel tile
+        t3 = torch.ones(3, 8, 8)  # 3-channel tile
         t1 = torch.ones(1, 8, 8) * 0.5  # 1-channel tile (simulates RED-only)
         # Must not raise AssertionError.
         result = MarsHiRISE._merge_tiles([t3, t1])
@@ -94,7 +89,7 @@ class TestFootprintIntersection:
 
     def test_intersection_when_corners_extend_beyond_jp2(self):
         """Corners polygon that extends beyond JP2 bounds is clipped."""
-        corners = box(-136.1, 11.9, -123.9, 24.1)   # larger than JP2
+        corners = box(-136.1, 11.9, -123.9, 24.1)  # larger than JP2
         jp2_bounds = box(-136.0, 12.0, -124.0, 24.0)
         result = corners.intersection(jp2_bounds)
         # Result must be entirely within jp2_bounds
@@ -146,7 +141,7 @@ class TestSpatialTolerance:
     def test_tolerance_allows_boundary_patch(self):
         """A patch touching the JP2 boundary within tolerance should be accepted."""
         # Simulates the comparison in _load_from_jp2
-        fl, fb, fr, ft = -140.0, 19.0, -130.0, 25.0   # JP2 bounds
+        fl, fb, fr, ft = -140.0, 19.0, -130.0, 25.0  # JP2 bounds
         # Query patch right at the boundary
         x_start = fr - _SPATIAL_TOL / 2  # inside tolerance
         x_stop = fr + 0.005
@@ -159,7 +154,7 @@ class TestSpatialTolerance:
     def test_tolerance_still_rejects_truly_outside(self):
         """A patch clearly outside JP2 bounds is still rejected."""
         fl, fb, fr, ft = -140.0, 19.0, -130.0, 25.0
-        x_start = fr + _SPATIAL_TOL * 10   # well outside
+        x_start = fr + _SPATIAL_TOL * 10  # well outside
 
         # With tolerance: fr + tol < x_start → True → early exit
         assert fr + _SPATIAL_TOL < x_start
@@ -223,10 +218,10 @@ class TestMarsHiRISEIntegration:
                 # Footprint must be within JP2 bounds (with tolerance)
                 tol = _SPATIAL_TOL * 10  # generous for integration test
                 if (
-                    fb_minx < fl - tol
-                    or fb_maxx > fr + tol
-                    or fb_miny < flb - tol
-                    or fb_maxy > ft + tol
+                        fb_minx < fl - tol
+                        or fb_maxx > fr + tol
+                        or fb_miny < flb - tol
+                        or fb_maxy > ft + tol
                 ):
                     failures += 1
                 break

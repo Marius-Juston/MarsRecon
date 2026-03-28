@@ -56,7 +56,7 @@ _OVERVIEW_RESAMPLING = rasterio.enums.Resampling.average
 _COG_CREATION_OPTIONS: dict = {
     "driver": "GTiff",
     "compress": "deflate",
-    "predictor": 2,       # horizontal differencing — good for imagery
+    "predictor": 2,  # horizontal differencing — good for imagery
     "tiled": True,
     "blockxsize": 512,
     "blockysize": 512,
@@ -147,6 +147,7 @@ def filter_maker(level: str) -> Callable:
         return record.levelno <= numeric
 
     return _filter
+
 
 def _is_corrupt_jp2_error(exc: Exception) -> bool:
     """Return True when *exc* indicates a corrupted JPEG2000 bitstream.
@@ -317,9 +318,9 @@ def _iter_jp2_files(root: pathlib.Path) -> Iterator[pathlib.Path]:
 
 
 def convert_all(
-    root: pathlib.Path,
-    workers: int = 4,
-    overwrite: bool = False,
+        root: pathlib.Path,
+        workers: int = 4,
+        overwrite: bool = False,
 ) -> dict[str, int]:
     """Convert all JP2 files under *root* to COG GeoTIFF sidecars.
 
@@ -399,10 +400,10 @@ def convert_all(
 
 
 def geographic_split(
-    index: gpd.GeoDataFrame,
-    test_fraction: float = 0.2,
-    split_axis: str = "longitude",
-    seed: int = 42,
+        index: gpd.GeoDataFrame,
+        test_fraction: float = 0.2,
+        split_axis: str = "longitude",
+        seed: int = 42,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Split a spatial index into geographically separated train and test sets.
 

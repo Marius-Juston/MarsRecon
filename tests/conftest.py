@@ -137,5 +137,3 @@ def synthetic_corner_row() -> pd.Series:
             "MAXIMUM_LONGITUDE": 236.0,
         }
     )
-
-

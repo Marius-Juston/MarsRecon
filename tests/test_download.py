@@ -4,7 +4,6 @@ Uses aioresponses to mock aiohttp.ClientSession without touching the network.
 All tests are async and run automatically via asyncio_mode = "auto" in pyproject.toml.
 """
 
-import asyncio
 import pathlib
 import sys
 import threading
@@ -17,7 +16,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from temp import _download_file
+from mars_hirise import _download_file
 
 _URL = "https://hirise-pds.lpl.arizona.edu/PDS/test/PSP_001430_1780_RED.JP2"
 

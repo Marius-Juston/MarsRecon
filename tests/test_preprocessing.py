@@ -6,7 +6,6 @@ No real HiRISE files are required.
 """
 
 import concurrent.futures as _cf
-import io
 import logging
 import pathlib
 import signal
@@ -118,7 +117,7 @@ def split_index(tmp_path: pathlib.Path) -> gpd.GeoDataFrame:
 _PROC_MEMINFO = (
     "MemTotal:       32768000 kB\n"
     "MemFree:         4096000 kB\n"
-    "MemAvailable:   16384000 kB\n"   # 16 GiB available
+    "MemAvailable:   16384000 kB\n"  # 16 GiB available
     "Buffers:         1024000 kB\n"
 )
 
@@ -397,8 +396,8 @@ class TestJp2ToCog:
         geo_warnings = [
             w for w in caught
             if issubclass(w.category, UserWarning)
-            and ("geotransform" in str(w.message).lower()
-                 or "identity matrix" in str(w.message).lower())
+               and ("geotransform" in str(w.message).lower()
+                    or "identity matrix" in str(w.message).lower())
         ]
         assert geo_warnings == [], f"Unexpected warnings: {geo_warnings}"
 
@@ -663,7 +662,7 @@ class TestConvertAllExtra:
 
         with mock.patch("concurrent.futures.ProcessPoolExecutor", return_value=mock_pool):
             with mock.patch(
-                "concurrent.futures.as_completed", side_effect=KeyboardInterrupt
+                    "concurrent.futures.as_completed", side_effect=KeyboardInterrupt
             ):
                 with pytest.raises(SystemExit) as exc_info:
                     convert_all(tmp_path, workers=1)
@@ -680,7 +679,7 @@ class TestConvertAllExtra:
 
         with mock.patch("concurrent.futures.ProcessPoolExecutor", return_value=mock_pool):
             with mock.patch(
-                "concurrent.futures.as_completed", side_effect=KeyboardInterrupt
+                    "concurrent.futures.as_completed", side_effect=KeyboardInterrupt
             ):
                 with pytest.raises(SystemExit):
                     convert_all(tmp_path, workers=1)

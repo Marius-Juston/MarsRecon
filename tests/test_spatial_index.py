@@ -5,14 +5,12 @@ Covers:
   handling, missing columns, and the geometry-is-smaller-than-bbox property.
 """
 
-import math
-
 import pandas as pd
 import pytest
 from shapely.geometry import Polygon, box
 
 # src/ is on sys.path via conftest.py
-from temp import _corners_to_polygon
+from mars_hirise import _corners_to_polygon
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +60,8 @@ class TestCornersToPolygon:
         row = pd.Series({
             "CORNER1_LATITUDE": -5.0, "CORNER1_LONGITUDE": 265.0,
             "CORNER2_LATITUDE": -5.0, "CORNER2_LONGITUDE": 275.0,
-            "CORNER3_LATITUDE":  5.0, "CORNER3_LONGITUDE": 275.0,
-            "CORNER4_LATITUDE":  5.0, "CORNER4_LONGITUDE": 265.0,
+            "CORNER3_LATITUDE": 5.0, "CORNER3_LONGITUDE": 275.0,
+            "CORNER4_LATITUDE": 5.0, "CORNER4_LONGITUDE": 265.0,
         })
         poly = _corners_to_polygon(row)
         assert poly is not None
@@ -119,7 +117,7 @@ class TestCornersToPolygon:
     # ---- synthetic_corner_row fixture ---------------------------------------
 
     def test_synthetic_corner_row_produces_valid_polygon(
-        self, synthetic_corner_row: pd.Series
+            self, synthetic_corner_row: pd.Series
     ):
         poly = _corners_to_polygon(synthetic_corner_row)
         assert poly is not None and poly.is_valid and not poly.is_empty

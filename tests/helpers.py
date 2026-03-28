@@ -15,9 +15,9 @@ if str(_SRC) not in sys.path:
 
 
 def make_mock_dataset(
-    geometries: list[Polygon],
-    crs: CRS,
-    res: tuple[float, float] = (8.44e-6, 8.44e-6),
+        geometries: list[Polygon],
+        crs: CRS,
+        res: tuple[float, float] = (8.44e-6, 8.44e-6),
 ) -> types.SimpleNamespace:
     """Build a minimal object satisfying the GeoSampler interface.
 
