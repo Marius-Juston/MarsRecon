@@ -4,6 +4,9 @@ data/
 *.TAB
 *.JP2
 
+Figures/
+validation/
+
 outcmaes/
 all-logs/
 plot*/
