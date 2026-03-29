@@ -9,13 +9,14 @@ import logging
 import logging.config
 import math
 import multiprocessing
+import os
 import pathlib
 import random
 import re
 import shutil
 import threading
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -42,6 +43,7 @@ from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import GeoSlice, Path, Sample, download_url
 from torchgeo.samplers import Units
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +327,92 @@ def _corners_to_polygon(row: "pd.Series") -> Polygon | None:
     if not poly.is_valid:
         poly = poly.buffer(0)  # standard fix for self-intersecting rings
     return poly if (poly.is_valid and not poly.is_empty) else None
+
+
+def _extract_footprint(
+        file_path: str | None,
+        mars_crs: "rasterio.crs.CRS",
+) -> tuple[list[tuple[float, float]] | None, tuple[float, float, float, float] | None]:
+    """Extract the convex hull of non-zero pixels from a JP2/COG.
+
+    Reads band 1 at the coarsest available overview level so even
+    multi-GB images resolve to a few hundred pixels.
+
+    Thread-safe: each call opens its own file handle.
+
+    Returns:
+        ``(hull_coords, file_bounds)`` — *hull_coords* is a list of
+        ``(lon, lat)`` vertices for the convex hull, or ``None`` on
+        failure.  *file_bounds* is a ``(west, south, east, north)``
+        fallback when the hull cannot be computed but the file is
+        readable.
+    """
+    from rasterio.warp import transform as warp_transform, transform_bounds
+    from shapely.geometry import MultiPoint
+
+    if file_path is None:
+        return None, None
+
+    path = pathlib.Path(file_path)
+    cog = path.with_suffix(".tif")
+    actual = cog if cog.exists() else path
+    if not actual.exists():
+        return None, None
+
+    try:
+        with rasterio.open(actual) as src:
+            src_crs = src.crs
+            if src_crs is None:
+                return None, None
+
+            # ── File bounds (always computed — cheap fallback) ────
+            try:
+                fl, fb, fr, ft = transform_bounds(src_crs, mars_crs, *src.bounds)
+                fl = ((fl + 180.0) % 360.0) - 180.0
+                fr = ((fr + 180.0) % 360.0) - 180.0
+                if not (-180.0 <= fl < fr <= 180.0 and -90.0 <= fb < ft <= 90.0):
+                    file_bounds = None
+                else:
+                    file_bounds = (fl, fb, fr, ft)
+            except Exception:
+                file_bounds = None
+
+            # ── Read band 1 at coarsest overview ─────────────────
+            ovrs = src.overviews(1)
+            factor = max(ovrs) if ovrs else max(1, min(src.height, src.width) // 500)
+            oh = max(1, src.height // factor)
+            ow = max(1, src.width // factor)
+
+            data = src.read(1, out_shape=(oh, ow))
+
+            ys, xs = np.where(data > 0)
+            if len(xs) < 3:
+                return None, file_bounds
+
+            # ── Convex hull in pixel space ───────────────────────
+            step = max(1, len(xs) // 4000)
+            hull = MultiPoint(
+                list(zip(xs[::step].tolist(), ys[::step].tolist()))
+            ).convex_hull
+            if hull.is_empty:
+                return None, file_bounds
+
+            hull_px = np.array(hull.exterior.coords)
+
+            # ── Pixel → source CRS → geographic CRS ─────────────
+            ovr_tf = rasterio.transform.from_bounds(*src.bounds, ow, oh)
+            src_xs, src_ys = rasterio.transform.xy(
+                ovr_tf, hull_px[:, 1].tolist(), hull_px[:, 0].tolist()
+            )
+            geo_xs, geo_ys = warp_transform(
+                src_crs, mars_crs, list(src_xs), list(src_ys)
+            )
+            geo_xs = [((x + 180.0) % 360.0) - 180.0 for x in geo_xs]
+
+            return list(zip(geo_xs, geo_ys)), file_bounds
+
+    except Exception:
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -850,9 +938,10 @@ class MarsHiRISE(GeoDataset):
         if self.target:
             parts.append(self.target)
         if self.bbox:
-            parts.append(f"{self.bbox[0]}_{self.bbox[1]}_{self.bbox[2]}_{self.bbox[3]}")
+            parts.append(
+                f"{self.bbox[0]}_{self.bbox[1]}_{self.bbox[2]}_{self.bbox[3]}"
+            )
         suffix = f"_{'_'.join(parts)}" if parts else ""
-        # v3: actual strip footprint from JP2 pixel data.
         return self.root / f"spatial_cache{suffix}_v3.gpkg"
 
     def _build_spatial_index(self, force_rebuild: bool = False) -> None:
@@ -872,19 +961,25 @@ class MarsHiRISE(GeoDataset):
         Longitudes are normalised from [0°, 360°] to [−180°, 180°];
         antimeridian-crossing tiles are skipped.
         """
-        if self.reuse_cache and not force_rebuild and self.spatial_index_cache.exists() and self.index is None:
-            logger.info("Loading spatial index from cache (%s).", self.spatial_index_cache)
-
+        # ── Cache check (unchanged) ──────────────────────────────────
+        if (
+                self.reuse_cache
+                and not force_rebuild
+                and self.spatial_index_cache.exists()
+                and self.index is None
+        ):
+            logger.info(
+                "Loading spatial index from cache (%s).", self.spatial_index_cache
+            )
             gdf = gpd.read_file(self.spatial_index_cache)
 
-            # Detect legacy bbox-only cache (all geometries are axis-aligned
-            # rectangles).  If so, fall through to rebuild with polygon footprints.
+            # Detect legacy bbox-only cache.
             sample_geoms = gdf.geometry.iloc[: min(5, len(gdf))]
             is_legacy = all(g.equals(box(*g.bounds)) for g in sample_geoms)
             if is_legacy:
                 logger.info(
-                    "Legacy axis-aligned-bbox cache detected at %s; rebuilding "
-                    "with strip polygon footprints.",
+                    "Legacy bbox cache detected at %s; rebuilding with "
+                    "strip polygon footprints.",
                     self.spatial_index_cache,
                 )
             else:
@@ -894,71 +989,119 @@ class MarsHiRISE(GeoDataset):
                     t_start, t_stop, closed="both", name="datetime"
                 )
                 self.index = gdf
-
-                bounds = self.index["geometry"].bounds
-                minx, miny = bounds[["minx", "miny"]].min()
-                maxx, maxy = bounds[["maxx", "maxy"]].max()
-
+                total_bounds = self.index["geometry"].bounds
+                minx, miny = total_bounds[["minx", "miny"]].min()
+                maxx, maxy = total_bounds[["maxx", "maxy"]].max()
                 logger.info(
-                    "Spatial index: %d observations, lon [%.2f, %.2f] lat [%.2f, %.2f].",
-                    len(self.index),
-                    minx,
-                    maxx,
-                    miny,
-                    maxy,
+                    "Spatial index: %d observations, "
+                    "lon [%.2f, %.2f] lat [%.2f, %.2f].",
+                    len(self.index), minx, maxx, miny, maxy,
                 )
                 return
 
+        # ── Phase 1: group products by observation (fast) ────────────
         df = self._raw_index.copy()
-
         pid = df["PRODUCT_ID"].str.strip()
         df["_product_type"] = pid.str.extract(r"_(COLOR|RED)\s*$", expand=False)
         df["_obs_id"] = pid.str.replace(r"_(COLOR|RED)\s*$", "", regex=True)
-
-        # Preserve the full PDS path structure under root.
         df["_local_path"] = df["FILE_NAME_SPECIFICATION"].apply(
             lambda s: str(self._pds_local_path(s))
         )
 
+        # Build a list of (obs_id, color_path, red_path, ref_row) and
+        # pick the best file for footprint extraction.
+        obs_list: list[tuple[str, str | None, str | None, str | None, "pd.Series"]] = []
+        for obs_id, grp in df.groupby("_obs_id", sort=False):
+            ref = grp.iloc[0]
+            color_rows = grp[grp["_product_type"] == "COLOR"]
+            red_rows = grp[grp["_product_type"] == "RED"]
+            cp = color_rows.iloc[0]["_local_path"] if not color_rows.empty else None
+            rp = red_rows.iloc[0]["_local_path"] if not red_rows.empty else None
+
+            # Pick the first file that exists on disk (or has a COG).
+            fp_path = None
+            for p in (cp, rp):
+                if p is not None:
+                    pp = pathlib.Path(p)
+                    if pp.exists() or pp.with_suffix(".tif").exists():
+                        fp_path = p
+                        break
+
+            obs_list.append((str(obs_id), cp, rp, fp_path, ref))
+
+        # ── Phase 2: parallel footprint extraction (the slow part) ───
+        mars_crs = rasterio.crs.CRS.from_user_input(self.mars_crs)
+        n_workers = min(os.cpu_count() or 4, 32)
+        n_total = len(obs_list)
+        n_with_files = sum(1 for _, _, _, fp, _ in obs_list if fp is not None)
+
+        logger.info(
+            "Extracting strip footprints: %d observations "
+            "(%d with files on disk), %d threads ...",
+            n_total, n_with_files, n_workers,
+        )
+
+        # Results indexed by position in obs_list.
+        fp_results: list[
+            tuple[list[tuple[float, float]] | None, tuple | None]
+        ] = [(None, None)] * n_total
+
+        done_count = 0
+        lock = threading.Lock()
+
+        def _do_extract(idx: int) -> None:
+            nonlocal done_count
+            _, _, _, fp_path, _ = obs_list[idx]
+            fp_results[idx] = _extract_footprint(fp_path, mars_crs)
+            with lock:
+                done_count += 1
+                if done_count % 50 == 0 or done_count == n_with_files:
+                    logger.info(
+                        "  footprint extraction: %d / %d done",
+                        done_count, n_with_files,
+                    )
+
+        # Only submit work for observations that have a file on disk.
+        indices_with_files = [
+            i for i, (_, _, _, fp, _) in enumerate(obs_list) if fp is not None
+        ]
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = [pool.submit(_do_extract, i) for i in indices_with_files]
+            for f in tqdm(
+                    as_completed(futs),
+                    total=len(futs),
+                    desc="Extracting footprints",
+                    unit="strip",
+            ):
+                f.result()
+
+        # ── Phase 3: assemble records (fast) ─────────────────────────
         records: list[dict] = []
         n_polygon = 0
         n_jp2_bbox = 0
         n_index_bbox = 0
-        for obs_id, grp in df.groupby("_obs_id", sort=False):
-            ref = grp.iloc[0]
 
-            color_rows = grp[grp["_product_type"] == "COLOR"]
-            red_rows = grp[grp["_product_type"] == "RED"]
-
-            color_path = (
-                color_rows.iloc[0]["_local_path"] if not color_rows.empty else None
-            )
-            red_path = (
-                red_rows.iloc[0]["_local_path"] if not red_rows.empty else None
-            )
+        for i, (obs_id, cp, rp, _, ref) in enumerate(obs_list):
+            hull_coords, file_bounds = fp_results[i]
 
             geom = None
 
-            # Try the primary JP2 file (COLOR first, RED as fallback).
-            for p in (color_path, red_path):
-                if p is not None:
-                    footprint = self._extract_data_footprint(pathlib.Path(p))
-                    if footprint is not None:
-                        geom = footprint
-                        n_polygon += 1
-                        break
+            # Case A: convex hull of non-zero pixels.
+            if hull_coords is not None:
+                candidate = Polygon(hull_coords)
+                if not candidate.is_valid:
+                    candidate = candidate.buffer(0)
+                if candidate.is_valid and not candidate.is_empty and candidate.area > 1e-12:
+                    geom = candidate
+                    n_polygon += 1
 
-            # Case B: JP2 exists but footprint extraction failed.
-            if geom is None:
-                for p in (color_path, red_path):
-                    if p is not None:
-                        file_bounds = self._read_jp2_bounds(pathlib.Path(p))
-                        if file_bounds is not None:
-                            geom = box(*file_bounds)
-                            n_jp2_bbox += 1
-                            break
+            # Case B: JP2/COG bounding box.
+            if geom is None and file_bounds is not None:
+                geom = box(*file_bounds)
+                n_jp2_bbox += 1
 
-            # Case C: no JP2 available — cumulative index bbox.
+            # Case C: cumulative-index min/max bbox.
             if geom is None:
                 lon_min = ((float(ref["MINIMUM_LONGITUDE"]) + 180.0) % 360.0) - 180.0
                 lon_max = ((float(ref["MAXIMUM_LONGITUDE"]) + 180.0) % 360.0) - 180.0
@@ -974,9 +1117,9 @@ class MarsHiRISE(GeoDataset):
 
             records.append(
                 {
-                    "obs_id": str(obs_id),
-                    "color_path": color_path,
-                    "red_path": red_path,
+                    "obs_id": obs_id,
+                    "color_path": cp,
+                    "red_path": rp,
                     "geometry": geom,
                     "t_start": ref["START_TIME"],
                     "t_stop": ref["STOP_TIME"],
@@ -988,6 +1131,7 @@ class MarsHiRISE(GeoDataset):
             n_polygon, n_jp2_bbox, n_index_bbox,
         )
 
+        # ── Phase 4: build GeoDataFrame (unchanged) ──────────────────
         obs_df = pd.DataFrame(records)
         if obs_df.empty:
             raise DatasetNotFoundError(self)
@@ -1015,12 +1159,9 @@ class MarsHiRISE(GeoDataset):
         minx, miny = total_bounds[["minx", "miny"]].min()
         maxx, maxy = total_bounds[["maxx", "maxy"]].max()
         logger.info(
-            "Spatial index: %d observations, lon [%.2f, %.2f] lat [%.2f, %.2f].",
-            len(self.index),
-            minx,
-            maxx,
-            miny,
-            maxy,
+            "Spatial index: %d observations, "
+            "lon [%.2f, %.2f] lat [%.2f, %.2f].",
+            len(self.index), minx, maxx, miny, maxy,
         )
 
     def _read_jp2_bounds(
