@@ -1,0 +1,505 @@
+"""Patch-level MarsCLIP dataset aligned to the Stage A workflow."""
+
+from __future__ import annotations
+
+import pathlib
+import re
+from collections.abc import Callable, Sequence
+from typing import Any
+
+import pandas as pd
+import torch
+from shapely.geometry import box as shapely_box
+from torch.utils.data import Dataset
+from torchgeo.samplers import Units
+
+from hirise_sampler import HiRISEGeoSampler, _to_tuple
+from mars_hirise import ALL_CHANNELS, MarsHiRISE
+from marsclip_dataset import (
+    GEO_FEATURE_NAMES,
+    VIEWING_FEATURE_NAMES,
+    _build_geo_features,
+    _build_viewing_features,
+)
+from observation_manifest import _clean_text, _normalize_longitude
+from rationale_cache import merge_rationale_cache
+
+PATCH_SCALE_FEATURE_NAMES: tuple[str, ...] = (
+    "map_scale",
+    "map_resolution",
+    "patch_lon_span_deg",
+    "patch_lat_span_deg",
+    "patch_area_deg2",
+    "dominant_overlap_fraction",
+    "source_obs_count",
+    "patch_aspect_ratio",
+)
+
+_PRODUCT_RE = re.compile(r"_(COLOR|RED)\s*$")
+
+
+def _normalize_image_size(value: int | tuple[int, int]) -> tuple[int, int]:
+    """Normalize an image size specification to ``(height, width)``."""
+    if isinstance(value, int):
+        return value, value
+    return int(value[0]), int(value[1])
+
+
+def _product_type(product_id: str) -> str | None:
+    """Extract the HiRISE product suffix (``COLOR`` or ``RED``)."""
+    match = _PRODUCT_RE.search(str(product_id).strip())
+    return match.group(1) if match else None
+
+
+def _observation_id(product_id: str) -> str:
+    """Strip the product suffix from a HiRISE product id."""
+    return _PRODUCT_RE.sub("", str(product_id).strip())
+
+
+def _build_patch_scale_features(
+    patch_row: pd.Series,
+    obs_row: pd.Series,
+) -> torch.Tensor:
+    """Build patch-level scale features from one patch record and observation row."""
+    patch_lon = max(1e-12, float(patch_row["patch_lon_span_deg"]))
+    patch_lat = max(1e-12, float(patch_row["patch_lat_span_deg"]))
+    values = [
+        float(obs_row["map_scale"]),
+        float(obs_row["map_resolution"]),
+        patch_lon,
+        patch_lat,
+        float(patch_row["patch_area_deg2"]),
+        float(patch_row["dominant_overlap_fraction"]),
+        float(patch_row["source_obs_count"]),
+        patch_lon / patch_lat,
+    ]
+    return torch.tensor(values, dtype=torch.float32)
+
+
+def build_patch_observation_metadata(
+    geo_dataset: MarsHiRISE | Any,
+    *,
+    rationale_cache: pd.DataFrame | pathlib.Path | str | None = None,
+) -> pd.DataFrame:
+    """Build one metadata row per observation for patch-level MarsCLIP samples."""
+    raw_index = getattr(geo_dataset, "_raw_index", None)
+    if raw_index is None:
+        raise ValueError("geo_dataset must expose a populated _raw_index DataFrame.")
+
+    working = raw_index.copy()
+    working["PRODUCT_ID"] = working["PRODUCT_ID"].astype(str).str.strip()
+    working["_obs_id"] = working["PRODUCT_ID"].map(_observation_id)
+    working["_product_type"] = working["PRODUCT_ID"].map(_product_type)
+
+    records: list[dict[str, object]] = []
+    for obs_id, group in working.groupby("_obs_id", sort=False):
+        color_rows = group[group["_product_type"] == "COLOR"]
+        red_rows = group[group["_product_type"] == "RED"]
+
+        primary = color_rows.iloc[0] if not color_rows.empty else group.iloc[0]
+        has_color = not color_rows.empty
+        has_red = has_color or not red_rows.empty
+        stereo_flag = str(primary.get("STEREO_FLAG", "")).strip().upper()
+
+        records.append(
+            {
+                "obs_id": str(obs_id),
+                "product_id": str(primary["PRODUCT_ID"]).strip(),
+                "rationale_desc": _clean_text(primary.get("RATIONALE_DESC", "")),
+                "start_time": pd.to_datetime(primary.get("START_TIME"), utc=True, errors="coerce"),
+                "stop_time": pd.to_datetime(primary.get("STOP_TIME"), utc=True, errors="coerce"),
+                "min_lon": _normalize_longitude(primary.get("MINIMUM_LONGITUDE", 0.0)),
+                "max_lon": _normalize_longitude(primary.get("MAXIMUM_LONGITUDE", 0.0)),
+                "min_lat": float(primary.get("MINIMUM_LATITUDE", 0.0)),
+                "max_lat": float(primary.get("MAXIMUM_LATITUDE", 0.0)),
+                "centroid_lon": (
+                    _normalize_longitude(primary.get("MINIMUM_LONGITUDE", 0.0))
+                    + _normalize_longitude(primary.get("MAXIMUM_LONGITUDE", 0.0))
+                )
+                / 2.0,
+                "centroid_lat": (
+                    float(primary.get("MINIMUM_LATITUDE", 0.0))
+                    + float(primary.get("MAXIMUM_LATITUDE", 0.0))
+                )
+                / 2.0,
+                "lon_span_deg": (
+                    _normalize_longitude(primary.get("MAXIMUM_LONGITUDE", 0.0))
+                    - _normalize_longitude(primary.get("MINIMUM_LONGITUDE", 0.0))
+                ),
+                "lat_span_deg": float(primary.get("MAXIMUM_LATITUDE", 0.0))
+                - float(primary.get("MINIMUM_LATITUDE", 0.0)),
+                "bbox_area_deg2": (
+                    (
+                        _normalize_longitude(primary.get("MAXIMUM_LONGITUDE", 0.0))
+                        - _normalize_longitude(primary.get("MINIMUM_LONGITUDE", 0.0))
+                    )
+                    * (
+                        float(primary.get("MAXIMUM_LATITUDE", 0.0))
+                        - float(primary.get("MINIMUM_LATITUDE", 0.0))
+                    )
+                ),
+                "image_lines": int(primary.get("IMAGE_LINES", 0)),
+                "line_samples": int(primary.get("LINE_SAMPLES", 0)),
+                "map_scale": float(primary.get("MAP_SCALE", 0.0)),
+                "map_resolution": float(primary.get("MAP_RESOLUTION", 0.0)),
+                "emission_angle": float(primary.get("EMISSION_ANGLE", 0.0)),
+                "incidence_angle": float(primary.get("INCIDENCE_ANGLE", 0.0)),
+                "phase_angle": float(primary.get("PHASE_ANGLE", 0.0)),
+                "local_time": float(primary.get("LOCAL_TIME", 0.0)),
+                "solar_longitude": float(primary.get("SOLAR_LONGITUDE", 0.0)),
+                "sub_solar_azimuth": float(primary.get("SUB_SOLAR_AZIMUTH", 0.0)),
+                "north_azimuth": float(primary.get("NORTH_AZIMUTH", 0.0)),
+                "spacecraft_altitude": float(primary.get("SPACECRAFT_ALTITUDE", 0.0)),
+                "stereo_flag": stereo_flag,
+                "is_stereo": stereo_flag == "YES",
+                "has_near_infrared": has_color,
+                "has_red": has_red,
+                "has_blue_green": has_color,
+                "channel_count": 3 if has_color else 1,
+            }
+        )
+
+    metadata = pd.DataFrame.from_records(records).sort_values("obs_id").reset_index(drop=True)
+    if metadata.empty:
+        raise ValueError("No observation metadata could be built from the cumulative index.")
+
+    if rationale_cache is not None:
+        metadata = merge_rationale_cache(metadata, rationale_cache)
+    else:
+        metadata["rationale_expanded"] = None
+        metadata["has_rationale_expanded"] = False
+
+    return metadata
+
+
+def _deduplicate_centers(
+    centers: Sequence[tuple[float, float, pd.Interval]],
+    *,
+    precision: int = 12,
+) -> list[tuple[float, float, pd.Interval]]:
+    """Drop duplicate patch centers created by overlapping strip footprints."""
+    unique: dict[tuple[float, float], tuple[float, float, pd.Interval]] = {}
+    for cx, cy, interval in centers:
+        key = (round(float(cx), precision), round(float(cy), precision))
+        unique.setdefault(key, (float(cx), float(cy), interval))
+    return list(unique.values())
+
+
+def _select_centers(
+    centers: list[tuple[float, float, pd.Interval]],
+    *,
+    max_patches: int | None = None,
+    generator: torch.Generator | None = None,
+) -> list[tuple[float, float, pd.Interval]]:
+    """Optionally truncate or subsample a deterministic list of patch centers."""
+    if max_patches is None or max_patches >= len(centers):
+        return centers
+    if generator is None:
+        return centers[:max_patches]
+
+    order = torch.randperm(len(centers), generator=generator).tolist()[:max_patches]
+    return [centers[i] for i in order]
+
+
+def build_patch_records(
+    geo_dataset: MarsHiRISE | Any,
+    *,
+    size: float | tuple[float, float] = 0.005,
+    stride: float | tuple[float, float] | None = None,
+    min_geometry_overlap: float = 0.5,
+    observation_metadata: pd.DataFrame | None = None,
+    centers: Sequence[tuple[float, float, pd.Interval]] | None = None,
+    max_patches: int | None = None,
+    generator: torch.Generator | None = None,
+) -> pd.DataFrame:
+    """Build deterministic patch records from HiRISE sampler centers."""
+    if observation_metadata is None:
+        observation_metadata = build_patch_observation_metadata(geo_dataset)
+    obs_lookup = observation_metadata.set_index("obs_id", drop=False)
+
+    if centers is None:
+        sampler = HiRISEGeoSampler(
+            geo_dataset,
+            size=size,
+            stride=stride,
+            units=Units.CRS,
+            min_overlap=min_geometry_overlap,
+        )
+        centers = sampler._centers
+
+    size_h, size_w = _to_tuple(size)
+    half_h = size_h / 2.0
+    half_w = size_w / 2.0
+
+    unique_centers = _deduplicate_centers(list(centers))
+    selected_centers = _select_centers(
+        unique_centers,
+        max_patches=max_patches,
+        generator=generator,
+    )
+
+    records: list[dict[str, object]] = []
+    try:
+        spatial_index = geo_dataset.index.sindex
+    except Exception:
+        spatial_index = None
+
+    for patch_idx, (cx, cy, interval) in enumerate(selected_centers):
+        patch_geom = shapely_box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+        if spatial_index is None:
+            candidates = geo_dataset.index
+        else:
+            candidate_positions = list(spatial_index.intersection(patch_geom.bounds))
+            if not candidate_positions:
+                continue
+            candidates = geo_dataset.index.iloc[candidate_positions]
+        candidates = candidates[candidates.geometry.intersects(patch_geom)]
+        if candidates.empty:
+            continue
+
+        overlaps: list[tuple[str, float]] = []
+        for _, row in candidates.iterrows():
+            overlap_area = row.geometry.intersection(patch_geom).area
+            if overlap_area > 0:
+                overlaps.append((str(row["obs_id"]), float(overlap_area)))
+
+        if not overlaps:
+            continue
+
+        overlaps.sort(key=lambda item: item[1], reverse=True)
+        total_overlap = sum(area for _, area in overlaps)
+        dominant_obs_id = overlaps[0][0]
+        dominant_meta = obs_lookup.loc[dominant_obs_id]
+
+        contributing_obs_ids = tuple(obs_id for obs_id, _ in overlaps)
+        overlap_fractions = tuple(area / total_overlap for _, area in overlaps)
+        contributing_rationales = tuple(
+            str(obs_lookup.loc[obs_id]["rationale_desc"])
+            for obs_id in contributing_obs_ids
+            if obs_id in obs_lookup.index
+        )
+
+        records.append(
+            {
+                "patch_id": f"patch_{patch_idx:06d}",
+                "x_start": cx - half_w,
+                "x_stop": cx + half_w,
+                "y_start": cy - half_h,
+                "y_stop": cy + half_h,
+                "t_start": pd.Timestamp(interval.left),
+                "t_stop": pd.Timestamp(interval.right),
+                "min_lon": cx - half_w,
+                "max_lon": cx + half_w,
+                "min_lat": cy - half_h,
+                "max_lat": cy + half_h,
+                "centroid_lon": cx,
+                "centroid_lat": cy,
+                "patch_lon_span_deg": size_w,
+                "patch_lat_span_deg": size_h,
+                "patch_area_deg2": patch_geom.area,
+                "dominant_obs_id": dominant_obs_id,
+                "contributing_obs_ids": contributing_obs_ids,
+                "contributing_rationales": contributing_rationales,
+                "overlap_fractions": overlap_fractions,
+                "dominant_overlap_fraction": overlap_fractions[0],
+                "source_obs_count": len(contributing_obs_ids),
+                "has_near_infrared": any(
+                    bool(obs_lookup.loc[obs_id]["has_near_infrared"])
+                    for obs_id in contributing_obs_ids
+                ),
+                "has_red": any(
+                    bool(obs_lookup.loc[obs_id]["has_red"])
+                    for obs_id in contributing_obs_ids
+                ),
+                "has_blue_green": any(
+                    bool(obs_lookup.loc[obs_id]["has_blue_green"])
+                    for obs_id in contributing_obs_ids
+                ),
+                "rationale_raw": str(dominant_meta["rationale_desc"]),
+            }
+        )
+
+    patch_records = pd.DataFrame.from_records(records)
+    if patch_records.empty:
+        raise ValueError("No patch records could be built from the requested sampler settings.")
+
+    return patch_records.reset_index(drop=True)
+
+
+def summarize_patch_records(patch_records: pd.DataFrame) -> dict[str, float]:
+    """Compute a few lightweight summary stats for a patch manifest."""
+    if patch_records.empty:
+        return {
+            "num_patches": 0,
+            "num_unique_dominant_obs": 0,
+            "mean_source_obs_count": 0.0,
+            "mean_dominant_overlap_fraction": 0.0,
+        }
+
+    return {
+        "num_patches": float(len(patch_records)),
+        "num_unique_dominant_obs": float(patch_records["dominant_obs_id"].nunique()),
+        "mean_source_obs_count": float(patch_records["source_obs_count"].mean()),
+        "mean_dominant_overlap_fraction": float(
+            patch_records["dominant_overlap_fraction"].mean()
+        ),
+    }
+
+
+class MarsCLIPPatchDataset(Dataset):
+    """Patch-level dataset bridging MarsHiRISE sampling to the MarsCLIP workflow."""
+
+    def __init__(
+        self,
+        geo_dataset: MarsHiRISE | Any | None = None,
+        *,
+        root: pathlib.Path | str | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        patch_size: float | tuple[float, float] = 0.005,
+        stride: float | tuple[float, float] | None = None,
+        image_size: int | tuple[int, int] = 224,
+        min_geometry_overlap: float = 0.5,
+        min_valid_fraction: float = 0.5,
+        max_patches: int | None = None,
+        generator: torch.Generator | None = None,
+        rationale_cache: pd.DataFrame | pathlib.Path | str | None = None,
+        observation_metadata: pd.DataFrame | None = None,
+        patch_records: pd.DataFrame | None = None,
+        transforms: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        if geo_dataset is None:
+            if root is None:
+                raise ValueError("Either geo_dataset or root must be provided.")
+            geo_dataset = MarsHiRISE(
+                root=root,
+                bbox=bbox,
+                channels=list(ALL_CHANNELS),
+                download=False,
+            )
+
+        if observation_metadata is None:
+            observation_metadata = build_patch_observation_metadata(
+                geo_dataset,
+                rationale_cache=rationale_cache,
+            )
+        else:
+            observation_metadata = observation_metadata.copy()
+            if rationale_cache is not None:
+                observation_metadata = merge_rationale_cache(
+                    observation_metadata,
+                    rationale_cache,
+                )
+            elif "rationale_expanded" not in observation_metadata.columns:
+                observation_metadata["rationale_expanded"] = None
+                observation_metadata["has_rationale_expanded"] = False
+
+        if patch_records is None:
+            patch_records = build_patch_records(
+                geo_dataset,
+                size=patch_size,
+                stride=stride,
+                min_geometry_overlap=min_geometry_overlap,
+                observation_metadata=observation_metadata,
+                max_patches=max_patches,
+                generator=generator,
+            )
+        else:
+            patch_records = patch_records.copy()
+
+        if patch_records.empty:
+            raise ValueError("Patch record table is empty.")
+
+        self.geo_dataset = geo_dataset
+        self.patch_records = patch_records.reset_index(drop=True)
+        self.observation_metadata = observation_metadata.set_index("obs_id", drop=False)
+        self.image_size = _normalize_image_size(image_size)
+        self.patch_size = _to_tuple(patch_size)
+        self.min_valid_fraction = float(min_valid_fraction)
+        self.transforms = transforms
+
+    def __len__(self) -> int:
+        return len(self.patch_records)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        patch_row = self.patch_records.iloc[index]
+        obs_row = self.observation_metadata.loc[str(patch_row["dominant_obs_id"])]
+
+        out_h, out_w = self.image_size
+        x_step = (float(patch_row["x_stop"]) - float(patch_row["x_start"])) / float(out_w)
+        y_step = (float(patch_row["y_stop"]) - float(patch_row["y_start"])) / float(out_h)
+
+        sample = self.geo_dataset[
+            (
+                slice(float(patch_row["x_start"]), float(patch_row["x_stop"]), x_step),
+                slice(float(patch_row["y_start"]), float(patch_row["y_stop"]), y_step),
+                slice(pd.Timestamp(patch_row["t_start"]), pd.Timestamp(patch_row["t_stop"]), 1),
+            )
+        ]
+
+        image: torch.Tensor = sample["image"]
+        valid_mask = (image > 1e-6).any(dim=0)
+        band_valid_fraction = (image > 1e-6).float().mean(dim=(1, 2))
+        overall_valid_fraction = float(valid_mask.float().mean())
+        band_presence_mask = torch.tensor(
+            [
+                bool(patch_row["has_near_infrared"]),
+                bool(patch_row["has_red"]),
+                bool(patch_row["has_blue_green"]),
+            ],
+            dtype=torch.bool,
+        )
+
+        rationale_expanded = obs_row.get("rationale_expanded")
+        if pd.isna(rationale_expanded):
+            rationale_expanded = None
+
+        out: dict[str, Any] = {
+            "image": image,
+            "valid_mask": valid_mask,
+            "rationale_raw": str(obs_row["rationale_desc"]),
+            "rationale_expanded": rationale_expanded,
+            "location": torch.tensor(
+                [float(patch_row["centroid_lon"]), float(patch_row["centroid_lat"])],
+                dtype=torch.float32,
+            ),
+            "geo_features": _build_geo_features(patch_row),
+            "scale_features": _build_patch_scale_features(patch_row, obs_row),
+            "metadata": {
+                "patch_id": str(patch_row["patch_id"]),
+                "obs_id": str(patch_row["dominant_obs_id"]),
+                "dominant_obs_id": str(patch_row["dominant_obs_id"]),
+                "product_id": str(obs_row["product_id"]),
+                "bounds": sample["bounds"],
+                "crs": sample["crs"],
+                "patch_bounds": (
+                    float(patch_row["x_start"]),
+                    float(patch_row["y_start"]),
+                    float(patch_row["x_stop"]),
+                    float(patch_row["y_stop"]),
+                ),
+                "viewing_features": _build_viewing_features(obs_row),
+                "viewing_feature_names": VIEWING_FEATURE_NAMES,
+                "geo_feature_names": GEO_FEATURE_NAMES,
+                "scale_feature_names": PATCH_SCALE_FEATURE_NAMES,
+                "band_presence_mask": band_presence_mask,
+                "band_valid_fraction": band_valid_fraction,
+                "overall_valid_fraction": overall_valid_fraction,
+                "is_patch_valid": overall_valid_fraction >= self.min_valid_fraction,
+                "min_valid_fraction": self.min_valid_fraction,
+                "contributing_obs_ids": tuple(patch_row["contributing_obs_ids"]),
+                "contributing_rationales": tuple(patch_row["contributing_rationales"]),
+                "overlap_fractions": tuple(patch_row["overlap_fractions"]),
+                "source_obs_count": int(patch_row["source_obs_count"]),
+                "dominant_overlap_fraction": float(patch_row["dominant_overlap_fraction"]),
+                "patch_size": self.patch_size,
+                "image_size": self.image_size,
+                "start_time": obs_row["start_time"],
+                "stop_time": obs_row["stop_time"],
+                "has_rationale_expanded": bool(obs_row.get("has_rationale_expanded", False)),
+                "expansion_model": obs_row.get("expansion_model"),
+                "prompt_version": obs_row.get("prompt_version"),
+            },
+        }
+        if self.transforms is not None:
+            out = self.transforms(out)
+        return out
