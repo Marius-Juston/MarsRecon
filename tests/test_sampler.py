@@ -11,6 +11,7 @@ Covers:
 
 import pathlib
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -194,3 +195,141 @@ class TestHiRISESamplerStride:
         s1 = HiRISEGeoSampler(dataset, size=0.005, units=Units.CRS)
         s2 = HiRISEGeoSampler(dataset, size=0.005, stride=0.005, units=Units.CRS)
         assert len(s1._centers) == len(s2._centers)
+
+
+# ---------------------------------------------------------------------------
+# _to_tuple utility
+# ---------------------------------------------------------------------------
+
+
+class TestToTuple:
+    """_to_tuple normalises scalars and 2-tuples to (height, width)."""
+
+    def test_integer_returns_symmetric_float_pair(self):
+        from hirise_sampler import _to_tuple
+
+        result = _to_tuple(3)
+        assert result == (3.0, 3.0)
+
+    def test_float_returns_symmetric_float_pair(self):
+        from hirise_sampler import _to_tuple
+
+        result = _to_tuple(0.005)
+        assert result == pytest.approx((0.005, 0.005))
+
+    def test_tuple_preserved_as_floats(self):
+        from hirise_sampler import _to_tuple
+
+        result = _to_tuple((0.003, 0.007))
+        assert result == pytest.approx((0.003, 0.007))
+
+
+# ---------------------------------------------------------------------------
+# PIXELS units conversion
+# ---------------------------------------------------------------------------
+
+
+class TestSamplerPixelUnits:
+    def test_pixels_converted_to_degrees(self, strip_polygon, mars_crs):
+        """Units.PIXELS: size/stride multiplied by dataset.res."""
+        from helpers import make_mock_dataset
+
+        pixel_size = 100
+        xres, yres = 8.44e-6, 8.44e-6
+        dataset = make_mock_dataset([strip_polygon], mars_crs, res=(xres, yres))
+        sampler = HiRISEGeoSampler(
+            dataset, size=pixel_size, length=10, units=Units.PIXELS
+        )
+        expected_h = pixel_size * yres
+        expected_w = pixel_size * xres
+        assert sampler.size[0] == pytest.approx(expected_h, rel=1e-6)
+        assert sampler.size[1] == pytest.approx(expected_w, rel=1e-6)
+        # Stride defaults to size when not set
+        assert sampler.stride[0] == pytest.approx(expected_h, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# buffer() exception fallback
+# ---------------------------------------------------------------------------
+
+
+class TestBufferExceptionFallback:
+    def test_buffer_raises_falls_back_to_original(
+        self, strip_polygon, mars_crs
+    ):
+        """If buffer(-inset) raises, the sampler falls back to the original polygon."""
+        from helpers import make_mock_dataset
+
+        original_buffer = strip_polygon.buffer
+
+        call_count = [0]
+
+        def _bad_buffer(dist, *args, **kwargs):
+            call_count[0] += 1
+            if dist < 0:
+                raise RuntimeError("simulated buffer error")
+            return original_buffer(dist, *args, **kwargs)
+
+        dataset = make_mock_dataset([strip_polygon], mars_crs)
+
+        with patch.object(
+            strip_polygon.__class__, "buffer", side_effect=_bad_buffer
+        ):
+            sampler = HiRISEGeoSampler(
+                dataset, size=0.005, length=10, units=Units.CRS
+            )
+
+        # Even with buffer failing, centers should be found using original polygon
+        assert len(sampler._centers) > 0
+
+
+# ---------------------------------------------------------------------------
+# min_overlap edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestMinOverlapEdgeCases:
+    def test_min_overlap_zero_accepts_more_centers(self, strip_polygon, mars_crs):
+        """min_overlap=0 (exclusive) accepts grid points that barely clip the polygon."""
+        from helpers import make_mock_dataset
+
+        dataset = make_mock_dataset([strip_polygon], mars_crs)
+        default_sampler = HiRISEGeoSampler(
+            dataset, size=0.005, length=10, units=Units.CRS, min_overlap=0.5
+        )
+        loose_sampler = HiRISEGeoSampler(
+            dataset, size=0.005, length=10, units=Units.CRS, min_overlap=0.0
+        )
+        # With a lower threshold, at least as many centres (typically more)
+        assert len(loose_sampler._centers) >= len(default_sampler._centers)
+
+    def test_min_overlap_one_strict_filter(self, strip_polygon, mars_crs):
+        """min_overlap=1.0 keeps only fully-contained patches (or none)."""
+        from helpers import make_mock_dataset
+
+        dataset = make_mock_dataset([strip_polygon], mars_crs)
+        strict_sampler = HiRISEGeoSampler(
+            dataset, size=0.005, length=10, units=Units.CRS, min_overlap=1.0
+        )
+        default_sampler = HiRISEGeoSampler(
+            dataset, size=0.005, length=10, units=Units.CRS, min_overlap=0.5
+        )
+        # Strict filter has at most as many centres as default
+        assert len(strict_sampler._centers) <= len(default_sampler._centers)
+
+
+# ---------------------------------------------------------------------------
+# Empty centres iteration
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyCentersIteration:
+    def test_tiny_strip_empty_centers_yields_nothing(self, mars_crs):
+        """Strip smaller than patch → _centers == [] → list(sampler) == []."""
+        from helpers import make_mock_dataset
+
+        tiny = box(-136.0, 18.0, -135.999, 18.002)  # ~0.001° × ~0.002°
+        dataset = make_mock_dataset([tiny], mars_crs)
+        sampler = HiRISEGeoSampler(dataset, size=0.005, length=5, units=Units.CRS)
+        assert sampler._centers == []
+        assert list(sampler) == []  # hits the `if n == 0: return` branch

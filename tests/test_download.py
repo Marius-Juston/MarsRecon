@@ -199,6 +199,65 @@ class TestContentLengthValidation:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Disk-space guard
+# ---------------------------------------------------------------------------
+
+
+class TestDiskSpaceGuard:
+    async def test_low_disk_space_sets_stop_event(self, dest, stop_event):
+        """shutil.disk_usage returns free < threshold → stop_event set, file not created."""
+        import shutil
+        from unittest.mock import patch
+        from collections import namedtuple
+
+        DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
+        # 50 GB < 100 GB threshold
+        low_disk = DiskUsage(total=500 * 1024**3, used=450 * 1024**3, free=50 * 1024**3)
+
+        with patch.object(shutil, "disk_usage", return_value=low_disk):
+            async with aiohttp.ClientSession() as session:
+                await _download_file(session, _URL, dest, stop_event)
+
+        assert not dest.exists()
+        assert stop_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Generic exception (not ClientResponseError / ClientConnectorError)
+# ---------------------------------------------------------------------------
+
+
+class TestGenericException:
+    async def test_generic_exception_returns_immediately(self, dest, stop_event):
+        """A non-aiohttp exception → returns immediately (no retry), tmp removed."""
+        import aiohttp as _aiohttp
+        from aioresponses import aioresponses as _aioresponses
+
+        class _FakeSession:
+            def get(self, url, **kw):
+                raise ValueError("unexpected error")
+
+        async with aiohttp.ClientSession() as real_session:
+            # Inject a session whose .get() raises a generic exception
+            class _BrokenSession:
+                class _CtxMgr:
+                    async def __aenter__(self):
+                        raise ValueError("unexpected error")
+
+                    async def __aexit__(self, *a):
+                        pass
+
+                def get(self, url, **kw):
+                    return self._CtxMgr()
+
+            broken = _BrokenSession()
+            await _download_file(broken, _URL, dest, stop_event, max_retries=0)
+
+        assert not dest.exists()
+        assert not _tmp(dest).exists()
+
+
 class TestDownloadCleanup:
     async def test_no_tmp_after_404(self, dest, stop_event):
         with aioresponses() as m:
