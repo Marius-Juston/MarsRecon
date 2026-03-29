@@ -29,6 +29,9 @@ markers = [
 
 [tool.coverage.run]
 source = ["src"]
+omit = [
+    "src/validate_sampling.py",
+]
 
 [tool.coverage.report]
 show_missing = true

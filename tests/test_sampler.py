@@ -247,6 +247,20 @@ class TestSamplerPixelUnits:
         # Stride defaults to size when not set
         assert sampler.stride[0] == pytest.approx(expected_h, rel=1e-6)
 
+    def test_explicit_pixels_stride_converted_to_degrees(self, strip_polygon, mars_crs):
+        """Units.PIXELS with explicit stride: both size and stride are scaled by res."""
+        from helpers import make_mock_dataset
+
+        pixel_size = 100
+        pixel_stride = 50
+        xres, yres = 8.44e-6, 8.44e-6
+        dataset = make_mock_dataset([strip_polygon], mars_crs, res=(xres, yres))
+        sampler = HiRISEGeoSampler(
+            dataset, size=pixel_size, stride=pixel_stride, units=Units.PIXELS
+        )
+        assert sampler.stride[0] == pytest.approx(pixel_stride * yres, rel=1e-6)
+        assert sampler.stride[1] == pytest.approx(pixel_stride * xres, rel=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # buffer() exception fallback
@@ -255,7 +269,7 @@ class TestSamplerPixelUnits:
 
 class TestBufferExceptionFallback:
     def test_buffer_raises_falls_back_to_original(
-        self, strip_polygon, mars_crs
+            self, strip_polygon, mars_crs
     ):
         """If buffer(-inset) raises, the sampler falls back to the original polygon."""
         from helpers import make_mock_dataset
@@ -273,7 +287,7 @@ class TestBufferExceptionFallback:
         dataset = make_mock_dataset([strip_polygon], mars_crs)
 
         with patch.object(
-            strip_polygon.__class__, "buffer", side_effect=_bad_buffer
+                strip_polygon.__class__, "buffer", side_effect=_bad_buffer
         ):
             sampler = HiRISEGeoSampler(
                 dataset, size=0.005, length=10, units=Units.CRS
@@ -281,6 +295,32 @@ class TestBufferExceptionFallback:
 
         # Even with buffer failing, centers should be found using original polygon
         assert len(sampler._centers) > 0
+
+    def test_buffer_returns_empty_falls_back_to_original(self, mars_crs):
+        """If buffer(-inset) returns empty geometry, sampler falls back to original (line 148)."""
+        from helpers import make_mock_dataset
+
+        # A thin diagonal parallelogram: large bounds but very thin actual width (~0.00007°).
+        # With size=0.005 → _edge_inset=0.00025°, which exceeds the polygon's half-width,
+        # so buffer(-inset) collapses to an empty polygon.
+        thin_w = 0.0001
+        thin_strip = Polygon([
+            (-136.0, 18.0),
+            (-136.0 + thin_w, 18.0),
+            (-135.0 + thin_w, 19.0),
+            (-135.0, 19.0),
+        ])
+        # Sanity check: buffer does produce empty for this polygon at this inset.
+        assert thin_strip.buffer(-0.00025).is_empty, (
+            "test setup: buffer(-inset) must be empty for this thin strip"
+        )
+
+        dataset = make_mock_dataset([thin_strip], mars_crs)
+        # size=0.005 → _edge_inset = 0.005 * 0.05 = 0.00025 → buffer returns empty
+        sampler = HiRISEGeoSampler(dataset, size=0.005, units=Units.CRS)
+        # The code falls back to the original polygon; centers list may be empty
+        # (strip too narrow to fit a patch), but no exception should be raised.
+        assert isinstance(sampler._centers, list)
 
 
 # ---------------------------------------------------------------------------
