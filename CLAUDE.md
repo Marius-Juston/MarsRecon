@@ -18,7 +18,7 @@ uv run pytest tests/ -v                    # Run all unit tests
 uv run pytest tests/ -m "not integration" # Skip tests that need real data on disk
 uv run pytest tests/ --cov=src --cov-report=term-missing  # With coverage
 
-uv run python src/temp.py      # Run main pipeline (downloads + samples + plots)
+uv run python src/mars_hirise.py  # Run main pipeline (downloads + samples + plots)
 
 # Pre-convert JP2 files to COG GeoTIFF for faster training (run once)
 uv run python -m src.preprocessing --root /scratch/mars_hirise --workers 4
@@ -27,10 +27,10 @@ uv run python -m src.preprocessing --root /scratch/mars_hirise --workers 4
 ## Architecture
 
 Source files:
-- **`src/temp.py`** — active implementation; `MarsHiRISE` dataset class
-- **`src/mars_hirise.py`** — original (reference only)
+- **`src/mars_hirise.py`** — `MarsHiRISE` dataset class; main entry point
 - **`src/hirise_sampler.py`** — `HiRISEGeoSampler`: strip-aware sampler
 - **`src/preprocessing.py`** — COG conversion pipeline and geographic train/test split
+- **`src/validate_sampling.py`** — diagnostic script (not a library module; excluded from coverage)
 
 ### Core Class: `MarsHiRISE(GeoDataset)`
 
@@ -38,14 +38,14 @@ The dataset lifecycle:
 1. `_verify()` — checks local files; triggers download pipeline if missing
 2. `_download_index()` — fetches `RDRCUMINDEX.LBL` + `RDRCUMINDEX.TAB` from NASA PDS
 3. `_load_index()` — parses PDS index into a pandas DataFrame, normalizes longitudes from [0°,360°] to [-180°,180°]
-4. `_build_spatial_index()` — groups by product ID, creates a GeoDataFrame with spatial geometry + temporal interval; cached to `spatial_cache{suffix}_v2.gpkg` (suffix encodes `target`/`bbox` filters)
+4. `_build_spatial_index()` — groups by product ID, creates a GeoDataFrame with spatial geometry + temporal interval; cached to `spatial_cache{suffix}_v3.gpkg` (suffix encodes `target`/`bbox` filters)
 5. `_download_images()` — concurrent async JP2 download using 8 worker processes × 2 concurrent requests (tuned for NASA server limits)
 6. `__getitem__(index)` — spatiotemporal slice → calls `_load_tile()` → returns `{"image": Tensor, "bounds": Tensor, "crs": str}`
 
 ### Sampling: `HiRISEGeoSampler` (`src/hirise_sampler.py`)
 
 HiRISE strips are long, thin, rotated parallelograms. `RandomGeoSampler` samples within axis-aligned bounding boxes, causing 60–90% of patches to be empty. `HiRISEGeoSampler` solves this by:
-1. Reading actual polygon footprints from the spatial index (built from `CORNER1-4` coordinates)
+1. Reading actual polygon footprints from the spatial index (built from `CORNER1-4` coordinates via convex hull)
 2. Pre-computing a regular grid of patch centres that are confirmed to intersect each strip polygon
 3. Randomly sampling from this pre-computed set each epoch
 
@@ -84,7 +84,7 @@ Parses PDS3 `.LBL` label files to extract per-product `SCALING_FACTOR` and `OFFS
 | `target` | Optional case-insensitive substring filter on product name columns |
 | `channels` | List from `["NEAR-INFRARED", "RED", "BLUE-GREEN"]` |
 | `download` | Fetch missing files from NASA PDS if `True` |
-| `reuse_cache` | Reuse cached `spatial_cache_v2.gpkg` if `True` |
+| `reuse_cache` | Reuse cached `spatial_cache_v3.gpkg` if `True` |
 
 ## Data Products
 
@@ -97,3 +97,19 @@ Configured via `logger_config.json`:
 - stdout: WARNING+ only
 - stderr: ERROR+
 - `app.log`: DEBUG+ (full trace)
+
+## Test Coverage
+
+All three library modules are at 100% line coverage (274 unit tests, no real HiRISE data required):
+
+```bash
+uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing
+```
+
+| Module | Statements | Coverage |
+|---|---|---|
+| `src/mars_hirise.py` | 828 | 100% |
+| `src/hirise_sampler.py` | 80 | 100% |
+| `src/preprocessing.py` | 161 | 100% |
+
+Integration tests (require real data at `/scratch/mars_hirise`) are marked `@pytest.mark.integration` and excluded from the unit suite via `-m "not integration"`.

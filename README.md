@@ -10,7 +10,7 @@ HiRISE (High Resolution Imaging Science Experiment) aboard the Mars Reconnaissan
 
 - Strip-aware sampling — `HiRISEGeoSampler` pre-grids valid patch centres within actual HiRISE strip polygons, avoiding 60–90% of empty-pixel patches that result from bounding-box sampling.
 - Automatic radiometric calibration — `I/F = DN × SCALING_FACTOR + OFFSET`, clipped to `[0, 1]`, using per-product `.LBL` files.
-- Spatial index with polygon footprints — corner-coordinate polygons intersected with each JP2's reprojected bounds for accurate footprints.
+- Spatial index with polygon footprints — convex hull of non-zero pixels intersected with each JP2's reprojected bounds for accurate footprints.
 - COG-ready — `src/preprocessing.py` converts JP2 files to Cloud Optimised GeoTIFF for 10–100× faster random-access reads.
 - Geographic train/test split — longitude- or latitude-blocked splits prevent spatial leakage.
 
@@ -34,15 +34,11 @@ HiRISE RDR products are served from the NASA PDS Imaging Node. The dataset expec
 <root>/
     RDRCUMINDEX.LBL
     RDRCUMINDEX.TAB
-    MROHR_0001/
-        DATA/
-            PSP/
-                ORB_001400_001499/
-                    PSP_001430_1780/
-                        PSP_001430_1780_COLOR.JP2
-                        PSP_001430_1780_COLOR.LBL
-                        PSP_001430_1780_RED.JP2
-                        PSP_001430_1780_RED.LBL
+    images/
+        PSP_001430_1780_COLOR.JP2
+        PSP_001430_1780_COLOR.LBL
+        PSP_001430_1780_RED.JP2
+        PSP_001430_1780_RED.LBL
 ```
 
 Pass `download=True` on first use to auto-download files. Mirrors via `rsync` or `wget -r` are fully compatible.
@@ -51,8 +47,8 @@ Pass `download=True` on first use to auto-download files. Mirrors via `rsync` or
 
 ```python
 from torch.utils.data import DataLoader
-from src.temp import MarsHiRISE
-from src.hirise_sampler import HiRISEGeoSampler
+from mars_hirise import MarsHiRISE
+from hirise_sampler import HiRISEGeoSampler
 from torchgeo.samplers import Units
 
 # Olympus Mons region, all three colour channels
@@ -80,10 +76,10 @@ for sample in loader:
 | Channel | Source file | Notes |
 |---|---|---|
 | `NEAR-INFRARED` | `_COLOR.JP2` band 1 | ~900 nm |
-| `RED` | `_COLOR.JP2` band 2 or `_RED.JP2` | RED.JP2 used when only RED requested (higher fidelity) |
+| `RED` | `_COLOR.JP2` band 2 or `_RED.JP2` | `_RED.JP2` used when only RED requested (higher fidelity) |
 | `BLUE-GREEN` | `_COLOR.JP2` band 3 | ~500 nm |
 
-When `_COLOR.JP2` is absent for an observation, NIR and BG channels are zero-filled; the RED channel falls back to `_RED.JP2`.
+When `_COLOR.JP2` is absent for an observation, available channels fall back to `_RED.JP2` where possible.
 
 ## Sampler
 
@@ -106,7 +102,7 @@ At construction, it pre-computes a regular grid of candidate centres for each st
 Converting JP2 files to Cloud Optimised GeoTIFF dramatically speeds up random-window reads:
 
 ```bash
-python -m src.preprocessing --root /scratch/mars_hirise --workers 4
+uv run python -m src.preprocessing --root /scratch/mars_hirise --workers 4
 ```
 
 The dataset transparently prefers `.tif` COG sidecars when they exist alongside `.JP2` files.
@@ -127,26 +123,34 @@ uv run pytest tests/ -m "not integration" -v
 # With coverage
 uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing
 
-# Preprocessing-only coverage (100%)
-uv run pytest tests/test_preprocessing.py --cov=preprocessing --cov-report=term-missing
-
 # Integration tests (require real data at /scratch/mars_hirise)
 uv run pytest tests/ -m integration -v
 ```
 
+### Coverage
+
+All three library modules are at **100% line coverage** across 274 unit tests:
+
+| Module | Statements | Coverage |
+|---|---|---|
+| `src/mars_hirise.py` | 828 | 100% |
+| `src/hirise_sampler.py` | 80 | 100% |
+| `src/preprocessing.py` | 161 | 100% |
+
 ### Test suite overview
 
-| Test file | What it covers |
-|---|---|
-| `test_preprocessing.py` | All of `src/preprocessing.py` — 100% line coverage; 73 tests |
-| `test_download.py` | Async download helpers, retry logic, disk-space guard |
-| `test_spatial_index.py` | Spatial index construction (Cases A–D), GeoPackage cache |
-| `test_dataset.py` | `MarsHiRISE.__getitem__`, tile loading, radiometric calibration |
-| `test_sampler.py` | `HiRISEGeoSampler` grid pre-computation and epoch sampling |
-| `test_lbl_parsing.py` | PDS3 `.LBL` label parsing and `_ProductMeta` extraction |
-| `test_coordinates.py` | Longitude normalisation and CRS helpers |
-| `conftest.py` | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
-| `helpers.py` | `make_mock_dataset()` — minimal `GeoSampler`-compatible mock |
+| Test file | Tests | What it covers |
+|---|---|---|
+| `test_mars_hirise_unit.py` | 100 | `MarsHiRISE` — dataset init, spatial index, tile loading, plotting, download pipeline, `main()` |
+| `test_preprocessing.py` | 73 | All of `src/preprocessing.py` — JP2→COG conversion, geographic split, CLI |
+| `test_download.py` | 22 | Async download helpers, retry logic, disk-space guard, stop-event handling |
+| `test_sampler.py` | 23 | `HiRISEGeoSampler` grid pre-computation, stride, pixel units, reproducibility |
+| `test_coordinates.py` | 16 | Longitude normalisation and CRS helpers |
+| `test_dataset.py` | 18 | `MarsHiRISE.__getitem__`, tile loading, radiometric calibration |
+| `test_spatial_index.py` | 14 | Spatial index construction (Cases A–D), GeoPackage cache |
+| `test_lbl_parsing.py` | 12 | PDS3 `.LBL` label parsing and `_ProductMeta` extraction |
+| `conftest.py` | — | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
+| `helpers.py` | — | `make_mock_dataset()` — minimal `GeoSampler`-compatible mock |
 
 ### `test_preprocessing.py` in detail
 
@@ -169,13 +173,14 @@ The file uses **synthetic data only** — no real HiRISE files are required.
 
 ## Architecture
 
-| File                    | Purpose |
-|-------------------------|---|
-| `src/mars_hirise.py`    | `MarsHiRISE` — main `GeoDataset` subclass; index loading, spatial index, tile loading, radiometric calibration |
+| File | Purpose |
+|---|---|
+| `src/mars_hirise.py` | `MarsHiRISE` — main `GeoDataset` subclass; index loading, spatial index, tile loading, radiometric calibration |
 | `src/hirise_sampler.py` | `HiRISEGeoSampler` — strip-polygon-aware geospatial sampler |
-| `src/preprocessing.py`  | JP2 → COG conversion pipeline; geographic train/test split |
-| `tests/conftest.py`     | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
-| `tests/helpers.py`      | `make_mock_dataset()` — minimal GeoSampler-compatible mock |
+| `src/preprocessing.py` | JP2 → COG conversion pipeline; geographic train/test split |
+| `src/validate_sampling.py` | Diagnostic script for visualising sampler hit-rate (not a library module) |
+| `tests/conftest.py` | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
+| `tests/helpers.py` | `make_mock_dataset()` — minimal GeoSampler-compatible mock |
 
 ### CRS design
 
@@ -183,10 +188,11 @@ The dataset CRS is the Mars IAU 2000 geographic CRS (`+proj=longlat +a=3396190 +
 
 ### Spatial index
 
-Built once at dataset construction and cached as a GeoPackage (`spatial_cache{suffix}_v2.gpkg`; suffix encodes any `target`/`bbox` filters). For each observation:
+Built once at dataset construction and cached as a GeoPackage (`spatial_cache{suffix}_v3.gpkg`; suffix encodes any `target`/`bbox` filters). For each observation the geometry is determined in priority order:
 
-1. Compute `corners_polygon ∩ JP2_bounds` (accurate strip polygon clipped to the JP2's actual coverage) — **Case A**
-2. Fall back to JP2 bounding box if no corners or degenerate intersection — **Case B**
-3. Fall back to cumulative index min/max bbox if no JP2 file available — **Cases C/D**
+1. **Case A** — convex hull of non-zero pixels extracted from the JP2 (most accurate)
+2. **Case B** — JP2 bounding box when the hull has too few non-zero pixels
+3. **Case C** — cumulative index min/max bbox when no JP2 file is available
+4. **Case D** — corner-coordinate polygon from the PDS index as a last resort
 
 A `_SPATIAL_TOL = 1e-5°` tolerance absorbs floating-point rounding between the index geometry and rasterio's recomputed bounds at load time.
