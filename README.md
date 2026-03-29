@@ -73,11 +73,11 @@ for sample in loader:
 
 ## Channels
 
-| Channel | Source file | Notes |
-|---|---|---|
-| `NEAR-INFRARED` | `_COLOR.JP2` band 1 | ~900 nm |
-| `RED` | `_COLOR.JP2` band 2 or `_RED.JP2` | `_RED.JP2` used when only RED requested (higher fidelity) |
-| `BLUE-GREEN` | `_COLOR.JP2` band 3 | ~500 nm |
+| Channel         | Source file                       | Notes                                                     |
+|-----------------|-----------------------------------|-----------------------------------------------------------|
+| `NEAR-INFRARED` | `_COLOR.JP2` band 1               | ~900 nm                                                   |
+| `RED`           | `_COLOR.JP2` band 2 or `_RED.JP2` | `_RED.JP2` used when only RED requested (higher fidelity) |
+| `BLUE-GREEN`    | `_COLOR.JP2` band 3               | ~500 nm                                                   |
 
 When `_COLOR.JP2` is absent for an observation, available channels fall back to `_RED.JP2` where possible.
 
@@ -131,56 +131,56 @@ uv run pytest tests/ -m integration -v
 
 All three library modules are at **100% line coverage** across 274 unit tests:
 
-| Module | Statements | Coverage |
-|---|---|---|
-| `src/mars_hirise.py` | 828 | 100% |
-| `src/hirise_sampler.py` | 80 | 100% |
-| `src/preprocessing.py` | 161 | 100% |
+| Module                  | Statements | Coverage |
+|-------------------------|------------|----------|
+| `src/mars_hirise.py`    | 828        | 100%     |
+| `src/hirise_sampler.py` | 80         | 100%     |
+| `src/preprocessing.py`  | 161        | 100%     |
 
 ### Test suite overview
 
-| Test file | Tests | What it covers |
-|---|---|---|
-| `test_mars_hirise_unit.py` | 100 | `MarsHiRISE` — dataset init, spatial index, tile loading, plotting, download pipeline, `main()` |
-| `test_preprocessing.py` | 73 | All of `src/preprocessing.py` — JP2→COG conversion, geographic split, CLI |
-| `test_download.py` | 22 | Async download helpers, retry logic, disk-space guard, stop-event handling |
-| `test_sampler.py` | 23 | `HiRISEGeoSampler` grid pre-computation, stride, pixel units, reproducibility |
-| `test_coordinates.py` | 16 | Longitude normalisation and CRS helpers |
-| `test_dataset.py` | 18 | `MarsHiRISE.__getitem__`, tile loading, radiometric calibration |
-| `test_spatial_index.py` | 14 | Spatial index construction (Cases A–D), GeoPackage cache |
-| `test_lbl_parsing.py` | 12 | PDS3 `.LBL` label parsing and `_ProductMeta` extraction |
-| `conftest.py` | — | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
-| `helpers.py` | — | `make_mock_dataset()` — minimal `GeoSampler`-compatible mock |
+| Test file                  | Tests | What it covers                                                                                  |
+|----------------------------|-------|-------------------------------------------------------------------------------------------------|
+| `test_mars_hirise_unit.py` | 100   | `MarsHiRISE` — dataset init, spatial index, tile loading, plotting, download pipeline, `main()` |
+| `test_preprocessing.py`    | 73    | All of `src/preprocessing.py` — JP2→COG conversion, geographic split, CLI                       |
+| `test_download.py`         | 22    | Async download helpers, retry logic, disk-space guard, stop-event handling                      |
+| `test_sampler.py`          | 23    | `HiRISEGeoSampler` grid pre-computation, stride, pixel units, reproducibility                   |
+| `test_coordinates.py`      | 16    | Longitude normalisation and CRS helpers                                                         |
+| `test_dataset.py`          | 18    | `MarsHiRISE.__getitem__`, tile loading, radiometric calibration                                 |
+| `test_spatial_index.py`    | 14    | Spatial index construction (Cases A–D), GeoPackage cache                                        |
+| `test_lbl_parsing.py`      | 12    | PDS3 `.LBL` label parsing and `_ProductMeta` extraction                                         |
+| `conftest.py`              | —     | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row`           |
+| `helpers.py`               | —     | `make_mock_dataset()` — minimal `GeoSampler`-compatible mock                                    |
 
 ### `test_preprocessing.py` in detail
 
 The file uses **synthetic data only** — no real HiRISE files are required.
 
-| Test class | Functions under test | Key scenarios |
-|---|---|---|
-| `TestAvailableMemoryBytes` | `_available_memory_bytes` | `/proc/meminfo` read, sysconf fallback, 8 GiB hard fallback, missing `MemAvailable` line |
-| `TestSafeWorkerCount` | `_safe_worker_count` | Ample/tight RAM, never-below-1 floor, never-exceeds-requested cap, largest-files-first sampling, warning logged when capped |
-| `TestIsCorruptJp2Error` | `_is_corrupt_jp2_error` | All recognised corrupt tokens, case-insensitivity, non-corrupt I/O errors |
-| `TestFilterMaker` | `filter_maker` | Records at/below/above the configured level |
-| `TestWorkerInit` | `_worker_init` | SIGINT restored to `SIG_DFL`, `basicConfig` called at INFO |
-| `TestJp2ToCog` | `jp2_to_cog` | Success path, skip-existing, overwrite, corrupted JP2 (delete+None), ungeoreferenced input (no spurious warnings) |
-| `TestJp2ToCogErrorPaths` | `jp2_to_cog` | Non-corrupt `RasterioIOError` (source preserved), generic `Exception` (source preserved, COG/tmp cleaned up) |
-| `TestConvertAll` | `convert_all` | Counts accuracy, corrupt-file deletion, valid conversion, pre-existing COG skip, empty directory |
-| `TestConvertAllExtra` | `convert_all` | `skipped` counter (COG older than JP2), `overwrite=True` reconverts, worker future exception → `failed`, `KeyboardInterrupt` → `SystemExit(130)` + `shutdown(cancel_futures=True)` |
-| `TestGeographicSplit` | `geographic_split` | Sizes sum, no overlap, test-fraction accuracy, reproducibility, different seeds differ, longitude/latitude axes |
-| `TestGeographicSplitExtra` | `geographic_split` | Returns `GeoDataFrame`, CRS preserved, small/large `test_fraction` (block-count `max(5, ...)` boundary), `n_test_blocks ≥ 1` guarantee |
-| `TestCLI` | `__main__` block | Empty-root run, `--overwrite` flag, `basicConfig` fallback when `logger_config.json` absent |
+| Test class                 | Functions under test      | Key scenarios                                                                                                                                                                      |
+|----------------------------|---------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `TestAvailableMemoryBytes` | `_available_memory_bytes` | `/proc/meminfo` read, sysconf fallback, 8 GiB hard fallback, missing `MemAvailable` line                                                                                           |
+| `TestSafeWorkerCount`      | `_safe_worker_count`      | Ample/tight RAM, never-below-1 floor, never-exceeds-requested cap, largest-files-first sampling, warning logged when capped                                                        |
+| `TestIsCorruptJp2Error`    | `_is_corrupt_jp2_error`   | All recognised corrupt tokens, case-insensitivity, non-corrupt I/O errors                                                                                                          |
+| `TestFilterMaker`          | `filter_maker`            | Records at/below/above the configured level                                                                                                                                        |
+| `TestWorkerInit`           | `_worker_init`            | SIGINT restored to `SIG_DFL`, `basicConfig` called at INFO                                                                                                                         |
+| `TestJp2ToCog`             | `jp2_to_cog`              | Success path, skip-existing, overwrite, corrupted JP2 (delete+None), ungeoreferenced input (no spurious warnings)                                                                  |
+| `TestJp2ToCogErrorPaths`   | `jp2_to_cog`              | Non-corrupt `RasterioIOError` (source preserved), generic `Exception` (source preserved, COG/tmp cleaned up)                                                                       |
+| `TestConvertAll`           | `convert_all`             | Counts accuracy, corrupt-file deletion, valid conversion, pre-existing COG skip, empty directory                                                                                   |
+| `TestConvertAllExtra`      | `convert_all`             | `skipped` counter (COG older than JP2), `overwrite=True` reconverts, worker future exception → `failed`, `KeyboardInterrupt` → `SystemExit(130)` + `shutdown(cancel_futures=True)` |
+| `TestGeographicSplit`      | `geographic_split`        | Sizes sum, no overlap, test-fraction accuracy, reproducibility, different seeds differ, longitude/latitude axes                                                                    |
+| `TestGeographicSplitExtra` | `geographic_split`        | Returns `GeoDataFrame`, CRS preserved, small/large `test_fraction` (block-count `max(5, ...)` boundary), `n_test_blocks ≥ 1` guarantee                                             |
+| `TestCLI`                  | `__main__` block          | Empty-root run, `--overwrite` flag, `basicConfig` fallback when `logger_config.json` absent                                                                                        |
 
 ## Architecture
 
-| File | Purpose |
-|---|---|
-| `src/mars_hirise.py` | `MarsHiRISE` — main `GeoDataset` subclass; index loading, spatial index, tile loading, radiometric calibration |
-| `src/hirise_sampler.py` | `HiRISEGeoSampler` — strip-polygon-aware geospatial sampler |
-| `src/preprocessing.py` | JP2 → COG conversion pipeline; geographic train/test split |
-| `src/validate_sampling.py` | Diagnostic script for visualising sampler hit-rate (not a library module) |
-| `tests/conftest.py` | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row` |
-| `tests/helpers.py` | `make_mock_dataset()` — minimal GeoSampler-compatible mock |
+| File                       | Purpose                                                                                                        |
+|----------------------------|----------------------------------------------------------------------------------------------------------------|
+| `src/mars_hirise.py`       | `MarsHiRISE` — main `GeoDataset` subclass; index loading, spatial index, tile loading, radiometric calibration |
+| `src/hirise_sampler.py`    | `HiRISEGeoSampler` — strip-polygon-aware geospatial sampler                                                    |
+| `src/preprocessing.py`     | JP2 → COG conversion pipeline; geographic train/test split                                                     |
+| `src/validate_sampling.py` | Diagnostic script for visualising sampler hit-rate (not a library module)                                      |
+| `tests/conftest.py`        | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row`                          |
+| `tests/helpers.py`         | `make_mock_dataset()` — minimal GeoSampler-compatible mock                                                     |
 
 ### CRS design
 
