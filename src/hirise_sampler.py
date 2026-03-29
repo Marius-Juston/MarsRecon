@@ -81,16 +81,16 @@ class HiRISEGeoSampler(GeoSampler):
         size_h, size_w = _to_tuple(size)
         if units == Units.PIXELS:
             xres, yres = dataset.res  # GeoDataset.res is always a (xres, yres) tuple
-            size_h = size_h * yres
-            size_w = size_w * xres
+            size_h *= yres
+            size_w *= xres
 
         if stride is None:
             stride_h, stride_w = size_h, size_w
         else:
             stride_h, stride_w = _to_tuple(stride)
             if units == Units.PIXELS:
-                stride_h = stride_h * yres
-                stride_w = stride_w * xres
+                stride_h *= yres
+                stride_w *= xres
 
         self.size = (size_h, size_w)
         self.stride = (stride_h, stride_w)
@@ -227,5 +227,5 @@ class HiRISEGeoSampler(GeoSampler):
 def _to_tuple(value: float | tuple[float, float]) -> tuple[float, float]:
     """Normalise a scalar or 2-tuple to ``(height, width)``."""
     if isinstance(value, (int, float)):
-        return (float(value), float(value))
-    return (float(value[0]), float(value[1]))
+        return float(value), float(value)
+    return float(value[0]), float(value[1])

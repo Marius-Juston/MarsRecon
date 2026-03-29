@@ -43,7 +43,6 @@ mpl.use("Agg")  # headless — must be set before pyplot import
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Rectangle
 from shapely.geometry import box as shapely_box
@@ -488,7 +487,7 @@ def plot_histogram(dataset, sampler, out_dir: Path, n_patches: int = 20) -> None
 
 
 def plot_thumbnails(
-    dataset, sampler, out_dir: Path, n_patches: int = 16
+        dataset, sampler, out_dir: Path, n_patches: int = 16
 ) -> None:
     """Grid of actual sample patches with per-patch stats."""
     cols = 4
@@ -566,7 +565,7 @@ def plot_thumbnails(
 
 
 def plot_calibration_comparison(
-    dataset, sampler, out_dir: Path, n_patches: int = 4
+        dataset, sampler, out_dir: Path, n_patches: int = 4
 ) -> None:
     """Side-by-side: raw calibration (current) vs nodata-masked calibration.
 
@@ -748,8 +747,8 @@ def main() -> None:
 
     if len(sampler._centers) == 0:
         logger.error("No valid centres — nothing to validate. "
-                      "Check that JP2 files exist and strip polygons are "
-                      "larger than the requested patch size.")
+                     "Check that JP2 files exist and strip polygons are "
+                     "larger than the requested patch size.")
         sys.exit(1)
 
     logger.info("-" * 60)

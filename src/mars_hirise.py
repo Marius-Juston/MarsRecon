@@ -42,7 +42,6 @@ from shapely.geometry import Polygon, box
 from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import GeoSlice, Path, Sample, download_url
-from torchgeo.samplers import Units
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -585,7 +584,7 @@ class MarsHiRISE(GeoDataset):
         x, y, t = self._disambiguate_slice(index)
 
         query_geom = box(x.start, y.start, x.stop, y.stop)
-        interval = pd.Interval(t.start, t.stop)
+        # interval = pd.Interval(t.start, t.stop)
         #
         # time_mask = self.index.index.overlaps(interval)
         # candidates: gpd.GeoDataFrame = self.index.iloc[time_mask]
@@ -1347,7 +1346,7 @@ class MarsHiRISE(GeoDataset):
                 tensors.append(torch.from_numpy(band_arrays[ch]))
             else:
                 tensors.append(torch.zeros(out_h, out_w, dtype=torch.float32))
-        return torch.stack(tensors, dim=0)
+        return torch.stack(tensors)
 
     def _load_from_jp2(
             self,
@@ -1476,7 +1475,7 @@ class MarsHiRISE(GeoDataset):
                     pad = torch.zeros(
                         n_ch - t.shape[0], t.shape[1], t.shape[2], dtype=t.dtype
                     )
-                    t = torch.cat([t, pad], dim=0)
+                    t = torch.cat([t, pad])
                 padded.append(t)
             tiles = padded
 

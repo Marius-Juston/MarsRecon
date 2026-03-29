@@ -1076,8 +1076,8 @@ class TestExtractFootprintBoundsEdgeCases:
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 4, 4)
         data = np.ones((1, 4, 4), dtype=np.uint16) * 500
         with rasterio.open(
-            p, "w", driver="GTiff", count=1, dtype="uint16",
-            width=4, height=4, crs=_MARS_RCRS, transform=transform,
+                p, "w", driver="GTiff", count=1, dtype="uint16",
+                width=4, height=4, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
         # fb=200 fails -90 <= fb < ft <= 90 → file_bounds = None
@@ -1091,8 +1091,8 @@ class TestExtractFootprintBoundsEdgeCases:
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 4, 4)
         data = np.ones((1, 4, 4), dtype=np.uint16) * 500
         with rasterio.open(
-            p, "w", driver="GTiff", count=1, dtype="uint16",
-            width=4, height=4, crs=_MARS_RCRS, transform=transform,
+                p, "w", driver="GTiff", count=1, dtype="uint16",
+                width=4, height=4, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
         with patch("rasterio.warp.transform_bounds", side_effect=RuntimeError("bad crs")):
@@ -1142,7 +1142,7 @@ class TestGetItemIndexErrors:
         t = slice(_T0, _T1)
         with patch.object(mock_dataset, "_disambiguate_slice", return_value=(x, y, t)):
             with pytest.raises(IndexError, match="No MarsHiRISE observations found"):
-                mock_dataset[x, y, t]
+                var = mock_dataset[x, y, t]
 
     def test_candidates_but_no_tile_raises_index_error(self, mock_dataset):
         """Query intersects polygon but color_path=None, red_path=None → IndexError (lines 616-617)."""
@@ -1152,7 +1152,7 @@ class TestGetItemIndexErrors:
         # mock_dataset has color_path=None and red_path=None → _load_tile returns None
         with patch.object(mock_dataset, "_disambiguate_slice", return_value=(x, y, t)):
             with pytest.raises(IndexError, match="but no image data could be loaded"):
-                mock_dataset[x, y, t]
+                var = mock_dataset[x, y, t]
 
 
 # ---------------------------------------------------------------------------
@@ -1333,8 +1333,8 @@ class TestExtractDataFootprintOverviews:
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 64, 64)
         data = np.ones((1, 64, 64), dtype=np.uint16) * 500
         with rasterio.open(
-            p, "w", driver="GTiff", count=1, dtype="uint16",
-            width=64, height=64, crs=_MARS_RCRS, transform=transform,
+                p, "w", driver="GTiff", count=1, dtype="uint16",
+                width=64, height=64, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
         # Build overviews so src.overviews(1) returns [2, 4]
@@ -1387,8 +1387,8 @@ def dataset_with_dense_file(tmp_path, mars_crs):
     transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
     data = np.ones((1, 16, 16), dtype=np.uint16) * 500
     with rasterio.open(
-        fpath, "w", driver="GTiff", count=1, dtype="uint16",
-        width=16, height=16, crs=_MARS_RCRS, transform=transform,
+            fpath, "w", driver="GTiff", count=1, dtype="uint16",
+            width=16, height=16, crs=_MARS_RCRS, transform=transform,
     ) as dst:
         dst.write(data)
 
@@ -1424,8 +1424,8 @@ def dataset_with_sparse_file(tmp_path, mars_crs):
     data[0, 0, 0] = 500
     data[0, 0, 1] = 500  # only 2 non-zero → len(xs) < 3 → returns (None, file_bounds)
     with rasterio.open(
-        fpath, "w", driver="GTiff", count=1, dtype="uint16",
-        width=16, height=16, crs=_MARS_RCRS, transform=transform,
+            fpath, "w", driver="GTiff", count=1, dtype="uint16",
+            width=16, height=16, crs=_MARS_RCRS, transform=transform,
     ) as dst:
         dst.write(data)
 
@@ -1592,8 +1592,8 @@ class TestLoadTileFilterNamesFallback:
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
         data = np.ones((3, 16, 16), dtype=np.uint16) * 500
         with rasterio.open(
-            color_path, "w", driver="GTiff", count=3, dtype="uint16",
-            width=16, height=16, crs=_MARS_RCRS, transform=transform,
+                color_path, "w", driver="GTiff", count=3, dtype="uint16",
+                width=16, height=16, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
         mock_dataset.channels = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
@@ -1613,7 +1613,7 @@ class TestLoadTileFilterNamesFallback:
 
 class TestLoadFromJp2BoundsException:
     def test_transform_bounds_exception_caught_reprojection_continues(
-        self, mock_dataset, mars_geotiff
+            self, mock_dataset, mars_geotiff
     ):
         """transform_bounds raises in inner try → pass → reproject still runs (1418-1419)."""
         with patch("mars_hirise.transform_bounds", side_effect=RuntimeError("bad crs")):

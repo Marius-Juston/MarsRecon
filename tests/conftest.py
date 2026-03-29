@@ -55,16 +55,16 @@ def strip_polygon() -> Polygon:
             cy + (-half_w) * math.sin(angle) + (-half_h) * math.cos(angle),
         ),
         (
-            cx + (half_w) * math.cos(angle) - (-half_h) * math.sin(angle),
-            cy + (half_w) * math.sin(angle) + (-half_h) * math.cos(angle),
+            cx + half_w * math.cos(angle) - (-half_h) * math.sin(angle),
+            cy + half_w * math.sin(angle) + (-half_h) * math.cos(angle),
         ),
         (
-            cx + (half_w) * math.cos(angle) - (half_h) * math.sin(angle),
-            cy + (half_w) * math.sin(angle) + (half_h) * math.cos(angle),
+            cx + half_w * math.cos(angle) - half_h * math.sin(angle),
+            cy + half_w * math.sin(angle) + half_h * math.cos(angle),
         ),
         (
-            cx + (-half_w) * math.cos(angle) - (half_h) * math.sin(angle),
-            cy + (-half_w) * math.sin(angle) + (half_h) * math.cos(angle),
+            cx + (-half_w) * math.cos(angle) - half_h * math.sin(angle),
+            cy + (-half_w) * math.sin(angle) + half_h * math.cos(angle),
         ),
     ]
     return Polygon(corners)

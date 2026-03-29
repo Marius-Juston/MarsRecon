@@ -76,15 +76,15 @@ Parses PDS3 `.LBL` label files to extract per-product `SCALING_FACTOR` and `OFFS
 
 ## Key Parameters
 
-| Parameter | Description |
-|-----------|-------------|
-| `root` | Local storage directory (default: `/scratch/mars_hirise`) |
-| `split` | Informational split label (`"train"`, `"val"`, `"test"`); no filtering yet |
-| `bbox` | (lon_min, lat_min, lon_max, lat_max) bounding box filter |
-| `target` | Optional case-insensitive substring filter on product name columns |
-| `channels` | List from `["NEAR-INFRARED", "RED", "BLUE-GREEN"]` |
-| `download` | Fetch missing files from NASA PDS if `True` |
-| `reuse_cache` | Reuse cached `spatial_cache_v3.gpkg` if `True` |
+| Parameter     | Description                                                                |
+|---------------|----------------------------------------------------------------------------|
+| `root`        | Local storage directory (default: `/scratch/mars_hirise`)                  |
+| `split`       | Informational split label (`"train"`, `"val"`, `"test"`); no filtering yet |
+| `bbox`        | (lon_min, lat_min, lon_max, lat_max) bounding box filter                   |
+| `target`      | Optional case-insensitive substring filter on product name columns         |
+| `channels`    | List from `["NEAR-INFRARED", "RED", "BLUE-GREEN"]`                         |
+| `download`    | Fetch missing files from NASA PDS if `True`                                |
+| `reuse_cache` | Reuse cached `spatial_cache_v3.gpkg` if `True`                             |
 
 ## Data Products
 
@@ -106,10 +106,10 @@ All three library modules are at 100% line coverage (274 unit tests, no real HiR
 uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing
 ```
 
-| Module | Statements | Coverage |
-|---|---|---|
-| `src/mars_hirise.py` | 828 | 100% |
-| `src/hirise_sampler.py` | 80 | 100% |
-| `src/preprocessing.py` | 161 | 100% |
+| Module                  | Statements | Coverage |
+|-------------------------|------------|----------|
+| `src/mars_hirise.py`    | 828        | 100%     |
+| `src/hirise_sampler.py` | 80         | 100%     |
+| `src/preprocessing.py`  | 161        | 100%     |
 
 Integration tests (require real data at `/scratch/mars_hirise`) are marked `@pytest.mark.integration` and excluded from the unit suite via `-m "not integration"`.
