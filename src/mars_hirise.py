@@ -42,6 +42,7 @@ from shapely.geometry import Polygon, box
 from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import GeoSlice, Path, Sample, download_url
+from torchgeo.samplers import Units
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
