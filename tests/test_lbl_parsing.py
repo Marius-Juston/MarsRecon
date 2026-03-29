@@ -7,6 +7,7 @@ Covers:
 """
 
 import pathlib
+from unittest.mock import patch
 
 import pytest
 
@@ -106,3 +107,21 @@ class TestRadiometricCalibration:
             min(1.0, 1023 * meta.scaling_factor + meta.offset), rel=1e-5
         )
         assert all(0.0 <= v <= 1.0 for v in result)
+
+
+# ---------------------------------------------------------------------------
+# OSError when reading LBL file (lines 131-133)
+# ---------------------------------------------------------------------------
+
+
+class TestProductMetaOsError:
+    def test_oserror_during_read_text_returns_defaults(self, tmp_path: pathlib.Path):
+        """OSError raised by read_text → warning logged, returns defaults (lines 131-133)."""
+        lbl = tmp_path / "unreadable.LBL"
+        lbl.write_text("PDS_VERSION_ID = PDS3\nEND\n")
+
+        with patch.object(pathlib.Path, "read_text", side_effect=OSError("permission denied")):
+            meta = _ProductMeta.from_lbl(lbl)
+
+        assert meta.scaling_factor == pytest.approx(_DEFAULT_SCALING_FACTOR, rel=1e-6)
+        assert meta.offset == pytest.approx(_DEFAULT_OFFSET, rel=1e-6)

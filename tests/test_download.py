@@ -16,7 +16,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from mars_hirise import _download_file
+from mars_hirise import _download_file, _download_many, _worker_process
 
 _URL = "https://hirise-pds.lpl.arizona.edu/PDS/test/PSP_001430_1780_RED.JP2"
 
@@ -270,3 +270,140 @@ class TestDownloadCleanup:
                     max_retries=4, base_delay=0.0,
                 )
         assert not _tmp(dest).exists()
+
+
+# ---------------------------------------------------------------------------
+# Line 204: stop_event becomes True on a retry iteration
+# ---------------------------------------------------------------------------
+
+
+class TestStopEventBetweenRetries:
+    async def test_stop_event_set_on_retry_returns_early(self, dest, stop_event):
+        """stop_event returns True on 3rd is_set() call → return at line 204."""
+        call_count = [0]
+
+        def _is_set():
+            call_count[0] += 1
+            # False for: (1) pre-loop disk/exists checks, (2) attempt-0 start
+            # True for: (3) attempt-1 start → hits line 204
+            return call_count[0] > 2
+
+        stop_event.is_set = _is_set
+
+        with aioresponses() as m:
+            m.get(_URL, status=503)  # attempt 0 fails → would retry but stop_event fires
+            async with aiohttp.ClientSession() as session:
+                await _download_file(
+                    session, _URL, dest, stop_event, max_retries=2, base_delay=0.0
+                )
+
+        assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# Lines 213-214: ValueError parsing non-numeric Content-Length
+# ---------------------------------------------------------------------------
+
+
+class TestBadContentLength:
+    async def test_non_numeric_content_length_ignored(self, dest, stop_event):
+        """Non-numeric Content-Length → ValueError caught → download still succeeds."""
+        with aioresponses() as m:
+            m.get(_URL, body=b"ok", status=200, headers={"Content-Length": "not_a_number"})
+            async with aiohttp.ClientSession() as session:
+                await _download_file(session, _URL, dest, stop_event)
+
+        assert dest.exists()
+        assert dest.read_bytes() == b"ok"
+
+
+# ---------------------------------------------------------------------------
+# Lines 221-223: stop_event set during chunk writing
+# ---------------------------------------------------------------------------
+
+
+class TestStopEventMidWrite:
+    async def test_stop_event_mid_write_removes_tmp(self, dest, stop_event):
+        """stop_event True on 3rd is_set() call (inside chunk loop) → lines 221-223."""
+        call_count = [0]
+
+        def _is_set():
+            call_count[0] += 1
+            # (1) pre-loop check → False; (2) attempt-0 start → False;
+            # (3) inside chunk loop → True → halt mid-write
+            return call_count[0] > 2
+
+        stop_event.is_set = _is_set
+
+        with aioresponses() as m:
+            m.get(_URL, body=b"big chunk data", status=200)
+            async with aiohttp.ClientSession() as session:
+                await _download_file(
+                    session, _URL, dest, stop_event, max_retries=0, base_delay=0.0
+                )
+
+        assert not dest.exists()
+        assert not _tmp(dest).exists()
+
+
+# ---------------------------------------------------------------------------
+# Lines 251-252: ClientConnectorError / asyncio.TimeoutError
+# ---------------------------------------------------------------------------
+
+
+class TestConnectorError:
+    async def test_timeout_error_is_caught_and_handled(self, dest, stop_event):
+        """asyncio.TimeoutError → caught at lines 251-252, tmp removed."""
+        import asyncio
+
+        class _TimeoutSession:
+            class _CtxMgr:
+                async def __aenter__(self):
+                    raise asyncio.TimeoutError()
+
+                async def __aexit__(self, *a):
+                    pass
+
+            def get(self, url, **kw):
+                return self._CtxMgr()
+
+        await _download_file(
+            _TimeoutSession(), _URL, dest, stop_event, max_retries=0, base_delay=0.0
+        )
+        assert not dest.exists()
+        assert not _tmp(dest).exists()
+
+
+# ---------------------------------------------------------------------------
+# Lines 274-276: _download_many function
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadMany:
+    async def test_download_many_downloads_all_files(self, dest, stop_event):
+        """_download_many creates a shared ClientSession and gathers downloads."""
+        with aioresponses() as m:
+            m.get(_URL, body=b"many-result", status=200)
+            await _download_many([(_URL, dest)], concurrency=1, stop_event=stop_event)
+
+        assert dest.exists()
+        assert dest.read_bytes() == b"many-result"
+
+
+# ---------------------------------------------------------------------------
+# Line 286: _worker_process function
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerProcess:
+    def test_worker_process_runs_asyncio_event_loop(self, dest, stop_event):
+        """_worker_process wraps asyncio.run(_download_many(...)) — line 286."""
+        from unittest.mock import AsyncMock, patch
+
+        mock_download_many = AsyncMock(return_value=None)
+        with patch("mars_hirise._download_many", mock_download_many):
+            _worker_process([(_URL, dest)], concurrency_per_process=1, stop_event=stop_event)
+
+        mock_download_many.assert_called_once_with(
+            [(_URL, dest)], 1, stop_event
+        )
