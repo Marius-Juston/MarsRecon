@@ -17,7 +17,7 @@ if str(_SRC) not in sys.path:
 
 import torch
 
-from mars_hirise import _SPATIAL_TOL, MarsHiRISE, _corners_to_polygon
+from mars_hirise import _SPATIAL_TOL, MarsHiRISE
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +174,7 @@ class TestMarsHiRISEIntegration:
 
     @pytest.fixture(scope="class")
     def dataset(self):
-        from temp import MarsHiRISE
+        from mars_hirise import MarsHiRISE
 
         return MarsHiRISE(
             bbox=self._BBOX,
@@ -259,7 +259,7 @@ class TestMarsHiRISEIntegration:
         from torch.utils.data import DataLoader
 
         from hirise_sampler import HiRISEGeoSampler
-        from temp import MarsHiRISE
+        from mars_hirise import MarsHiRISE
         from torchgeo.samplers import Units
 
         ds = MarsHiRISE(

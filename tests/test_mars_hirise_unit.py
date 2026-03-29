@@ -15,7 +15,7 @@ import logging
 import pathlib
 import sys
 import textwrap
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import geopandas as gpd
 import numpy as np
@@ -31,16 +31,15 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 import matplotlib
+
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
 from mars_hirise import (
-    MARS_GEOGRAPHIC_CRS,
     MarsHiRISE,
     _ProductMeta,
     _corners_to_polygon,
     _extract_footprint,
-    _SPATIAL_TOL,
     filter_maker,
     setup_logging,
 )
@@ -113,9 +112,9 @@ def mars_geotiff(tmp_path):
     transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
     data = np.ones((1, 16, 16), dtype=np.uint16) * 500
     with rasterio.open(
-        p, "w",
-        driver="GTiff", count=1, dtype="uint16",
-        width=16, height=16, crs=_MARS_RCRS, transform=transform,
+            p, "w",
+            driver="GTiff", count=1, dtype="uint16",
+            width=16, height=16, crs=_MARS_RCRS, transform=transform,
     ) as dst:
         dst.write(data)
     return p
@@ -128,9 +127,9 @@ def mars_geotiff_3band(tmp_path):
     transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
     data = np.ones((3, 16, 16), dtype=np.uint16) * 500
     with rasterio.open(
-        p, "w",
-        driver="GTiff", count=3, dtype="uint16",
-        width=16, height=16, crs=_MARS_RCRS, transform=transform,
+            p, "w",
+            driver="GTiff", count=3, dtype="uint16",
+            width=16, height=16, crs=_MARS_RCRS, transform=transform,
     ) as dst:
         dst.write(data)
     return p
@@ -143,10 +142,10 @@ def no_crs_geotiff(tmp_path):
     transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
     data = np.ones((1, 16, 16), dtype=np.uint16) * 500
     with rasterio.open(
-        p, "w",
-        driver="GTiff", count=1, dtype="uint16",
-        width=16, height=16, transform=transform,
-        # intentionally omit crs=
+            p, "w",
+            driver="GTiff", count=1, dtype="uint16",
+            width=16, height=16, transform=transform,
+            # intentionally omit crs=
     ) as dst:
         dst.write(data)
     return p
@@ -159,9 +158,9 @@ def zero_geotiff(tmp_path):
     transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
     data = np.zeros((1, 16, 16), dtype=np.uint16)
     with rasterio.open(
-        p, "w",
-        driver="GTiff", count=1, dtype="uint16",
-        width=16, height=16, crs=_MARS_RCRS, transform=transform,
+            p, "w",
+            driver="GTiff", count=1, dtype="uint16",
+            width=16, height=16, crs=_MARS_RCRS, transform=transform,
     ) as dst:
         dst.write(data)
     return p
@@ -253,8 +252,8 @@ class TestExtractFootprintStandalone:
         data[0, 0, 0] = 1
         data[0, 0, 1] = 1  # only 2 non-zero → len(xs) < 3
         with rasterio.open(
-            p, "w", driver="GTiff", count=1, dtype="uint16",
-            width=16, height=16, crs=_MARS_RCRS, transform=transform,
+                p, "w", driver="GTiff", count=1, dtype="uint16",
+                width=16, height=16, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
         hull, bounds = _extract_footprint(str(p), _MARS_RCRS)
@@ -328,8 +327,8 @@ class TestReadJp2Bounds:
             transform = rasterio.transform.from_bounds(-131, 18, -130, 19, 4, 4)
             data = np.ones((1, 4, 4), dtype=np.uint16)
             with rasterio.open(
-                p, "w", driver="GTiff", count=1, dtype="uint16",
-                width=4, height=4, crs=_MARS_RCRS, transform=transform,
+                    p, "w", driver="GTiff", count=1, dtype="uint16",
+                    width=4, height=4, crs=_MARS_RCRS, transform=transform,
             ) as dst:
                 dst.write(data)
             result = mock_dataset._read_jp2_bounds(p)
@@ -371,8 +370,8 @@ class TestExtractDataFootprint:
         data[0, 0, 0] = 1
         data[0, 0, 1] = 1  # only 2 non-zero
         with rasterio.open(
-            p, "w", driver="GTiff", count=1, dtype="uint16",
-            width=16, height=16, crs=_MARS_RCRS, transform=transform,
+                p, "w", driver="GTiff", count=1, dtype="uint16",
+                width=16, height=16, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
         result = mock_dataset._extract_data_footprint(p)
@@ -486,7 +485,7 @@ class TestLoadTile:
         assert result.shape[0] == 1  # 1 channel
 
     def test_color_unavailable_logs_lost_channels(
-        self, mock_dataset, tmp_path, mars_geotiff, caplog
+            self, mock_dataset, tmp_path, mars_geotiff, caplog
     ):
         """COLOR unavailable, NIR/BG channels lost → warning logged."""
         mock_dataset.channels = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
@@ -514,7 +513,7 @@ class TestLoadTile:
         assert result is None
 
     def test_red_unavailable_after_color_fail_returns_none(
-        self, mock_dataset, tmp_path, caplog
+            self, mock_dataset, tmp_path, caplog
     ):
         """NIR requested, color missing, RED also missing → None with warning."""
         mock_dataset.channels = ["NEAR-INFRARED"]
@@ -540,8 +539,8 @@ class TestLoadTile:
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
         data = np.ones((3, 16, 16), dtype=np.uint16) * 500
         with rasterio.open(
-            color_path, "w", driver="GTiff", count=3, dtype="uint16",
-            width=16, height=16, crs=_MARS_RCRS, transform=transform,
+                color_path, "w", driver="GTiff", count=3, dtype="uint16",
+                width=16, height=16, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
         lbl_path.write_text(textwrap.dedent("""\
@@ -907,7 +906,7 @@ def _make_raw_index_two_obs():
 
 class TestBuildSpatialIndex:
     def test_antimeridian_observation_skipped_with_warning(
-        self, mock_dataset, caplog
+            self, mock_dataset, caplog
     ):
         """Observation straddling antimeridian is skipped with a warning."""
         mock_dataset._raw_index = _make_raw_index_two_obs()
@@ -918,7 +917,7 @@ class TestBuildSpatialIndex:
         assert len(mock_dataset.index) == 1
 
     def test_legacy_bbox_cache_triggers_rebuild(
-        self, mock_dataset, mars_crs, caplog
+            self, mock_dataset, mars_crs, caplog
     ):
         """Cache where all geometries are axis-aligned boxes → legacy rebuild."""
         from shapely.geometry import box as sbox

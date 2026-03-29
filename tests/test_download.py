@@ -213,7 +213,7 @@ class TestDiskSpaceGuard:
 
         DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
         # 50 GB < 100 GB threshold
-        low_disk = DiskUsage(total=500 * 1024**3, used=450 * 1024**3, free=50 * 1024**3)
+        low_disk = DiskUsage(total=500 * 1024 ** 3, used=450 * 1024 ** 3, free=50 * 1024 ** 3)
 
         with patch.object(shutil, "disk_usage", return_value=low_disk):
             async with aiohttp.ClientSession() as session:
@@ -231,14 +231,8 @@ class TestDiskSpaceGuard:
 class TestGenericException:
     async def test_generic_exception_returns_immediately(self, dest, stop_event):
         """A non-aiohttp exception → returns immediately (no retry), tmp removed."""
-        import aiohttp as _aiohttp
-        from aioresponses import aioresponses as _aioresponses
 
-        class _FakeSession:
-            def get(self, url, **kw):
-                raise ValueError("unexpected error")
-
-        async with aiohttp.ClientSession() as real_session:
+        async with aiohttp.ClientSession():
             # Inject a session whose .get() raises a generic exception
             class _BrokenSession:
                 class _CtxMgr:

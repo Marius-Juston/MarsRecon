@@ -9,6 +9,7 @@ Covers:
 import pathlib
 
 import pytest
+
 # src/ is on sys.path via conftest.py
 from mars_hirise import _ProductMeta
 
