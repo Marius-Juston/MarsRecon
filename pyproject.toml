@@ -29,7 +29,6 @@ markers = [
 
 [tool.coverage.run]
 source = ["src"]
-omit = ["src/mars_hirise.py"]
 
 [tool.coverage.report]
 show_missing = true
