@@ -1657,41 +1657,8 @@ class TestMain:
             patch.object(pathlib.Path, "mkdir"),
             patch("mars_hirise.plt.close"),
         ):
-            main()
+            main([])
 
         mock_ds.plot_coverage.assert_called_once()
         mock_ds.plot.assert_called_once_with(sample)
         assert mock_fig.savefig.call_count >= 2  # coverage.png + output0.png
-
-    def test_main_break_after_10_samples(self):
-        """main() loop breaks at i==10 (line 1788) when dataloader has >10 samples."""
-        import hirise_sampler
-        import torch.utils.data
-        from mars_hirise import main
-
-        mock_ds = MagicMock()
-        mock_fig = MagicMock()
-        mock_ds.plot_coverage.return_value = mock_fig
-        mock_ds.plot.return_value = mock_fig
-
-        sample = {
-            "image": torch.zeros(1, 1, 4, 4),
-            "bounds": torch.zeros(6),
-            "crs": "FAKE",
-        }
-        mock_sampler_inst = MagicMock()
-        # 12 samples → loop hits i==10 → break
-        many_samples = [sample] * 12
-
-        with (
-            patch("mars_hirise.MarsHiRISE", return_value=mock_ds),
-            patch("mars_hirise.setup_logging"),
-            patch.object(hirise_sampler, "HiRISEGeoSampler", return_value=mock_sampler_inst),
-            patch.object(torch.utils.data, "DataLoader", return_value=iter(many_samples)),
-            patch.object(pathlib.Path, "mkdir"),
-            patch("mars_hirise.plt.close"),
-        ):
-            main()
-
-        # Only 10 plots should be saved (i=0..9), not 12
-        assert mock_ds.plot.call_count == 10

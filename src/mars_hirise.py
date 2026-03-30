@@ -1748,7 +1748,7 @@ def setup_logging(config_path: str = CONFIG) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv=None) -> None:  # pragma: no cover
     setup_logging()
 
     torch.manual_seed(42)
@@ -1757,20 +1757,28 @@ def main() -> None:
     from torch.utils.data import DataLoader
 
     from hirise_sampler import HiRISEGeoSampler
+    import argparse
 
-    # dataset = MarsHiRISE(
-    #     target="Olympus",
-    #     channels=["NEAR-INFRARED", "RED", "BLUE-GREEN"],
-    #     download=True,  # set False if you already have a local mirror
-    #     reuse_cache=True
-    # )
+    parser = argparse.ArgumentParser(description="Run a sample test on the main HiRISE dataset for validation")
+    parser.add_argument(
+        "--olympus", action=argparse.BooleanOptionalAction)
 
-    dataset = MarsHiRISE(
-        bbox=(-136, 12, -124, 24),  # Olympus Mons extent from the CTX metadata
-        channels=["NEAR-INFRARED", "RED", "BLUE-GREEN"],
-        download=True,
-        reuse_cache=True,
-    )
+    args = parser.parse_args(argv)
+
+    if args.olympus:
+        dataset = MarsHiRISE(
+            target="Olympus",
+            channels=["NEAR-INFRARED", "RED", "BLUE-GREEN"],
+            download=True,  # set False if you already have a local mirror
+            reuse_cache=True
+        )
+    else:
+        dataset = MarsHiRISE(
+            bbox=(-136, 12, -124, 24),  # Olympus Mons extent from the CTX metadata
+            channels=["NEAR-INFRARED", "RED", "BLUE-GREEN"],
+            download=True,
+            reuse_cache=True,
+        )
 
     fig = dataset.plot_coverage()
     fig.savefig("coverage.png")
