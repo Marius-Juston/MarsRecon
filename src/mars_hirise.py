@@ -1751,8 +1751,7 @@ def setup_logging(config_path: str = CONFIG) -> None:
 def main(argv=None) -> None:  # pragma: no cover
     setup_logging()
 
-    torch.manual_seed(42)
-    np.random.seed(42)
+
 
     from torch.utils.data import DataLoader
 
@@ -1761,9 +1760,25 @@ def main(argv=None) -> None:  # pragma: no cover
 
     parser = argparse.ArgumentParser(description="Run a sample test on the main HiRISE dataset for validation")
     parser.add_argument(
-        "--olympus", action=argparse.BooleanOptionalAction)
+        '-ol', "--olympus", action=argparse.BooleanOptionalAction,
+        help="Whether to use the 'Olympus' target for the dataset")
+    parser.add_argument(
+        '-l', '--length',
+        help='Number of samples to have',
+        default=-1,
+        type=int,
+    )
+    parser.add_argument(
+        '-s', '--seed',
+        help='seed',
+        default=42,
+        type=int,
+    )
 
     args = parser.parse_args(argv)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     if args.olympus:
         dataset = MarsHiRISE(
@@ -1789,11 +1804,14 @@ def main(argv=None) -> None:  # pragma: no cover
     # strip polygon, so every yielded patch is guaranteed to intersect real data.
     # size= is in degrees (units of self.crs = geographic Mars CRS).
     # 0.005 deg ≈ 593 pixels ≈ 296 m at the equator.
-    sampler = HiRISEGeoSampler(dataset, size=0.005, length=200, units=Units.CRS)
+    sampler = HiRISEGeoSampler(dataset, size=0.005, length=None if args.length <= 0 else args.length, units=Units.CRS)
+
+    logger.info("Number of samples: %d", len(sampler))
     dataloader = DataLoader(dataset, sampler=sampler,
                             num_workers=10,
                             multiprocessing_context='spawn',
                             prefetch_factor=4)
+    logger.info("Number of data-loader: %d", len(dataloader))
 
     output_path = pathlib.Path("Figures")
 
