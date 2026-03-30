@@ -4,9 +4,9 @@ This document turns the embedding workflow into a finite execution plan. The wor
 
 ## Status Snapshot
 
-Current position: Phase 0 is complete, and we have a tested observation-level MarsCLIP baseline scaffold plus the first patch-level Stage A bridge. We are not yet at the workflow-accurate Stage A MAE / Stage B training pipeline.
+Current position: Phase 0 and all of Stage A are complete in the current environment. We now have a reusable GPU-backed Stage A MAE checkpoint, a longer non-smoke CUDA run, an explicit checkpoint-selection note, and embedding sanity artifacts. The next gap is Stage B1: building workflow-aligned paired local/global crops and reusing the Stage A encoder in the multimodal path.
 
-Overall workflow progress: `[###-------] ~30%`
+Overall workflow progress: `[#######---] ~68%`
 
 This percentage is intentionally conservative. It reflects alignment to the full workflow, not just the amount of code already written.
 
@@ -43,9 +43,9 @@ Exit criteria:
 
 ### 2. Stage A1: Patch-Level Dataset And Sampler Bridge
 
-Status: `in_progress`
+Status: `complete`
 
-Progress: `[#####-----] 50%`
+Progress: `[##########] 100%`
 
 Why it is next:
 - This is the biggest remaining gap between the current code and the workflow
@@ -63,8 +63,12 @@ What exists now:
 - patch-record builder from strip-aware sampler centres
 - dominant-observation and overlap-fraction metadata
 - patch validity accounting via nodata / valid-pixel fraction
+- explicit Stage A1 default `min_valid_fraction=0.5`, matching the workflow's ">50% nodata" rule
 - patch-compatible preview path
+- patch summary / report utility
 - focused Stage A1 unit tests
+- lightweight real-data smoke test on Olympus Mons
+- saved real-data patch preview and patch summary artifacts
 
 Validation:
 - Unit tests for patch extraction
@@ -84,9 +88,9 @@ Exit criteria:
 
 ### 3. Stage A2: MAE Vision Encoder
 
-Status: `pending`
+Status: `complete`
 
-Progress: `[----------] 0%`
+Progress: `[##########] 100%`
 
 Deliverables:
 - ViT-based masked autoencoder
@@ -95,6 +99,17 @@ Deliverables:
 - Decoder and reconstruction loss
 - Scale-aware positional encoding
 - If feasible in v1, independent spectral band tokenization with missing-band handling
+
+What exists now:
+- Stage A MAE module wired to the Stage A1 patch contract
+- valid-patch filtering with the shared `min_valid_fraction=0.5` threshold
+- random masking restricted to valid patches
+- scale-aware positional encoding from patch scale features
+- reconstruction loss computed only on masked valid pixels
+- direct batch collation from Stage A1 patch samples
+- focused unit tests and a lightweight real-data forward/backward smoke test
+- masked/reconstructed preview utility with real Olympus Mons artifact generation
+- verified short training smoke where reconstruction loss decreases on real Olympus Mons patches
 
 Validation:
 - Unit tests for patch-mask construction
@@ -114,9 +129,9 @@ Exit criteria:
 
 ### 4. Stage A3: Stage A Training, Checkpointing, And Embedding Sanity
 
-Status: `pending`
+Status: `complete`
 
-Progress: `[----------] 0%`
+Progress: `[##########] 100%`
 
 Deliverables:
 - Training script or CLI
@@ -124,6 +139,26 @@ Deliverables:
 - Configurable hyperparameters
 - Logging of reconstruction metrics
 - Embedding export for sanity checks
+
+What exists now:
+- minimal `train_marsclip_mae.py` CLI
+- MAE dataloader / batch collation for Stage A1 patch samples
+- checkpoint save / load helpers
+- JSON loss history and loss-curve artifact generation
+- before/after reconstruction previews from the training script
+- lightweight real-data training smoke on Olympus Mons
+- periodic checkpoint saving
+- periodic reconstruction preview saving
+- best-checkpoint tracking
+- summary JSON artifact for each run
+- verified resume-from-checkpoint path on real data
+- embedding export utility on top of saved MAE checkpoints
+- nearest-neighbor gallery generation
+- PCA-based embedding scatter generation
+- real Olympus Mons embedding sanity artifacts from a saved checkpoint
+- longer 40-step Stage A run with periodic checkpoints on Olympus Mons
+- longer 80-step CUDA Stage A run with GPU-backed checkpoint selection
+- explicit checkpoint-selection note in `reports/MarsCLIP_StageA_Checkpoint_Note.md`
 
 Validation:
 - Resume-from-checkpoint works
@@ -261,17 +296,24 @@ Exit criteria:
 
 ## Immediate Next Step
 
-The next best step is:
+The next best step is now:
 
-`Implement Stage A1: the patch-level dataset and sampler bridge.`
+`Start Stage B1: paired local/global crops and workflow-aligned context encoders.`
 
 That means:
-- move from observation thumbnails to workflow-aligned `0.005 deg` patches
-- carry through nodata-aware validity accounting
-- preserve scale, location, viewing, and channel-availability metadata per patch
-- add tests and real-data patch previews
+- build paired local/global crop sampling on top of the Stage A patch bridge
+- load and reuse the selected Stage A encoder checkpoint
+- define the first workflow-aligned location / geometry / text context batch contract
+- keep Stage B tests as strict as Stage A tests
+- keep tests and reconstruction previews first-class from the start
 
-This is the highest-leverage next move because it closes the largest structural gap between the current baseline and the workflow.
+Concretely, the immediate next actions are:
+- add a paired-crop record builder for local and global views from the same dominant observation
+- add a Stage B dataset / collator that returns local image, global image, text, and geo-context
+- wire the Stage A checkpoint in as the visual backbone initialization
+- add unit tests for paired-crop validity, overlap, and metadata alignment
+
+This is the highest-leverage next move because Stage A now has a selected reusable checkpoint, and the next remaining structural gap is building the workflow-aligned Stage B input pipeline around it.
 
 ## Done Criteria For The Whole Project
 
