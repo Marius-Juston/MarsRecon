@@ -10,10 +10,10 @@ A systematic documentation of the data structures, coordinate systems, projectio
 
 The Mars reference ellipsoid is defined in the HiRISE RDR Software Interface Specification and encoded in every per-product LBL file (`IMAGE_MAP_PROJECTION` object). The authoritative values are:
 
-| Parameter | Value | Source |
-|-----------|-------|--------|
+| Parameter             | Value       | Source                                   |
+|-----------------------|-------------|------------------------------------------|
 | Equatorial radius (a) | 3 396 190 m | `HIRISE_RDR_SIS.PDF §3.5.1`; `DSMAP.CAT` |
-| Polar radius (b) | 3 376 200 m | `DSMAP.CAT` |
+| Polar radius (b)      | 3 376 200 m | `DSMAP.CAT`                              |
 
 *Reference: [DSMAP.CAT](https://hirise-pds.lpl.arizona.edu/PDS/CATALOG/DSMAP.CAT) — "equatorial radius of 3396.190000 km and polar radius of 3376.200000 kilometers."*
 
@@ -67,19 +67,19 @@ Files:
 
 ### 2.2  Key columns
 
-| Column | Type | Description | Used for |
-|--------|------|-------------|----------|
-| `PRODUCT_ID` | CHARACTER(21) | Unique ID, e.g. `ESP_011261_1960_COLOR` | Distinguish `_COLOR` vs `_RED` products; extract observation ID |
-| `FILE_NAME_SPECIFICATION` | CHARACTER(67) | PDS-relative path to the JP2 file | Resolve local file paths; construct download URLs |
-| `MINIMUM_LATITUDE` | REAL | Southern edge of projected image (°) | Spatial filtering (bbox query) |
-| `MAXIMUM_LATITUDE` | REAL | Northern edge of projected image (°) | Spatial filtering |
-| `MINIMUM_LONGITUDE` | REAL | Western edge (0°–360° convention) | Spatial filtering (after normalisation) |
-| `MAXIMUM_LONGITUDE` | REAL | Eastern edge (0°–360° convention) | Spatial filtering (after normalisation) |
-| `CORNER1_LATITUDE` through `CORNER4_LONGITUDE` | REAL | Four corners of the projected image | **See §2.3** |
-| `START_TIME` / `STOP_TIME` | TIME | UTC acquisition window | Temporal index for TorchGeo's `IntervalIndex` |
-| `MAP_SCALE` | REAL | Metres per pixel | Resolution metadata |
-| `MAP_PROJECTION_TYPE` | CHARACTER(19) | `EQUIRECTANGULAR` or `POLAR STEREOGRAPHIC` | CRS determination |
-| `NORTH_AZIMUTH` | REAL | Angle from image right-edge to north (° clockwise) | Image orientation |
+| Column                                         | Type          | Description                                        | Used for                                                        |
+|------------------------------------------------|---------------|----------------------------------------------------|-----------------------------------------------------------------|
+| `PRODUCT_ID`                                   | CHARACTER(21) | Unique ID, e.g. `ESP_011261_1960_COLOR`            | Distinguish `_COLOR` vs `_RED` products; extract observation ID |
+| `FILE_NAME_SPECIFICATION`                      | CHARACTER(67) | PDS-relative path to the JP2 file                  | Resolve local file paths; construct download URLs               |
+| `MINIMUM_LATITUDE`                             | REAL          | Southern edge of projected image (°)               | Spatial filtering (bbox query)                                  |
+| `MAXIMUM_LATITUDE`                             | REAL          | Northern edge of projected image (°)               | Spatial filtering                                               |
+| `MINIMUM_LONGITUDE`                            | REAL          | Western edge (0°–360° convention)                  | Spatial filtering (after normalisation)                         |
+| `MAXIMUM_LONGITUDE`                            | REAL          | Eastern edge (0°–360° convention)                  | Spatial filtering (after normalisation)                         |
+| `CORNER1_LATITUDE` through `CORNER4_LONGITUDE` | REAL          | Four corners of the projected image                | **See §2.3**                                                    |
+| `START_TIME` / `STOP_TIME`                     | TIME          | UTC acquisition window                             | Temporal index for TorchGeo's `IntervalIndex`                   |
+| `MAP_SCALE`                                    | REAL          | Metres per pixel                                   | Resolution metadata                                             |
+| `MAP_PROJECTION_TYPE`                          | CHARACTER(19) | `EQUIRECTANGULAR` or `POLAR STEREOGRAPHIC`         | CRS determination                                               |
+| `NORTH_AZIMUTH`                                | REAL          | Angle from image right-edge to north (° clockwise) | Image orientation                                               |
 
 *Reference: [RDRCUMINDEX.LBL](https://hirise-pds.lpl.arizona.edu/PDS/INDEX/RDRCUMINDEX.LBL) — complete schema definition.*
 
@@ -132,14 +132,14 @@ Lat = ((1 − L0 − Line) × Scale / R) × (180 / π)
 Lon = LonP + ((Sample − S0 − 1) × Scale / (R × cos(LatP))) × (180 / π)
 ```
 
-| Symbol | LBL keyword | Meaning |
-|--------|-------------|---------|
-| `LonP` | `CENTER_LONGITUDE` | Centre longitude of projection (always 180.0°) |
-| `LatP` | `CENTER_LATITUDE` | Centre latitude of projection (varies per observation) |
-| `L0` | `LINE_PROJECTION_OFFSET` | Line offset of projection origin from pixel (1,1) |
-| `S0` | `SAMPLE_PROJECTION_OFFSET` | Sample offset of projection origin from pixel (1,1) |
-| `Scale` | `MAP_SCALE` | Map scale in metres/pixel |
-| `R` | `A_AXIS_RADIUS` | Local ellipsoid radius at `LatP` (km; convert to m) |
+| Symbol  | LBL keyword                | Meaning                                                |
+|---------|----------------------------|--------------------------------------------------------|
+| `LonP`  | `CENTER_LONGITUDE`         | Centre longitude of projection (always 180.0°)         |
+| `LatP`  | `CENTER_LATITUDE`          | Centre latitude of projection (varies per observation) |
+| `L0`    | `LINE_PROJECTION_OFFSET`   | Line offset of projection origin from pixel (1,1)      |
+| `S0`    | `SAMPLE_PROJECTION_OFFSET` | Sample offset of projection origin from pixel (1,1)    |
+| `Scale` | `MAP_SCALE`                | Map scale in metres/pixel                              |
+| `R`     | `A_AXIS_RADIUS`            | Local ellipsoid radius at `LatP` (km; convert to m)    |
 
 *Reference: [DSMAP.CAT](https://hirise-pds.lpl.arizona.edu/PDS/CATALOG/DSMAP.CAT) — full derivation with worked equations.*
 
@@ -163,15 +163,15 @@ The `IMAGE` object in each LBL provides the constants for converting raw DN (dig
 I/F = DN × SCALING_FACTOR + OFFSET
 ```
 
-| LBL keyword | Typical value | Meaning |
-|-------------|---------------|---------|
-| `SCALING_FACTOR` | 1.24 × 10⁻⁴ – 2.38 × 10⁻⁴ | Multiplicative calibration factor |
-| `OFFSET` | 0.030 – 0.038 | Additive offset |
-| `SAMPLE_BITS` | 16 | Bits per pixel (stored as `MSB_UNSIGNED_INTEGER`) |
-| `SAMPLE_BIT_MASK` | `2#0000001111111111#` | Effective 10-bit data (0–1023) |
-| `CORE_NULL` | 0 | DN value representing nodata |
-| `CORE_LOW_REPR_SATURATION` | 1 | Lowest valid DN |
-| `CORE_HIGH_REPR_SATURATION` | 1023 | Highest valid DN |
+| LBL keyword                 | Typical value             | Meaning                                           |
+|-----------------------------|---------------------------|---------------------------------------------------|
+| `SCALING_FACTOR`            | 1.24 × 10⁻⁴ – 2.38 × 10⁻⁴ | Multiplicative calibration factor                 |
+| `OFFSET`                    | 0.030 – 0.038             | Additive offset                                   |
+| `SAMPLE_BITS`               | 16                        | Bits per pixel (stored as `MSB_UNSIGNED_INTEGER`) |
+| `SAMPLE_BIT_MASK`           | `2#0000001111111111#`     | Effective 10-bit data (0–1023)                    |
+| `CORE_NULL`                 | 0                         | DN value representing nodata                      |
+| `CORE_LOW_REPR_SATURATION`  | 1                         | Lowest valid DN                                   |
+| `CORE_HIGH_REPR_SATURATION` | 1023                      | Highest valid DN                                  |
 
 The calibrated I/F is clipped to `[0, 1]`.
 
@@ -179,12 +179,12 @@ The calibrated I/F is clipped to `[0, 1]`.
 
 ### 4.3  Band structure
 
-| LBL keyword | Example value | Meaning |
-|-------------|---------------|---------|
-| `BANDS` | 3 (COLOR) or 1 (RED) | Number of image bands |
-| `FILTER_NAME` | `("NEAR-INFRARED", "RED", "BLUE-GREEN")` | Band assignment |
-| `CENTER_FILTER_WAVELENGTH` | `(900, 700, 500)` nm | Wavelength centres |
-| `BAND_STORAGE_TYPE` | `BAND_SEQUENTIAL` | BSQ interleaving |
+| LBL keyword                | Example value                            | Meaning               |
+|----------------------------|------------------------------------------|-----------------------|
+| `BANDS`                    | 3 (COLOR) or 1 (RED)                     | Number of image bands |
+| `FILTER_NAME`              | `("NEAR-INFRARED", "RED", "BLUE-GREEN")` | Band assignment       |
+| `CENTER_FILTER_WAVELENGTH` | `(900, 700, 500)` nm                     | Wavelength centres    |
+| `BAND_STORAGE_TYPE`        | `BAND_SEQUENTIAL`                        | BSQ interleaving      |
 
 **Channel selection logic:** When only `"RED"` is requested, the `_RED.JP2` file is preferred (higher fidelity — more TDI lines). When any colour channel (NIR or BG) is requested, the `_COLOR.JP2` is used. The `FILTER_NAME` tuple in the LBL determines the band-index mapping; the fallback `_COLOR_BAND` dictionary (`NIR→1, RED→2, BG→3`) is used when the LBL cannot be parsed.
 
@@ -192,11 +192,11 @@ The calibrated I/F is clipped to `[0, 1]`.
 
 The `INSTRUMENT_SETTING_PARAMETERS` group records which CCDs were active and their acquisition settings:
 
-| Keyword | Meaning |
-|---------|---------|
-| `MRO:CCD_FLAG` | 14-element array (ON/OFF for each CCD) |
-| `MRO:BINNING` | Per-CCD pixel binning factor (1, 2, or 4; −9998 = inactive) |
-| `MRO:TDI` | Time-delay integration stages (32, 64, or 128; −9998 = inactive) |
+| Keyword        | Meaning                                                          |
+|----------------|------------------------------------------------------------------|
+| `MRO:CCD_FLAG` | 14-element array (ON/OFF for each CCD)                           |
+| `MRO:BINNING`  | Per-CCD pixel binning factor (1, 2, or 4; −9998 = inactive)      |
+| `MRO:TDI`      | Time-delay integration stages (32, 64, or 128; −9998 = inactive) |
 
 The `SOURCE_PRODUCT_ID` list names the specific EDR channel products that were mosaicked into the RDR. For example, `ESP_011261_1960_COLOR` uses `BG12_0, BG12_1, RED4_0, RED4_1, IR10_0, IR10_1, BG13_0, BG13_1, RED5_0, RED5_1, IR11_0, IR11_1` — 6 CCD pairs (12 EDR halves). These CCDs are physically staggered on the HiRISE focal plane in both the cross-track and along-track directions, producing an irregular data footprint within the axis-aligned projected image rectangle.
 
@@ -212,13 +212,13 @@ HiRISE RDR products are stored as JPEG2000 Part-1 (ISO/IEC 15444-1:2004) compres
 
 ### 5.2  Data characteristics
 
-| Property | COLOR products | RED products |
-|----------|---------------|-------------|
-| Bands | 3 (NIR, RED, BG) | 1 (RED) |
-| Bit depth | 16-bit unsigned (10-bit effective) | 16-bit unsigned (10-bit effective) |
-| Typical dimensions | 2 000–18 000 samples × 5 000–110 000 lines | 20 000–70 000 samples × 50 000–200 000+ lines |
-| Typical compressed size | 50 MB – 2.5 GB | 200 MB – 5 GB |
-| Compression ratio | ~3–6× | ~3–6× |
+| Property                | COLOR products                             | RED products                                  |
+|-------------------------|--------------------------------------------|-----------------------------------------------|
+| Bands                   | 3 (NIR, RED, BG)                           | 1 (RED)                                       |
+| Bit depth               | 16-bit unsigned (10-bit effective)         | 16-bit unsigned (10-bit effective)            |
+| Typical dimensions      | 2 000–18 000 samples × 5 000–110 000 lines | 20 000–70 000 samples × 50 000–200 000+ lines |
+| Typical compressed size | 50 MB – 2.5 GB                             | 200 MB – 5 GB                                 |
+| Compression ratio       | ~3–6×                                      | ~3–6×                                         |
 
 ### 5.3  Random-access performance problem
 
@@ -276,22 +276,22 @@ Each worker fully decompresses one JP2 at a time. `_safe_worker_count()` estimat
 
 The spatial index is a `GeoDataFrame` with one row per unique observation, indexed by a `pd.IntervalIndex` of `[START_TIME, STOP_TIME]` intervals. Columns:
 
-| Column | Type | Content |
-|--------|------|---------|
-| `obs_id` | str | Observation ID (e.g. `ESP_011261_1960`) |
-| `color_path` | str or None | Local path to the `_COLOR.JP2` file |
-| `red_path` | str or None | Local path to the `_RED.JP2` file |
-| `geometry` | Polygon | Strip footprint in geographic CRS |
+| Column       | Type        | Content                                 |
+|--------------|-------------|-----------------------------------------|
+| `obs_id`     | str         | Observation ID (e.g. `ESP_011261_1960`) |
+| `color_path` | str or None | Local path to the `_COLOR.JP2` file     |
+| `red_path`   | str or None | Local path to the `_RED.JP2` file       |
+| `geometry`   | Polygon     | Strip footprint in geographic CRS       |
 
 ### 7.2  Geometry resolution priority
 
 The geometry for each observation is resolved in priority order:
 
-| Case | Source | Shape | When used |
-|------|--------|-------|-----------|
-| A | Convex hull of non-zero pixels from JP2/COG | True strip parallelogram | JP2 file exists and is readable |
-| B | JP2 bounding box (from `rasterio.transform_bounds`) | Axis-aligned rectangle | JP2 exists but footprint extraction fails |
-| C | Cumulative index `MINIMUM/MAXIMUM_LATITUDE/LONGITUDE` | Axis-aligned rectangle | JP2 not yet downloaded |
+| Case | Source                                                | Shape                    | When used                                 |
+|------|-------------------------------------------------------|--------------------------|-------------------------------------------|
+| A    | Convex hull of non-zero pixels from JP2/COG           | True strip parallelogram | JP2 file exists and is readable           |
+| B    | JP2 bounding box (from `rasterio.transform_bounds`)   | Axis-aligned rectangle   | JP2 exists but footprint extraction fails |
+| C    | Cumulative index `MINIMUM/MAXIMUM_LATITUDE/LONGITUDE` | Axis-aligned rectangle   | JP2 not yet downloaded                    |
 
 The footprint extraction (Case A) reads band 1 at the coarsest available overview level (typically 16× reduction), computes the convex hull of non-zero pixel coordinates in pixel space, then reprojects only the hull vertices (typically 4–20 points) to the geographic CRS. This captures the actual data boundary created by CCD stagger without requiring knowledge of the focal plane geometry.
 
@@ -533,16 +533,16 @@ This keeps geographically adjacent observations on the same side of the split.
 
 ## 13  Summary of constants
 
-| Constant | Value | Source |
-|----------|-------|--------|
-| Mars equatorial radius | 3 396 190 m | DSMAP.CAT |
-| Mars polar radius | 3 376 200 m | DSMAP.CAT |
-| Native resolution (RED) | 118 502.26 pix/deg | Per-product LBL |
-| Effective bit depth | 10 bits (0–1023) | `SAMPLE_BIT_MASK = 2#0000001111111111#` |
-| COG tile size | 512 × 512 pixels | _COG_CREATION_OPTIONS |
-| COG overview levels | [2, 4, 8, 16] | _OVERVIEW_LEVELS |
-| Spatial tolerance | 1 × 10⁻⁵ ° (≈ 0.6 m) | _SPATIAL_TOL |
-| Sampler edge inset | 5% of patch size | _edge_inset in HiRISEGeoSampler |
-| Center longitude (projection) | 180.000° | All per-product LBLs |
-| CORE_NULL (nodata DN) | 0 | Per-product LBL IMAGE object |
-| Minimum free disk (downloads) | 100 GB | _MIN_FREE_BYTES |
+| Constant                      | Value                | Source                                  |
+|-------------------------------|----------------------|-----------------------------------------|
+| Mars equatorial radius        | 3 396 190 m          | DSMAP.CAT                               |
+| Mars polar radius             | 3 376 200 m          | DSMAP.CAT                               |
+| Native resolution (RED)       | 118 502.26 pix/deg   | Per-product LBL                         |
+| Effective bit depth           | 10 bits (0–1023)     | `SAMPLE_BIT_MASK = 2#0000001111111111#` |
+| COG tile size                 | 512 × 512 pixels     | _COG_CREATION_OPTIONS                   |
+| COG overview levels           | [2, 4, 8, 16]        | _OVERVIEW_LEVELS                        |
+| Spatial tolerance             | 1 × 10⁻⁵ ° (≈ 0.6 m) | _SPATIAL_TOL                            |
+| Sampler edge inset            | 5% of patch size     | _edge_inset in HiRISEGeoSampler         |
+| Center longitude (projection) | 180.000°             | All per-product LBLs                    |
+| CORE_NULL (nodata DN)         | 0                    | Per-product LBL IMAGE object            |
+| Minimum free disk (downloads) | 100 GB               | _MIN_FREE_BYTES                         |
