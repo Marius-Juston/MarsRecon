@@ -1777,16 +1777,16 @@ def main() -> None:
     # size= is in degrees (units of self.crs = geographic Mars CRS).
     # 0.005 deg ≈ 593 pixels ≈ 296 m at the equator.
     sampler = HiRISEGeoSampler(dataset, size=0.005, length=200, units=Units.CRS)
-    dataloader = DataLoader(dataset, sampler=sampler)
+    dataloader = DataLoader(dataset, sampler=sampler,
+                            num_workers=10,
+                            multiprocessing_context='spawn',
+                            prefetch_factor=4)
 
     output_path = pathlib.Path("Figures")
 
     output_path.mkdir(parents=True, exist_ok=True)
 
     for i, sample in enumerate(dataloader):
-        if i >= 10:
-            break
-
         fig = dataset.plot(sample)
         fig.savefig(output_path / f"output{i}.png")
         logger.info("Saved fig output%d.png", i)
