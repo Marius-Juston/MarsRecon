@@ -23,6 +23,8 @@ from marsclip_patches import (
     MarsCLIPPatchDataset,
     build_patch_observation_metadata,
     build_patch_records,
+    load_patch_records,
+    save_patch_records,
     summarize_patch_records,
     summarize_patch_samples,
 )
@@ -332,6 +334,100 @@ def test_patch_dataset_returns_expected_keys_and_quality_flags():
     assert metadata["overlap_fractions"] == (1.0,)
 
 
+def test_patch_dataset_color_only_filters_red_only_observations(mars_crs):
+    geometries = [
+        box(-1.0, 0.0, 1.0, 2.0),
+        box(0.0, 0.0, 2.0, 2.0),
+    ]
+    dataset = make_mock_dataset(geometries, mars_crs)
+    dataset.index["obs_id"] = ["OBS_A", "OBS_B"]
+    dataset._raw_index = _raw_index_rows()
+
+    image = torch.full((3, 4, 4), 0.25, dtype=torch.float32)
+
+    def _getitem(_: object) -> dict[str, object]:
+        return {
+            "image": image.clone(),
+            "bounds": torch.tensor([-1.0, 0.0, 1.0, 2.0], dtype=torch.float32),
+            "crs": "mars",
+        }
+
+    dataset.__getitem__ = _getitem  # type: ignore[attr-defined]
+
+    patch_records = pd.DataFrame(
+        [
+            {
+                "patch_id": "patch_color",
+                "x_start": -1.0,
+                "x_stop": 1.0,
+                "y_start": 0.0,
+                "y_stop": 2.0,
+                "t_start": pd.Timestamp("2007-01-01T00:00:00Z"),
+                "t_stop": pd.Timestamp("2007-01-01T00:01:00Z"),
+                "min_lon": -1.0,
+                "max_lon": 1.0,
+                "min_lat": 0.0,
+                "max_lat": 2.0,
+                "centroid_lon": 0.0,
+                "centroid_lat": 1.0,
+                "patch_lon_span_deg": 2.0,
+                "patch_lat_span_deg": 2.0,
+                "patch_area_deg2": 4.0,
+                "dominant_obs_id": "OBS_A",
+                "contributing_obs_ids": ("OBS_A",),
+                "contributing_rationales": ("Olympus Mons lava channels",),
+                "overlap_fractions": (1.0,),
+                "dominant_overlap_fraction": 1.0,
+                "source_obs_count": 1,
+                "has_near_infrared": True,
+                "has_red": True,
+                "has_blue_green": True,
+                "rationale_raw": "Olympus Mons lava channels",
+            },
+            {
+                "patch_id": "patch_red_only",
+                "x_start": 0.0,
+                "x_stop": 2.0,
+                "y_start": 0.0,
+                "y_stop": 2.0,
+                "t_start": pd.Timestamp("2007-01-02T00:00:00Z"),
+                "t_stop": pd.Timestamp("2007-01-02T00:01:00Z"),
+                "min_lon": 0.0,
+                "max_lon": 2.0,
+                "min_lat": 0.0,
+                "max_lat": 2.0,
+                "centroid_lon": 1.0,
+                "centroid_lat": 1.0,
+                "patch_lon_span_deg": 2.0,
+                "patch_lat_span_deg": 2.0,
+                "patch_area_deg2": 4.0,
+                "dominant_obs_id": "OBS_B",
+                "contributing_obs_ids": ("OBS_B",),
+                "contributing_rationales": ("Red only strip",),
+                "overlap_fractions": (1.0,),
+                "dominant_overlap_fraction": 1.0,
+                "source_obs_count": 1,
+                "has_near_infrared": False,
+                "has_red": True,
+                "has_blue_green": False,
+                "rationale_raw": "Red only strip",
+            },
+        ]
+    )
+
+    ds = MarsCLIPPatchDataset(
+        geo_dataset=dataset,
+        patch_records=patch_records,
+        image_size=4,
+        color_only=True,
+    )
+
+    assert len(ds) == 1
+    assert ds.patch_records["patch_id"].tolist() == ["patch_color"]
+    assert set(ds.observation_metadata.index.tolist()) == {"OBS_A"}
+    assert set(ds.geo_dataset.index["obs_id"].astype(str).tolist()) == {"OBS_A"}
+
+
 def test_summarize_patch_samples_reports_validity_threshold():
     samples = [
         {
@@ -368,6 +464,28 @@ def test_summarize_patch_samples_reports_validity_threshold():
     assert summary["min_valid_fraction_threshold"] == pytest.approx(
         DEFAULT_PATCH_VALID_FRACTION
     )
+
+
+def test_patch_records_round_trip_pickle(tmp_path):
+    patch_records = pd.DataFrame(
+        [
+            {
+                "patch_id": "patch_000000",
+                "dominant_obs_id": "OBS_A",
+                "contributing_obs_ids": ("OBS_A", "OBS_B"),
+                "contributing_rationales": ("A", "B"),
+                "overlap_fractions": (0.6, 0.4),
+                "has_near_infrared": True,
+                "has_red": True,
+                "has_blue_green": True,
+            }
+        ]
+    )
+
+    path = save_patch_records(patch_records, tmp_path / "patch_records.pkl")
+    loaded = load_patch_records(path)
+
+    assert loaded.to_dict(orient="records") == patch_records.to_dict(orient="records")
 
 
 @pytest.mark.integration

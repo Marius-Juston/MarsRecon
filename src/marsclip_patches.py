@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+from ast import literal_eval
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -38,6 +39,88 @@ PATCH_SCALE_FEATURE_NAMES: tuple[str, ...] = (
 DEFAULT_PATCH_VALID_FRACTION = 0.5
 
 _PRODUCT_RE = re.compile(r"_(COLOR|RED)\s*$")
+
+
+def _normalize_obs_id_set(obs_ids: Sequence[str]) -> set[str]:
+    """Normalize a sequence of observation ids into a string set."""
+    return {str(obs_id) for obs_id in obs_ids}
+
+
+def _filter_observation_metadata_to_color(
+    observation_metadata: pd.DataFrame,
+) -> pd.DataFrame:
+    """Keep only observations with full three-band COLOR support."""
+    required = {"obs_id", "has_near_infrared", "has_blue_green"}
+    missing = required.difference(observation_metadata.columns)
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        raise ValueError(
+            f"observation_metadata is missing required COLOR filter columns: {missing_names}"
+        )
+
+    mask = (
+        observation_metadata["has_near_infrared"].astype(bool)
+        & observation_metadata["has_blue_green"].astype(bool)
+    )
+    filtered = observation_metadata.loc[mask].copy().reset_index(drop=True)
+    if filtered.empty:
+        raise ValueError("No COLOR-capable observations remain after color_only filtering.")
+    return filtered
+
+
+def _filter_geo_dataset_to_obs_ids(
+    geo_dataset: MarsHiRISE | Any,
+    *,
+    allowed_obs_ids: set[str],
+) -> None:
+    """Restrict a GeoDataset in-place to a set of allowed observation ids."""
+    if hasattr(geo_dataset, "index") and getattr(geo_dataset, "index") is not None:
+        index = geo_dataset.index.copy()
+        if "obs_id" not in index.columns:
+            raise ValueError("geo_dataset.index must include an 'obs_id' column for color filtering.")
+        index["obs_id"] = index["obs_id"].astype(str)
+        geo_dataset.index = index.loc[index["obs_id"].isin(allowed_obs_ids)].copy()
+        if len(geo_dataset.index) == 0:
+            raise ValueError("No spatial-index observations remain after color_only filtering.")
+
+    if hasattr(geo_dataset, "_raw_index") and getattr(geo_dataset, "_raw_index") is not None:
+        raw_index = geo_dataset._raw_index.copy()
+        if "PRODUCT_ID" not in raw_index.columns:
+            raise ValueError("geo_dataset._raw_index must include a 'PRODUCT_ID' column for color filtering.")
+        product_ids = raw_index["PRODUCT_ID"].astype(str).str.strip()
+        obs_ids = product_ids.map(_observation_id)
+        geo_dataset._raw_index = raw_index.loc[obs_ids.isin(allowed_obs_ids)].copy()
+
+
+def _filter_patch_records_to_color(
+    patch_records: pd.DataFrame,
+    *,
+    allowed_obs_ids: set[str],
+) -> pd.DataFrame:
+    """Keep only patch records whose contributing observations are COLOR-capable."""
+    required = {"dominant_obs_id", "contributing_obs_ids", "has_near_infrared", "has_blue_green"}
+    missing = required.difference(patch_records.columns)
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        raise ValueError(
+            f"patch_records is missing required COLOR filter columns: {missing_names}"
+        )
+
+    def _all_allowed(contributing_obs_ids: object) -> bool:
+        if isinstance(contributing_obs_ids, Sequence) and not isinstance(contributing_obs_ids, str):
+            return all(str(obs_id) in allowed_obs_ids for obs_id in contributing_obs_ids)
+        return False
+
+    mask = (
+        patch_records["dominant_obs_id"].astype(str).isin(allowed_obs_ids)
+        & patch_records["has_near_infrared"].astype(bool)
+        & patch_records["has_blue_green"].astype(bool)
+        & patch_records["contributing_obs_ids"].map(_all_allowed)
+    )
+    filtered = patch_records.loc[mask].copy().reset_index(drop=True)
+    if filtered.empty:
+        raise ValueError("No patch records remain after color_only filtering.")
+    return filtered
 
 
 def _normalize_image_size(value: int | tuple[int, int]) -> tuple[int, int]:
@@ -348,6 +431,40 @@ def summarize_patch_records(patch_records: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def save_patch_records(
+    patch_records: pd.DataFrame,
+    path: pathlib.Path | str,
+) -> pathlib.Path:
+    """Persist patch records for reuse across training runs."""
+    out = pathlib.Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    suffix = out.suffix.lower()
+    if suffix in {".pkl", ".pickle"}:
+        patch_records.to_pickle(out)
+    elif suffix == ".parquet":
+        patch_records.to_parquet(out, index=False)
+    else:
+        patch_records.to_csv(out, index=False)
+    return out
+
+
+def load_patch_records(path: pathlib.Path | str) -> pd.DataFrame:
+    """Load cached patch records from disk."""
+    source = pathlib.Path(path)
+    suffix = source.suffix.lower()
+    if suffix in {".pkl", ".pickle"}:
+        patch_records = pd.read_pickle(source)
+    elif suffix == ".parquet":
+        patch_records = pd.read_parquet(source)
+    else:
+        patch_records = pd.read_csv(source)
+        tuple_columns = ("contributing_obs_ids", "contributing_rationales", "overlap_fractions")
+        for column in tuple_columns:
+            if column in patch_records.columns:
+                patch_records[column] = patch_records[column].map(literal_eval)
+    return patch_records
+
+
 def summarize_patch_samples(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Summarize sampled Stage A patches using realized valid-mask statistics."""
     if not samples:
@@ -412,6 +529,7 @@ class MarsCLIPPatchDataset(Dataset):
         min_valid_fraction: float = DEFAULT_PATCH_VALID_FRACTION,
         max_patches: int | None = None,
         generator: torch.Generator | None = None,
+        color_only: bool = False,
         rationale_cache: pd.DataFrame | pathlib.Path | str | None = None,
         observation_metadata: pd.DataFrame | None = None,
         patch_records: pd.DataFrame | None = None,
@@ -443,6 +561,13 @@ class MarsCLIPPatchDataset(Dataset):
                 observation_metadata["rationale_expanded"] = None
                 observation_metadata["has_rationale_expanded"] = False
 
+        if color_only:
+            observation_metadata = _filter_observation_metadata_to_color(observation_metadata)
+            allowed_obs_ids = _normalize_obs_id_set(observation_metadata["obs_id"].tolist())
+            _filter_geo_dataset_to_obs_ids(geo_dataset, allowed_obs_ids=allowed_obs_ids)
+        else:
+            allowed_obs_ids = set()
+
         if patch_records is None:
             patch_records = build_patch_records(
                 geo_dataset,
@@ -455,6 +580,11 @@ class MarsCLIPPatchDataset(Dataset):
             )
         else:
             patch_records = patch_records.copy()
+        if color_only:
+            patch_records = _filter_patch_records_to_color(
+                patch_records,
+                allowed_obs_ids=allowed_obs_ids,
+            )
 
         if patch_records.empty:
             raise ValueError("Patch record table is empty.")
@@ -465,6 +595,7 @@ class MarsCLIPPatchDataset(Dataset):
         self.image_size = _normalize_image_size(image_size)
         self.patch_size = _to_tuple(patch_size)
         self.min_valid_fraction = float(min_valid_fraction)
+        self.color_only = bool(color_only)
         self.transforms = transforms
 
     def __len__(self) -> int:
