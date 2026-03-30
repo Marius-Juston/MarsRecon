@@ -10,6 +10,16 @@ Overall workflow progress: `[#######---] ~68%`
 
 This percentage is intentionally conservative. It reflects alignment to the full workflow, not just the amount of code already written.
 
+## Comparison References
+
+- `SatMAE`
+  Use as inspiration for Stage A multi-spectral masked autoencoding, band handling, and later Stage B transfer comparisons.
+  Source: https://sustainlab-group.github.io/SatMAE/
+
+- `Scale-MAE`
+  Use as inspiration for scale/GSD-aware Stage A ablations, especially scale encoding and future low/high-frequency reconstruction losses.
+  Source: https://arxiv.org/pdf/2212.14532
+
 ## Stage Tracker
 
 ### 1. Phase 0: Data Infrastructure And Baseline Scaffold
@@ -157,7 +167,7 @@ What exists now:
 - PCA-based embedding scatter generation
 - real Olympus Mons embedding sanity artifacts from a saved checkpoint
 - longer 40-step Stage A run with periodic checkpoints on Olympus Mons
-- longer 80-step CUDA Stage A run with GPU-backed checkpoint selection
+- longer 80-step CUDA Stage A run with GPU-backed checkpoint selection at batch size `8`
 - explicit checkpoint-selection note in `reports/MarsCLIP_StageA_Checkpoint_Note.md`
 
 Validation:

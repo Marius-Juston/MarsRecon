@@ -179,6 +179,7 @@ Loss summary:
 
 Run summary:
 
+- Batch size: `8`
 - Initial loss: `0.3595007061958313`
 - Final loss: `0.16833315789699554`
 - Best loss: `0.16813473403453827`
