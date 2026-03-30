@@ -934,12 +934,17 @@ class MarsHiRISE(GeoDataset):
 
     @property
     def spatial_index_cache(self) -> pathlib.Path:
+        def _format_part(value: object) -> str:
+            if isinstance(value, float) and value.is_integer():
+                return str(int(value))
+            return str(value)
+
         parts = []
         if self.target:
             parts.append(self.target)
         if self.bbox:
             parts.append(
-                f"{self.bbox[0]}_{self.bbox[1]}_{self.bbox[2]}_{self.bbox[3]}"
+                "_".join(_format_part(v) for v in self.bbox)
             )
         suffix = f"_{'_'.join(parts)}" if parts else ""
         return self.root / f"spatial_cache{suffix}_v3.gpkg"

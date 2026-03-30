@@ -18,11 +18,13 @@ if str(_SRC) not in sys.path:
 from helpers import make_mock_dataset
 from marsclip_dataset import GEO_FEATURE_NAMES, VIEWING_FEATURE_NAMES
 from marsclip_patches import (
+    DEFAULT_PATCH_VALID_FRACTION,
     PATCH_SCALE_FEATURE_NAMES,
     MarsCLIPPatchDataset,
     build_patch_observation_metadata,
     build_patch_records,
     summarize_patch_records,
+    summarize_patch_samples,
 )
 
 
@@ -328,6 +330,44 @@ def test_patch_dataset_returns_expected_keys_and_quality_flags():
     assert not metadata["is_patch_valid"]
     assert metadata["contributing_obs_ids"] == ("obs_0",)
     assert metadata["overlap_fractions"] == (1.0,)
+
+
+def test_summarize_patch_samples_reports_validity_threshold():
+    samples = [
+        {
+            "metadata": {
+                "overall_valid_fraction": 0.25,
+                "is_patch_valid": False,
+                "source_obs_count": 1,
+                "dominant_overlap_fraction": 1.0,
+                "band_valid_fraction": torch.tensor([0.0, 0.25, 0.0]),
+                "min_valid_fraction": DEFAULT_PATCH_VALID_FRACTION,
+            }
+        },
+        {
+            "metadata": {
+                "overall_valid_fraction": 0.75,
+                "is_patch_valid": True,
+                "source_obs_count": 2,
+                "dominant_overlap_fraction": 0.8,
+                "band_valid_fraction": torch.tensor([0.75, 0.75, 0.5]),
+                "min_valid_fraction": DEFAULT_PATCH_VALID_FRACTION,
+            }
+        },
+    ]
+
+    summary = summarize_patch_samples(samples)
+
+    assert summary["num_samples"] == 2
+    assert summary["num_valid_patches"] == 1
+    assert summary["valid_patch_fraction"] == pytest.approx(0.5)
+    assert summary["mean_overall_valid_fraction"] == pytest.approx(0.5)
+    assert summary["mean_source_obs_count"] == pytest.approx(1.5)
+    assert summary["mean_dominant_overlap_fraction"] == pytest.approx(0.9)
+    assert summary["mean_band_valid_fraction"] == pytest.approx([0.375, 0.5, 0.25])
+    assert summary["min_valid_fraction_threshold"] == pytest.approx(
+        DEFAULT_PATCH_VALID_FRACTION
+    )
 
 
 @pytest.mark.integration

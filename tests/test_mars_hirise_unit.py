@@ -746,7 +746,7 @@ class TestSpatialIndexCache:
         mock_dataset.target = None
         mock_dataset.bbox = (-136.0, 12.0, -124.0, 24.0)
         path = mock_dataset.spatial_index_cache
-        assert "-136.0" in path.name
+        assert path.name == "spatial_cache_-136_12_-124_24_v3.gpkg"
         mock_dataset.bbox = None
 
     def test_both_target_and_bbox_in_suffix(self, mock_dataset):
@@ -754,7 +754,7 @@ class TestSpatialIndexCache:
         mock_dataset.bbox = (-136.0, 12.0, -124.0, 24.0)
         path = mock_dataset.spatial_index_cache
         assert "Olympus" in path.name
-        assert "-136.0" in path.name
+        assert "-136_12_-124_24" in path.name
         mock_dataset.target = None
         mock_dataset.bbox = None
 

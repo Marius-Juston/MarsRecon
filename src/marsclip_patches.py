@@ -35,6 +35,8 @@ PATCH_SCALE_FEATURE_NAMES: tuple[str, ...] = (
     "patch_aspect_ratio",
 )
 
+DEFAULT_PATCH_VALID_FRACTION = 0.5
+
 _PRODUCT_RE = re.compile(r"_(COLOR|RED)\s*$")
 
 
@@ -346,6 +348,54 @@ def summarize_patch_records(patch_records: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def summarize_patch_samples(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize sampled Stage A patches using realized valid-mask statistics."""
+    if not samples:
+        return {
+            "num_samples": 0,
+            "num_valid_patches": 0,
+            "valid_patch_fraction": 0.0,
+            "mean_overall_valid_fraction": 0.0,
+            "min_overall_valid_fraction": 0.0,
+            "max_overall_valid_fraction": 0.0,
+            "mean_source_obs_count": 0.0,
+            "mean_dominant_overlap_fraction": 0.0,
+            "mean_band_valid_fraction": [0.0, 0.0, 0.0],
+            "min_valid_fraction_threshold": DEFAULT_PATCH_VALID_FRACTION,
+        }
+
+    overall_valid = []
+    is_valid = []
+    source_counts = []
+    dominant_overlap = []
+    band_valid = []
+    thresholds = []
+    for sample in samples:
+        metadata = sample["metadata"]
+        overall_valid.append(float(metadata["overall_valid_fraction"]))
+        is_valid.append(bool(metadata["is_patch_valid"]))
+        source_counts.append(float(metadata["source_obs_count"]))
+        dominant_overlap.append(float(metadata["dominant_overlap_fraction"]))
+        band_valid.append(metadata["band_valid_fraction"].detach().cpu().float())
+        thresholds.append(float(metadata["min_valid_fraction"]))
+
+    mean_band_valid = torch.stack(band_valid, dim=0).mean(dim=0).tolist()
+    return {
+        "num_samples": int(len(samples)),
+        "num_valid_patches": int(sum(is_valid)),
+        "valid_patch_fraction": float(sum(is_valid) / len(samples)),
+        "mean_overall_valid_fraction": float(sum(overall_valid) / len(samples)),
+        "min_overall_valid_fraction": float(min(overall_valid)),
+        "max_overall_valid_fraction": float(max(overall_valid)),
+        "mean_source_obs_count": float(sum(source_counts) / len(source_counts)),
+        "mean_dominant_overlap_fraction": float(
+            sum(dominant_overlap) / len(dominant_overlap)
+        ),
+        "mean_band_valid_fraction": [float(x) for x in mean_band_valid],
+        "min_valid_fraction_threshold": float(thresholds[0]),
+    }
+
+
 class MarsCLIPPatchDataset(Dataset):
     """Patch-level dataset bridging MarsHiRISE sampling to the MarsCLIP workflow."""
 
@@ -359,7 +409,7 @@ class MarsCLIPPatchDataset(Dataset):
         stride: float | tuple[float, float] | None = None,
         image_size: int | tuple[int, int] = 224,
         min_geometry_overlap: float = 0.5,
-        min_valid_fraction: float = 0.5,
+        min_valid_fraction: float = DEFAULT_PATCH_VALID_FRACTION,
         max_patches: int | None = None,
         generator: torch.Generator | None = None,
         rationale_cache: pd.DataFrame | pathlib.Path | str | None = None,

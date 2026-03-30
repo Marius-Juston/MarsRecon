@@ -20,7 +20,7 @@ mpl.use("Agg")
 from matplotlib import pyplot as plt
 
 from marsclip_dataset import MarsCLIPDataset
-from marsclip_patches import MarsCLIPPatchDataset
+from marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
 
 
 def _to_display_rgb(image: torch.Tensor) -> np.ndarray:
@@ -30,6 +30,25 @@ def _to_display_rgb(image: torch.Tensor) -> np.ndarray:
     else:
         raise ValueError("Expected CHW image tensor.")
     return np.clip(disp, 0.0, 1.0)
+
+
+def _build_mask_overlay(image: torch.Tensor, valid_mask: torch.Tensor) -> np.ndarray:
+    """Render a readable validity overlay instead of a blank binary panel."""
+    rgb = _to_display_rgb(image)
+    mask = valid_mask.detach().cpu().numpy().astype(bool)
+
+    # Use a muted grayscale background so fully valid masks still show structure.
+    gray = rgb.mean(axis=2, keepdims=True)
+    overlay = np.repeat(gray, 3, axis=2) * 0.75
+
+    # Valid regions get a subtle green tint; invalid regions get a strong red tint.
+    overlay[mask] = np.clip(
+        0.55 * overlay[mask] + 0.45 * np.array([0.20, 0.85, 0.25]),
+        0.0,
+        1.0,
+    )
+    overlay[~mask] = np.array([0.95, 0.15, 0.15])
+    return overlay
 
 
 def save_sample_preview(
@@ -61,13 +80,23 @@ def save_sample_preview(
             f"{md['obs_id']}  valid={md['overall_valid_fraction']:.0%}\n"
             f"{sample['rationale_raw'][:70]}"
         )
+        if "is_patch_valid" in md:
+            title = (
+                f"{md['obs_id']}  valid={md['overall_valid_fraction']:.0%}"
+                f"  keep={'yes' if md['is_patch_valid'] else 'no'}\n"
+                f"{sample['rationale_raw'][:70]}"
+            )
         if sample.get("rationale_expanded"):
             title += "\nexpanded"
         ax_img.set_title(title, fontsize=9)
 
-        ax_mask.imshow(valid_mask, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+        mask_overlay = _build_mask_overlay(sample["image"], sample["valid_mask"])
+        ax_mask.imshow(mask_overlay, interpolation="nearest")
         ax_mask.axis("off")
-        ax_mask.set_title("valid_mask", fontsize=9)
+        ax_mask.set_title(
+            f"valid mask overlay ({md['overall_valid_fraction']:.0%} valid)",
+            fontsize=9,
+        )
 
     fig.suptitle("MarsCLIP sample preview", fontsize=12)
     fig.tight_layout()
@@ -100,7 +129,11 @@ def main() -> None:
     parser.add_argument("--patch-size", type=float, default=0.005)
     parser.add_argument("--stride", type=float, default=None)
     parser.add_argument("--max-patches", type=int, default=64)
-    parser.add_argument("--min-valid-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--min-valid-fraction",
+        type=float,
+        default=DEFAULT_PATCH_VALID_FRACTION,
+    )
     args = parser.parse_args()
 
     if args.dataset_kind == "patch":
