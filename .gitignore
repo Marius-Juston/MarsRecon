@@ -13,6 +13,7 @@ outcmaes/
 all-logs/
 plot*/
 lightning_logs/
+wandb/
 .vscode/
 ~bench-results*/
 optimizations*/

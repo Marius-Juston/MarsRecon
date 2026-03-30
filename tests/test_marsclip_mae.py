@@ -19,8 +19,10 @@ from marsclip_mae import (
     collate_patch_samples_for_mae,
     compute_patch_valid_fraction,
     compute_valid_patch_mask,
+    denormalize_patch_tokens,
     expand_patch_mask,
     extract_scale_values,
+    normalize_valid_image,
     patchify,
     sample_visible_patch_mask,
     scale_sinusoidal_encoding,
@@ -177,6 +179,41 @@ def test_scale_sinusoidal_encoding_shape_and_repeatability():
     assert torch.allclose(enc_a, enc_b)
 
 
+def test_normalize_valid_image_preserves_invalid_pixels_as_zero():
+    image = torch.tensor(
+        [[[[2.0, 4.0], [6.0, 8.0]], [[10.0, 12.0], [14.0, 16.0]]]],
+        dtype=torch.float32,
+    )
+    valid_mask = torch.tensor([[[True, False], [True, False]]], dtype=torch.bool)
+
+    normalized = normalize_valid_image(
+        image,
+        valid_mask,
+        channel_mean=[4.0, 12.0],
+        channel_std=[2.0, 2.0],
+    )
+
+    assert normalized[0, 0, 0, 0] == pytest.approx(-1.0)
+    assert normalized[0, 1, 1, 0] == pytest.approx(1.0)
+    assert normalized[0, :, 0, 1].eq(0).all()
+    assert normalized[0, :, 1, 1].eq(0).all()
+
+
+def test_denormalize_patch_tokens_restores_original_scale():
+    normalized_patches = torch.tensor([[[0.0, 1.0, 2.0, 3.0]]], dtype=torch.float32)
+
+    denormalized = denormalize_patch_tokens(
+        normalized_patches,
+        patch_size=1,
+        channels=4,
+        channel_mean=[1.0, 2.0, 3.0, 4.0],
+        channel_std=[2.0, 2.0, 2.0, 2.0],
+    )
+
+    expected = torch.tensor([[[1.0, 4.0, 7.0, 10.0]]], dtype=torch.float32)
+    assert torch.allclose(denormalized, expected)
+
+
 def test_mae_forward_returns_shapes_and_finite_loss():
     image = torch.rand(2, 3, 8, 8)
     valid_mask = torch.tensor(
@@ -282,6 +319,48 @@ def test_mae_forward_patch_batch_uses_stage_a1_inputs():
     assert out.encoded_tokens.shape == (2, 4, 32)
     assert out.patch_valid_mask.shape == (2, 4)
     assert torch.isfinite(out.loss)
+
+
+def test_mae_forward_supports_optional_input_and_target_normalization():
+    image = torch.tensor(
+        [
+            [
+                [[0.1, 0.2, 0.0, 0.0], [0.3, 0.4, 0.0, 0.0], [0.0, 0.0, 0.5, 0.6], [0.0, 0.0, 0.7, 0.8]],
+                [[0.2, 0.3, 0.0, 0.0], [0.4, 0.5, 0.0, 0.0], [0.0, 0.0, 0.6, 0.7], [0.0, 0.0, 0.8, 0.9]],
+                [[0.3, 0.4, 0.0, 0.0], [0.5, 0.6, 0.0, 0.0], [0.0, 0.0, 0.7, 0.8], [0.0, 0.0, 0.9, 1.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    valid_mask = torch.tensor(
+        [[[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]]],
+        dtype=torch.bool,
+    )
+    model = MarsMaskedAutoencoder(
+        image_size=4,
+        patch_size=2,
+        encoder_dim=16,
+        encoder_depth=1,
+        encoder_heads=4,
+        decoder_dim=8,
+        decoder_depth=1,
+        decoder_heads=4,
+        normalize_inputs=True,
+        normalize_targets=True,
+        input_mean=[0.45, 0.55, 0.65],
+        input_std=[0.2, 0.2, 0.2],
+    )
+
+    out = model(
+        image,
+        valid_mask,
+        scale_values=torch.tensor([0.5], dtype=torch.float32),
+        mask_ratio=0.5,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    assert torch.isfinite(out.loss)
+    assert out.reconstruction.shape == (1, 4, 12)
 
 
 def test_mae_backward_smoke():

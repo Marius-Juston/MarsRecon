@@ -136,6 +136,75 @@ def extract_scale_values(scale_features: torch.Tensor) -> torch.Tensor:
     return scale_features[:, 0].to(torch.float32)
 
 
+def _coerce_channel_stats(
+    values: Sequence[float] | torch.Tensor | None,
+    *,
+    channels: int,
+    default: float,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Normalize per-channel statistics to a ``(1, C, 1, 1)`` tensor."""
+    if values is None:
+        tensor = torch.full((channels,), float(default), dtype=dtype)
+    else:
+        tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
+        if tensor.numel() != channels:
+            raise ValueError(f"Expected {channels} channel stats, got {tensor.numel()}.")
+    return tensor.view(1, channels, 1, 1)
+
+
+def normalize_valid_image(
+    image: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    channel_mean: Sequence[float] | torch.Tensor,
+    channel_std: Sequence[float] | torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Normalize valid pixels channel-wise while keeping invalid pixels at zero."""
+    if image.ndim != 4:
+        raise ValueError("image must have shape (B, C, H, W)")
+    if valid_mask.ndim != 3:
+        raise ValueError("valid_mask must have shape (B, H, W)")
+    if image.shape[0] != valid_mask.shape[0] or image.shape[-2:] != valid_mask.shape[-2:]:
+        raise ValueError("image and valid_mask must share batch/spatial dimensions.")
+
+    mean = _coerce_channel_stats(channel_mean, channels=image.shape[1], default=0.0, dtype=image.dtype).to(
+        image.device
+    )
+    std = _coerce_channel_stats(channel_std, channels=image.shape[1], default=1.0, dtype=image.dtype).to(
+        image.device
+    )
+    std = std.clamp_min(float(eps))
+    normalized = (image - mean) / std
+    expanded_valid = valid_mask.unsqueeze(1)
+    return torch.where(expanded_valid, normalized, torch.zeros_like(normalized))
+
+
+def denormalize_patch_tokens(
+    patches: torch.Tensor,
+    *,
+    patch_size: int,
+    channels: int,
+    channel_mean: Sequence[float] | torch.Tensor,
+    channel_std: Sequence[float] | torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Map normalized patch tokens back into the original channel scale."""
+    if patches.ndim != 3:
+        raise ValueError("patches must have shape (B, N, D)")
+    mean = _coerce_channel_stats(channel_mean, channels=channels, default=0.0, dtype=patches.dtype).to(
+        patches.device
+    )
+    std = _coerce_channel_stats(channel_std, channels=channels, default=1.0, dtype=patches.dtype).to(
+        patches.device
+    )
+    std = std.clamp_min(float(eps))
+    mean_tokens = mean.expand(1, channels, patch_size, patch_size).reshape(1, 1, -1)
+    std_tokens = std.expand(1, channels, patch_size, patch_size).reshape(1, 1, -1)
+    return patches * std_tokens + mean_tokens
+
+
 def collate_patch_samples_for_mae(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Collate Stage A1 patch samples into a MAE-ready batch dictionary."""
     if not samples:
@@ -316,6 +385,10 @@ class MarsMaskedAutoencoder(nn.Module):
         decoder_depth: int = 2,
         decoder_heads: int = 4,
         min_valid_fraction: float = DEFAULT_PATCH_VALID_FRACTION,
+        normalize_inputs: bool = False,
+        normalize_targets: bool = False,
+        input_mean: Sequence[float] | torch.Tensor | None = None,
+        input_std: Sequence[float] | torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if image_size % patch_size != 0:
@@ -328,6 +401,18 @@ class MarsMaskedAutoencoder(nn.Module):
         self.in_channels = in_channels
         self.num_patches = (image_size // patch_size) ** 2
         self.min_valid_fraction = min_valid_fraction
+        self.normalize_inputs = bool(normalize_inputs)
+        self.normalize_targets = bool(normalize_targets)
+        self.register_buffer(
+            "input_mean",
+            _coerce_channel_stats(input_mean, channels=in_channels, default=0.0),
+            persistent=True,
+        )
+        self.register_buffer(
+            "input_std",
+            _coerce_channel_stats(input_std, channels=in_channels, default=1.0),
+            persistent=True,
+        )
 
         self.patch_embed = nn.Conv2d(
             in_channels=in_channels,
@@ -396,7 +481,17 @@ class MarsMaskedAutoencoder(nn.Module):
         if image.shape[2] != self.image_size or image.shape[3] != self.image_size:
             raise ValueError("Input image size does not match model image_size.")
 
-        tokens = self.patch_embed(image).flatten(2).transpose(1, 2)
+        normalized_image = None
+        if self.normalize_inputs or self.normalize_targets:
+            normalized_image = normalize_valid_image(
+                image,
+                valid_mask,
+                channel_mean=self.input_mean.flatten(),
+                channel_std=self.input_std.flatten(),
+            )
+
+        encoder_image = normalized_image if self.normalize_inputs and normalized_image is not None else image
+        tokens = self.patch_embed(encoder_image).flatten(2).transpose(1, 2)
         encoder_scale = scale_sinusoidal_encoding(scale_values, tokens.shape[-1]).unsqueeze(1)
         tokens = tokens + self.encoder_pos_embed + encoder_scale
 
@@ -447,7 +542,8 @@ class MarsMaskedAutoencoder(nn.Module):
         )
         reconstruction = self.reconstruction_head(decoded)
 
-        target_patches = patchify(image, self.patch_size)
+        target_image = normalized_image if self.normalize_targets and normalized_image is not None else image
+        target_patches = patchify(target_image, self.patch_size)
         expanded_valid_mask = valid_mask.unsqueeze(1).expand(-1, image.shape[1], -1, -1)
         valid_pixel_mask = (
             patchify(expanded_valid_mask.to(image.dtype), self.patch_size) > 0.5
@@ -460,6 +556,16 @@ class MarsMaskedAutoencoder(nn.Module):
         else:
             loss = reconstruction.sum() * 0.0
 
+        output_reconstruction = reconstruction
+        if self.normalize_targets:
+            output_reconstruction = denormalize_patch_tokens(
+                reconstruction,
+                patch_size=self.patch_size,
+                channels=self.in_channels,
+                channel_mean=self.input_mean.flatten(),
+                channel_std=self.input_std.flatten(),
+            )
+
         return MarsMAEOutput(
             encoded_tokens=encoded_tokens,
             pooled_embedding=pooled_embedding,
@@ -469,6 +575,6 @@ class MarsMaskedAutoencoder(nn.Module):
             masked_valid_mask=masked_valid_mask,
             valid_pixel_mask=valid_pixel_mask,
             loss_mask=loss_mask,
-            reconstruction=reconstruction,
+            reconstruction=output_reconstruction,
             loss=loss,
         )
