@@ -70,7 +70,8 @@ class HiRISEGeoSampler(GeoSampler):
             toi=None,
             units: Units = Units.CRS,
             generator: torch.Generator | None = None,
-            min_overlap: int = 0.5
+            min_overlap: int = 0.5,
+            replacement=False,
     ) -> None:
         super().__init__(dataset, roi, toi)
 
@@ -78,6 +79,7 @@ class HiRISEGeoSampler(GeoSampler):
         # Resolve size / stride to (height_deg, width_deg)
         # ----------------------------------------------------------------
 
+        self.replacement = replacement
         size_h, size_w = _to_tuple(size)
         if units == Units.PIXELS:
             xres, yres = dataset.res  # GeoDataset.res is always a (xres, yres) tuple
@@ -103,7 +105,16 @@ class HiRISEGeoSampler(GeoSampler):
         self._centers: list[tuple[float, float, pd.Interval]] = []
         self._build_valid_centers()
 
-        self.length = length if length is not None else max(1, len(self._centers))
+        n = len(self._centers)
+        self.length = length if length is not None else max(1, n)
+
+        if not self.replacement and self.length > n:
+            logger.warning(
+                "length (%d) > available centres (%d) with replacement=False; "
+                "capping to %d. Use replacement=True for oversampling.",
+                self.length, n, n,
+            )
+            self.length = n
 
         if not self._centers:
             logger.warning(
@@ -206,7 +217,11 @@ class HiRISEGeoSampler(GeoSampler):
 
         half_h, half_w = self.size[0] / 2.0, self.size[1] / 2.0
 
-        indices = torch.randint(n, (self.length,), generator=self.generator).tolist()
+        if self.replacement:
+            indices = torch.randint(n, (self.length,), generator=self.generator).tolist()
+        else:
+            indices = torch.randperm(n, generator=self.generator).tolist()[:self.length]
+
         for idx in indices:
             cx, cy, interval = self._centers[idx]
             yield (

@@ -373,3 +373,131 @@ class TestEmptyCentersIteration:
         sampler = HiRISEGeoSampler(dataset, size=0.005, length=5, units=Units.CRS)
         assert sampler._centers == []
         assert list(sampler) == []  # hits the `if n == 0: return` branch
+
+
+# ---------------------------------------------------------------------------
+# Replacement flag
+# ---------------------------------------------------------------------------
+
+
+class TestReplacement:
+    PATCH_SIZE = 0.005
+
+    def test_replacement_true_allows_length_greater_than_n_centers(
+            self, single_strip_dataset
+    ):
+        """replacement=True skips the length-cap guard; length > n_centers is kept."""
+        ref = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE, units=Units.CRS
+        )
+        n = len(ref._centers)
+        sampler = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE,
+            length=n * 2, replacement=True, units=Units.CRS,
+        )
+        assert len(sampler) == n * 2
+
+    def test_replacement_false_caps_length_to_n_centers(
+            self, single_strip_dataset
+    ):
+        """replacement=False caps length to available centres when length > n."""
+        ref = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE, units=Units.CRS
+        )
+        n = len(ref._centers)
+        capped = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE,
+            length=n + 100, replacement=False, units=Units.CRS,
+        )
+        assert len(capped) == n
+
+    def test_replacement_true_yields_exactly_length_samples_when_oversampling(
+            self, single_strip_dataset
+    ):
+        """replacement=True iterates via torch.randint, yielding exactly length patches."""
+        ref = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE, units=Units.CRS
+        )
+        n = len(ref._centers)
+        target = n * 3
+        sampler = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE,
+            length=target, replacement=True, units=Units.CRS,
+        )
+        assert len(list(sampler)) == target
+
+    def test_replacement_false_capping_emits_warning(
+            self, single_strip_dataset, caplog
+    ):
+        """Capping length to n_centres when replacement=False emits a WARNING."""
+        import logging
+
+        ref = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE, units=Units.CRS
+        )
+        n = len(ref._centers)
+        with caplog.at_level(logging.WARNING, logger="hirise_sampler"):
+            HiRISEGeoSampler(
+                single_strip_dataset, size=self.PATCH_SIZE,
+                length=n + 50, replacement=False, units=Units.CRS,
+            )
+        assert "capping" in caplog.text.lower()
+
+    def test_replacement_true_seeded_generator_is_deterministic(
+            self, single_strip_dataset
+    ):
+        """torch.randint path: same seed → same sequence; different seeds differ."""
+        def _run(seed: int):
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            ref = HiRISEGeoSampler(
+                single_strip_dataset, size=self.PATCH_SIZE, units=Units.CRS
+            )
+            n = len(ref._centers)
+            sampler = HiRISEGeoSampler(
+                single_strip_dataset, size=self.PATCH_SIZE,
+                length=n * 2, replacement=True,
+                generator=gen, units=Units.CRS,
+            )
+            return [(round(x.start, 10), round(y.start, 10))
+                    for x, y, _ in sampler]
+
+        assert _run(42) == _run(42)
+        assert _run(42) != _run(99)
+
+    def test_replacement_true_can_revisit_same_center(
+            self, single_strip_dataset
+    ):
+        """With length >> n_centers and replacement=True, duplicates appear."""
+        ref = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE, units=Units.CRS
+        )
+        n = len(ref._centers)
+        gen = torch.Generator()
+        gen.manual_seed(0)
+        sampler = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE,
+            length=n * 10, replacement=True,
+            generator=gen, units=Units.CRS,
+        )
+        starts = [(round(x.start, 10), round(y.start, 10))
+                  for x, y, _ in sampler]
+        # Birthday paradox guarantees duplicates when drawing 10 * n from n centres
+        assert len(starts) > len(set(starts))
+
+    def test_replacement_false_no_warning_when_length_le_n_centers(
+            self, single_strip_dataset, caplog
+    ):
+        """No warning emitted when length <= n_centres with replacement=False."""
+        import logging
+
+        ref = HiRISEGeoSampler(
+            single_strip_dataset, size=self.PATCH_SIZE, units=Units.CRS
+        )
+        n = len(ref._centers)
+        with caplog.at_level(logging.WARNING, logger="hirise_sampler"):
+            HiRISEGeoSampler(
+                single_strip_dataset, size=self.PATCH_SIZE,
+                length=n, replacement=False, units=Units.CRS,
+            )
+        assert "capping" not in caplog.text.lower()
