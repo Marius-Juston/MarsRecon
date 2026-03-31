@@ -43,6 +43,7 @@ from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import GeoSlice, Path, Sample, download_url
 from torchgeo.samplers import Units
+from torchvision.transforms import Normalize
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -500,7 +501,9 @@ class MarsHiRISE(GeoDataset):
             download: bool = False,
             bbox: tuple[float, float, float, float] | None = None,
             checksum: bool = False,
-            reuse_cache: bool = True
+            reuse_cache: bool = True,
+            normalize: bool = False,
+            normalization_path: str | None = None
     ) -> None:
         """Initialise the dataset.
 
@@ -556,6 +559,32 @@ class MarsHiRISE(GeoDataset):
 
         self.index: gpd.GeoDataFrame | None = None
         self._raw_index: pd.DataFrame | None = None
+
+        self.normalize = normalize
+        self.normalization_path = normalization_path
+        self._normalizer = None
+
+        if self.normalize:
+            path = pathlib.Path(self.normalization_path)
+
+            if not self.normalization_path or not path.exists():
+                raise ValueError(f"normalization_path must be a valid path to dataset_stats.json when normalize=True, currently pointing to {path.absolute()}")
+
+            with open(self.normalization_path, 'r') as f:
+                stats = json.load(f)
+
+            # Map the loaded stats to the currently requested self.channels order
+            stat_channels = stats["channels"]
+            mean_dict = dict(zip(stat_channels, stats["mean"]))
+            std_dict = dict(zip(stat_channels, stats["std"]))
+
+            try:
+                mean = [mean_dict[ch] for ch in self.channels]
+                std = [std_dict[ch] for ch in self.channels]
+            except KeyError as e:
+                raise ValueError(f"Channel {e} not found in normalization stats.")
+
+            self._normalizer = Normalize(mean=mean, std=std)
 
         self._verify()
 
@@ -624,6 +653,13 @@ class MarsHiRISE(GeoDataset):
             )
 
         image = self._merge_tiles(tiles)
+
+        # Apply normalization but preserve the 0.0 nodata pixels
+        if self.normalize and self._normalizer is not None:
+            nodata_mask = image == 0.0
+            image = self._normalizer(image)
+            image[nodata_mask] = 0.0
+
         sample: Sample = {
             "image": image,
             "bounds": self._slice_to_tensor(index),
@@ -633,7 +669,9 @@ class MarsHiRISE(GeoDataset):
             sample = self.transforms(sample)
         return sample
 
-    def plot(self, sample, show_titles=True, suptitle=None) -> Figure:
+    def plot(self, sample, show_titles=True, suptitle=None, eps = 1e-8) -> Figure:
+        eps = abs(eps)
+
         image: torch.Tensor = sample["image"]
         if image.ndim == 4:
             image = image[0]
@@ -665,19 +703,24 @@ class MarsHiRISE(GeoDataset):
         if img_out.ndim == 3:
             for c in range(img_out.shape[2]):
                 band = img_out[..., c]
-                data_pixels = band[band > 1e-6]
+
+                mask = np.logical_or(band > eps, band < -eps)
+
+                data_pixels = band[mask]
                 if len(data_pixels) > 0:
                     p2, p98 = np.percentile(data_pixels, [2, 98])
                     if p98 > p2:
                         img_out[..., c] = np.clip((band - p2) / (p98 - p2), 0, 1)
-                        img_out[..., c][band == 0] = 0  # keep nodata black
+                        img_out[..., c][np.logical_not(mask)] = 0  # keep nodata black
         else:
-            data_pixels = img_out[img_out > 0]
+            mask = np.logical_or(img_out > eps, img_out < -eps)
+
+            data_pixels = img_out[mask]
             if len(data_pixels) > 0:
                 p2, p98 = np.percentile(data_pixels, [2, 98])
                 if p98 > p2:
                     img_out = np.clip((img_out - p2) / (p98 - p2), 0, 1)
-                    img_out[img_np == 0] = 0
+                    img_out[np.logical_not(mask)] = 0
 
         fig, ax = plt.subplots(figsize=(8, 8))
         ax.imshow(img_out, cmap=cmap, interpolation="nearest")
@@ -1751,11 +1794,9 @@ def setup_logging(config_path: str = CONFIG) -> None:
 def main(argv=None) -> None:  # pragma: no cover
     setup_logging()
 
-
-
     from torch.utils.data import DataLoader
 
-    from dataset.hirise_sampler import HiRISEGeoSampler
+    from hirise_sampler import HiRISEGeoSampler
     import argparse
 
     parser = argparse.ArgumentParser(description="Run a sample test on the main HiRISE dataset for validation")
@@ -1780,12 +1821,16 @@ def main(argv=None) -> None:  # pragma: no cover
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    normalization_path  = 'dataset_stats/dataset_stats.json'
+
     if args.olympus:
         dataset = MarsHiRISE(
             target="Olympus",
             channels=["NEAR-INFRARED", "RED", "BLUE-GREEN"],
             download=True,  # set False if you already have a local mirror
-            reuse_cache=True
+            reuse_cache=True,
+            normalize=True,
+            normalization_path=normalization_path
         )
     else:
         dataset = MarsHiRISE(
@@ -1793,6 +1838,8 @@ def main(argv=None) -> None:  # pragma: no cover
             channels=["NEAR-INFRARED", "RED", "BLUE-GREEN"],
             download=True,
             reuse_cache=True,
+            normalize=True,
+            normalization_path=normalization_path
         )
 
     output_path = pathlib.Path("Figures")
