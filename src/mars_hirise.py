@@ -1795,8 +1795,12 @@ def main(argv=None) -> None:  # pragma: no cover
             reuse_cache=True,
         )
 
+    output_path = pathlib.Path("Figures")
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
     fig = dataset.plot_coverage()
-    fig.savefig("coverage.png")
+    fig.savefig(output_path / "coverage.png")
 
     logger.info("saved fig")
 
@@ -1812,10 +1816,6 @@ def main(argv=None) -> None:  # pragma: no cover
                             multiprocessing_context='spawn',
                             prefetch_factor=4)
     logger.info("Number of data-loader: %d", len(dataloader))
-
-    output_path = pathlib.Path("Figures")
-
-    output_path.mkdir(parents=True, exist_ok=True)
 
     for i, sample in enumerate(dataloader):
         fig = dataset.plot(sample)

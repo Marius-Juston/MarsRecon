@@ -70,7 +70,7 @@ class HiRISEGeoSampler(GeoSampler):
             toi=None,
             units: Units = Units.CRS,
             generator: torch.Generator | None = None,
-            min_overlap: int = 0.5,
+            min_overlap: float = 0.5,
             replacement=False,
     ) -> None:
         super().__init__(dataset, roi, toi)

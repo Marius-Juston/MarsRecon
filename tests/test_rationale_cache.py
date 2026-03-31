@@ -14,10 +14,12 @@ if str(_SRC) not in sys.path:
 
 from rationale_cache import (
     DEFAULT_PROMPT_TEMPLATE,
+    _clean_text,
     build_rationale_expansion_cache,
     load_rationale_cache,
     merge_rationale_cache,
     render_expansion_prompt,
+    save_rationale_cache,
 )
 
 
@@ -168,3 +170,83 @@ def test_merge_rationale_cache_adds_expanded_text():
     assert bool(obs_a["has_rationale_expanded"])
     assert obs_b["rationale_expanded"] is None
     assert not bool(obs_b["has_rationale_expanded"])
+
+
+def test_clean_text_returns_none_for_none_input():
+    assert _clean_text(None) is None
+
+
+def test_load_rationale_cache_returns_empty_for_nonexistent_path(tmp_path):
+    result = load_rationale_cache(tmp_path / "missing.parquet")
+    assert result.empty
+
+
+def test_load_rationale_cache_reads_parquet_file(tmp_path):
+    df = pd.DataFrame([{
+        "obs_id": "OBS_A",
+        "expansion_status": "ok",
+        "rationale_expanded": "Some expanded text.",
+        "expansion_model": "test-model",
+        "expansion_timestamp": pd.Timestamp("2026-01-01", tz="UTC"),
+        "prompt_version": "v1",
+    }])
+    path = tmp_path / "cache.parquet"
+    df.to_parquet(path, index=False)
+    loaded = load_rationale_cache(path)
+    assert len(loaded) == 1
+    assert loaded.iloc[0]["obs_id"] == "OBS_A"
+
+
+def test_load_rationale_cache_fills_missing_columns(tmp_path):
+    df = pd.DataFrame([{
+        "obs_id": "OBS_B",
+        "expansion_status": "ok",
+        "expansion_timestamp": "2026-01-01T00:00:00+00:00",
+    }])
+    path = tmp_path / "partial.csv"
+    df.to_csv(path, index=False)
+    loaded = load_rationale_cache(path)
+    assert "rationale_expanded" in loaded.columns
+    assert "expansion_model" in loaded.columns
+
+
+def test_save_rationale_cache_writes_parquet(tmp_path):
+    cache = pd.DataFrame([{
+        "obs_id": "OBS_A",
+        "expansion_status": "ok",
+        "rationale_expanded": "text",
+        "expansion_model": "m",
+        "expansion_timestamp": pd.Timestamp("2026-01-01", tz="UTC"),
+        "prompt_version": "v1",
+    }])
+    out_path = tmp_path / "cache.parquet"
+    save_rationale_cache(cache, out_path)
+    assert out_path.exists()
+    loaded = pd.read_parquet(out_path)
+    assert loaded.iloc[0]["obs_id"] == "OBS_A"
+
+
+def test_save_rationale_cache_writes_csv(tmp_path):
+    """Line 98: save_rationale_cache uses CSV for non-parquet extensions."""
+    cache = pd.DataFrame([{
+        "obs_id": "OBS_A",
+        "expansion_status": "ok",
+        "rationale_expanded": "text",
+        "expansion_model": "m",
+        "expansion_timestamp": pd.Timestamp("2026-01-01", tz="UTC"),
+        "prompt_version": "v1",
+    }])
+    out_path = tmp_path / "cache.csv"
+    save_rationale_cache(cache, out_path)
+    assert out_path.exists()
+    loaded = pd.read_csv(out_path)
+    assert loaded.iloc[0]["obs_id"] == "OBS_A"
+
+
+def test_merge_rationale_cache_with_empty_cache_adds_none_columns():
+    manifest = pd.DataFrame([{"obs_id": "OBS_A", "rationale_desc": "text"}])
+    result = merge_rationale_cache(manifest, None)
+    assert "rationale_expanded" in result.columns
+    assert "has_rationale_expanded" in result.columns
+    assert result.iloc[0]["rationale_expanded"] is None
+    assert not bool(result.iloc[0]["has_rationale_expanded"])

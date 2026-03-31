@@ -98,3 +98,33 @@ def test_model_forward_returns_embeddings_and_loss():
     assert torch.isfinite(out.loss)
     assert set(out.losses) == {"image_text", "image_geo", "text_geo"}
     assert not bool((out.patch_keep_mask & ~out.patch_valid_mask).any())
+
+
+class TestValidationErrors:
+    def test_compute_patch_valid_mask_requires_3d_mask(self):
+        import pytest
+        with pytest.raises(ValueError, match="B, H, W"):
+            compute_patch_valid_mask(torch.ones(8, 8, dtype=torch.bool), patch_size=4)
+
+    def test_compute_patch_valid_mask_requires_divisible_dimensions(self):
+        import pytest
+        with pytest.raises(ValueError, match="divisible by patch_size"):
+            compute_patch_valid_mask(torch.ones(1, 9, 8, dtype=torch.bool), patch_size=4)
+
+    def test_sample_patch_keep_mask_requires_valid_mask_ratio(self):
+        import pytest
+        patch_valid = torch.ones(1, 4, dtype=torch.bool)
+        with pytest.raises(ValueError, match="0 <= mask_ratio < 1"):
+            sample_patch_keep_mask(patch_valid, mask_ratio=1.0)
+
+    def test_sample_patch_keep_mask_handles_all_invalid_patches(self):
+        patch_valid = torch.zeros(2, 4, dtype=torch.bool)
+        keep = sample_patch_keep_mask(patch_valid, mask_ratio=0.5)
+        assert keep.shape == (2, 4)
+        assert not keep.any()
+
+    def test_image_vit_tower_requires_divisible_image_size(self):
+        import pytest
+        from marsclip_model import ImageViTTower
+        with pytest.raises(ValueError, match="divisible by patch_size"):
+            ImageViTTower(image_size=15, patch_size=4)

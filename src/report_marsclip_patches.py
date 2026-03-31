@@ -58,7 +58,7 @@ def save_patch_report(
     }
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Create a Stage A1 patch summary report.")
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))
     parser.add_argument(

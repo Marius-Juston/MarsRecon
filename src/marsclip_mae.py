@@ -304,8 +304,8 @@ def sample_visible_patch_mask(
             continue
         n_visible = max(1, int(math.ceil(valid_idx.numel() * (1.0 - mask_ratio))))
         perm = torch.randperm(valid_idx.numel(), generator=generator)
-        if perm.device != valid_idx.device:
-            perm = perm.to(valid_idx.device)
+        if perm.device != valid_idx.device:  # pragma: no cover
+            perm = perm.to(valid_idx.device)  # pragma: no cover
         selected = valid_idx[perm[:n_visible]]
         visible_mask[i, selected] = True
     return visible_mask

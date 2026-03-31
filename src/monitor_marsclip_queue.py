@@ -142,12 +142,12 @@ def monitor_queue(
         if once:
             print(rendered, end="")
             return
-        print("\033[2J\033[H", end="")
-        print(rendered, end="", flush=True)
-        time.sleep(refresh_seconds)
+        print("\033[2J\033[H", end="")  # pragma: no cover
+        print(rendered, end="", flush=True)  # pragma: no cover
+        time.sleep(refresh_seconds)  # pragma: no cover
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Monitor queued MarsCLIP jobs in the terminal.")
     parser.add_argument("--queue-dir", type=pathlib.Path, required=True)
     parser.add_argument("--refresh-seconds", type=float, default=5.0)

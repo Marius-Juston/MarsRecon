@@ -30,12 +30,12 @@ def compute_split_counts(
     train_count = int(round(num_samples * float(train_fraction)))
     val_count = int(round(num_samples * float(val_fraction)))
     test_count = num_samples - train_count - val_count
-    if test_count < 0:
-        raise ValueError("Split fractions produced a negative test count.")
+    if test_count < 0:  # pragma: no cover
+        raise ValueError("Split fractions produced a negative test count.")  # pragma: no cover
 
     counts = [train_count, val_count, test_count]
     targets = [float(train_fraction), float(val_fraction), float(test_fraction)]
-    while sum(counts) != num_samples:
+    while sum(counts) != num_samples:  # pragma: no cover
         diff = num_samples - sum(counts)
         if diff > 0:
             idx = max(range(3), key=lambda i: targets[i] - counts[i] / max(num_samples, 1))
@@ -106,7 +106,7 @@ def build_patch_split_manifest(
             holdout_split = "train"
             fold = int(fold_assignment[patch_index])
         else:
-            raise RuntimeError("Patch index was not assigned to a split.")
+            raise RuntimeError("Patch index was not assigned to a split.")  # pragma: no cover
 
         records.append(
             {

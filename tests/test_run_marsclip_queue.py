@@ -6,6 +6,8 @@ import json
 import pathlib
 import sys
 
+import pytest
+
 _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -109,3 +111,77 @@ def test_run_queue_fail_fast_skips_remaining_jobs(tmp_path):
     assert status["jobs"][0]["exit_code"] == 3
     assert status["jobs"][1]["status"] == "skipped"
     assert not marker.exists()
+
+
+def test_load_queue_spec_raises_when_jobs_is_not_a_list(tmp_path):
+    spec_path = tmp_path / "queue.json"
+    spec_path.write_text(json.dumps({"jobs": "not_a_list"}))
+    with pytest.raises(ValueError, match="non-empty 'jobs' list"):
+        load_queue_spec(spec_path)
+
+
+def test_load_queue_spec_raises_when_job_missing_argv(tmp_path):
+    spec_path = tmp_path / "queue.json"
+    spec_path.write_text(json.dumps({"jobs": [{"name": "j1"}]}))
+    with pytest.raises(ValueError, match="non-empty 'argv' list"):
+        load_queue_spec(spec_path)
+
+
+def test_load_queue_spec_raises_when_argv_contains_non_strings(tmp_path):
+    spec_path = tmp_path / "queue.json"
+    spec_path.write_text(json.dumps({"jobs": [{"name": "j1", "argv": [42, "arg"]}]}))
+    with pytest.raises(ValueError, match="argv entries must all be strings"):
+        load_queue_spec(spec_path)
+
+
+def test_load_queue_spec_raises_when_job_is_not_a_dict(tmp_path):
+    """Line 29: raises when a job entry is not a JSON object."""
+    spec_path = tmp_path / "queue.json"
+    spec_path.write_text(json.dumps({"jobs": ["not_a_dict"]}))
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        load_queue_spec(spec_path)
+
+
+def test_load_queue_spec_returns_spec_for_valid_input(tmp_path):
+    """Line 35: returns the spec dict when all validation passes."""
+    spec = {"name": "valid-queue", "jobs": [{"name": "j1", "argv": ["python", "--version"]}]}
+    spec_path = tmp_path / "queue.json"
+    spec_path.write_text(json.dumps(spec))
+    loaded = load_queue_spec(spec_path)
+    assert loaded["name"] == "valid-queue"
+    assert len(loaded["jobs"]) == 1
+
+
+def test_run_queue_propagates_custom_env_vars(tmp_path):
+    """Line 123: custom env dict entries are passed to subprocess."""
+    spec = {
+        "name": "env-queue",
+        "jobs": [{
+            "name": "print_env",
+            "argv": [
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('MARSRECON_TEST_VAR', 'missing'))",
+            ],
+            "env": {"MARSRECON_TEST_VAR": "hello_env"},
+        }],
+    }
+    status = run_queue(spec, queue_dir=tmp_path / "queue", stream_child_output=False)
+    assert status["status"] == "completed"
+    first_log = pathlib.Path(status["jobs"][0]["log_path"])
+    assert "hello_env" in first_log.read_text()
+
+
+def test_run_queue_with_stream_child_output(tmp_path):
+    """Lines 134-156: stream_child_output=True path captures output line-by-line."""
+    spec = {
+        "name": "stream-queue",
+        "jobs": [{
+            "name": "job_streamed",
+            "argv": [sys.executable, "-c", "print('hello_streamed')"],
+        }],
+    }
+    status = run_queue(spec, queue_dir=tmp_path / "queue", stream_child_output=True)
+    assert status["status"] == "completed"
+    first_log = pathlib.Path(status["jobs"][0]["log_path"])
+    assert "hello_streamed" in first_log.read_text()

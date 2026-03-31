@@ -94,3 +94,9 @@ def test_collator_batches_tensors_and_tokenizes_text():
     assert batch["quality_features"].shape == (2, 7)
     assert "Expanded context:" in batch["text"][0]
     assert batch["text"][1] == "raw b"
+
+
+def test_compose_rationale_text_raises_for_unknown_mode():
+    import pytest
+    with pytest.raises(ValueError, match="Unsupported text_mode"):
+        compose_rationale_text("raw text", None, text_mode="invalid_mode")

@@ -15,6 +15,7 @@ if str(_SRC) not in sys.path:
 
 from observation_manifest import (
     _apply_bbox_filter,
+    _choose_image_path,
     _clean_text,
     _normalize_longitude,
     build_observation_manifest,
@@ -258,3 +259,16 @@ def test_real_olympus_color_manifest_counts():
     assert manifest["obs_id"].nunique() == 419
     assert manifest["image_format"].isin(["tif", "jp2"]).all()
     assert manifest["rationale_desc"].str.len().gt(0).all()
+
+
+def test_choose_image_path_returns_tif_when_prefer_cog_false_and_only_tif_available(tmp_path):
+    jp2_path = tmp_path / "obs.jp2"
+    tif_path = tmp_path / "obs.tif"
+    result = _choose_image_path(
+        jp2_path=jp2_path,
+        tif_path=tif_path,
+        has_local_jp2=False,
+        has_local_tif=True,
+        prefer_cog=False,
+    )
+    assert result == tif_path

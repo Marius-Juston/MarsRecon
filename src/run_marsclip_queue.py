@@ -207,7 +207,7 @@ def run_queue(
     return status
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Run a sequential queue of MarsCLIP jobs with status logging.")
     parser.add_argument("--spec", type=pathlib.Path, required=True, help="Path to a queue spec JSON file.")
     parser.add_argument("--queue-dir", type=pathlib.Path, required=True, help="Directory for queue logs and status.")

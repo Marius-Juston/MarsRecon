@@ -1210,7 +1210,7 @@ def run_mae_training(
     return summary
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Run a minimal Stage A MAE training loop.")
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))
     parser.add_argument(

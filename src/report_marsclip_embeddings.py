@@ -409,7 +409,7 @@ def save_embedding_report(
     return summary
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Create a Stage A embedding sanity report.")
     parser.add_argument("--checkpoint", type=pathlib.Path, required=True)
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))

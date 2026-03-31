@@ -1648,12 +1648,15 @@ class TestMain:
             "crs": "FAKE",
         }
         mock_sampler_inst = MagicMock()
+        mock_dl = MagicMock()
+        mock_dl.__len__ = lambda self: 1
+        mock_dl.__iter__ = lambda self: iter([sample])
 
         with (
             patch("mars_hirise.MarsHiRISE", return_value=mock_ds),
             patch("mars_hirise.setup_logging"),
             patch.object(hirise_sampler, "HiRISEGeoSampler", return_value=mock_sampler_inst),
-            patch.object(torch.utils.data, "DataLoader", return_value=iter([sample])),
+            patch.object(torch.utils.data, "DataLoader", return_value=mock_dl),
             patch.object(pathlib.Path, "mkdir"),
             patch("mars_hirise.plt.close"),
         ):

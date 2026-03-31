@@ -14,6 +14,8 @@ if str(_SRC) not in sys.path:
 
 from marsclip_mae import (
     MarsMaskedAutoencoder,
+    _coerce_channel_stats,
+    _gather_visible_tokens,
     build_masked_input_image,
     build_reconstruction_composite,
     collate_patch_samples_for_mae,
@@ -459,3 +461,209 @@ def test_mae_real_patch_batch_forward_backward_smoke():
 
     assert torch.isfinite(out.loss)
     assert total_grad > 0.0
+
+
+class TestValidationErrors:
+    def test_patchify_requires_4d_tensor(self):
+        with pytest.raises(ValueError, match="B, C, H, W"):
+            patchify(torch.randn(3, 8, 8), patch_size=4)
+
+    def test_patchify_requires_divisible_dimensions(self):
+        with pytest.raises(ValueError, match="divisible by patch_size"):
+            patchify(torch.randn(1, 3, 9, 8), patch_size=4)
+
+    def test_unpatchify_requires_3d_patches(self):
+        with pytest.raises(ValueError, match="B, N, D"):
+            unpatchify(torch.randn(4, 48), patch_size=4, channels=3)
+
+    def test_unpatchify_requires_matching_patch_dim(self):
+        with pytest.raises(ValueError, match="does not match channels"):
+            unpatchify(torch.randn(1, 4, 10), patch_size=4, channels=3)
+
+    def test_unpatchify_requires_square_grid_without_image_size(self):
+        with pytest.raises(ValueError, match="square grid"):
+            unpatchify(torch.randn(1, 5, 48), patch_size=4, channels=3)
+
+    def test_unpatchify_requires_divisible_image_size(self):
+        with pytest.raises(ValueError, match="divisible by patch_size"):
+            unpatchify(torch.randn(1, 4, 48), patch_size=4, channels=3, image_size=9)
+
+    def test_unpatchify_requires_matching_image_size_and_num_patches(self):
+        with pytest.raises(ValueError, match="does not match the number of patches"):
+            unpatchify(torch.randn(1, 4, 48), patch_size=4, channels=3, image_size=12)
+
+    def test_expand_patch_mask_requires_2d_mask(self):
+        with pytest.raises(ValueError, match="B, N"):
+            expand_patch_mask(torch.ones(2, 4, 4, dtype=torch.bool), patch_size=4)
+
+    def test_expand_patch_mask_requires_square_grid_without_image_size(self):
+        with pytest.raises(ValueError, match="square grid"):
+            expand_patch_mask(torch.ones(1, 5, dtype=torch.bool), patch_size=4)
+
+    def test_expand_patch_mask_requires_divisible_image_size(self):
+        with pytest.raises(ValueError, match="divisible by patch_size"):
+            expand_patch_mask(torch.ones(1, 4, dtype=torch.bool), patch_size=4, image_size=9)
+
+    def test_expand_patch_mask_requires_matching_image_size_and_patches(self):
+        with pytest.raises(ValueError, match="does not match the number of patches"):
+            expand_patch_mask(torch.ones(1, 4, dtype=torch.bool), patch_size=4, image_size=12)
+
+    def test_compute_patch_valid_fraction_requires_3d_mask(self):
+        with pytest.raises(ValueError, match="B, H, W"):
+            compute_patch_valid_fraction(torch.ones(8, 8, dtype=torch.bool), patch_size=4)
+
+    def test_compute_patch_valid_fraction_requires_divisible_dimensions(self):
+        with pytest.raises(ValueError, match="divisible by patch_size"):
+            compute_patch_valid_fraction(torch.ones(1, 9, 8, dtype=torch.bool), patch_size=4)
+
+    def test_compute_valid_patch_mask_requires_valid_fraction_range(self):
+        with pytest.raises(ValueError, match="0 <= value <= 1"):
+            compute_valid_patch_mask(torch.ones(1, 8, 8, dtype=torch.bool), patch_size=4, min_valid_fraction=-0.1)
+
+    def test_extract_scale_values_requires_2d_tensor(self):
+        with pytest.raises(ValueError, match="B, F"):
+            extract_scale_values(torch.randn(2, 4, 4))
+
+    def test_extract_scale_values_requires_at_least_one_column(self):
+        with pytest.raises(ValueError, match="at least one column"):
+            extract_scale_values(torch.randn(2, 0))
+
+    def test_coerce_channel_stats_raises_on_wrong_count(self):
+        with pytest.raises(ValueError, match="Expected 3 channel stats"):
+            _coerce_channel_stats([1.0, 2.0], channels=3, default=0.0)
+
+    def test_normalize_valid_image_requires_4d_image(self):
+        with pytest.raises(ValueError, match="B, C, H, W"):
+            normalize_valid_image(
+                torch.randn(3, 8, 8),
+                torch.ones(1, 8, 8, dtype=torch.bool),
+                channel_mean=[0.0, 0.0, 0.0],
+                channel_std=[1.0, 1.0, 1.0],
+            )
+
+    def test_normalize_valid_image_requires_3d_mask(self):
+        with pytest.raises(ValueError, match="B, H, W"):
+            normalize_valid_image(
+                torch.randn(1, 3, 8, 8),
+                torch.ones(8, 8, dtype=torch.bool),
+                channel_mean=[0.0, 0.0, 0.0],
+                channel_std=[1.0, 1.0, 1.0],
+            )
+
+    def test_normalize_valid_image_requires_matching_batch_and_spatial(self):
+        with pytest.raises(ValueError, match="batch/spatial dimensions"):
+            normalize_valid_image(
+                torch.randn(2, 3, 8, 8),
+                torch.ones(1, 8, 8, dtype=torch.bool),
+                channel_mean=[0.0, 0.0, 0.0],
+                channel_std=[1.0, 1.0, 1.0],
+            )
+
+    def test_denormalize_patch_tokens_requires_3d_patches(self):
+        with pytest.raises(ValueError, match="B, N, D"):
+            denormalize_patch_tokens(
+                torch.randn(4, 48),
+                patch_size=4,
+                channels=3,
+                channel_mean=[0.0, 0.0, 0.0],
+                channel_std=[1.0, 1.0, 1.0],
+            )
+
+    def test_collate_patch_samples_raises_on_empty_list(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            collate_patch_samples_for_mae([])
+
+    def test_build_masked_input_image_requires_4d_image(self):
+        patch_mask = torch.ones(1, 4, dtype=torch.bool)
+        with pytest.raises(ValueError, match="B, C, H, W"):
+            build_masked_input_image(torch.randn(3, 8, 8), patch_mask, patch_mask, patch_size=4)
+
+    def test_build_masked_input_image_requires_matching_mask_shapes(self):
+        image = torch.randn(1, 3, 8, 8)
+        with pytest.raises(ValueError, match="matching shape"):
+            build_masked_input_image(
+                image,
+                torch.ones(1, 4, dtype=torch.bool),
+                torch.ones(1, 5, dtype=torch.bool),
+                patch_size=4,
+            )
+
+    def test_build_reconstruction_composite_requires_4d_image(self):
+        patches = torch.randn(1, 4, 48)
+        patch_mask = torch.ones(1, 4, dtype=torch.bool)
+        with pytest.raises(ValueError, match="B, C, H, W"):
+            build_reconstruction_composite(torch.randn(3, 8, 8), patches, patch_mask, patch_mask, patch_size=4)
+
+    def test_sample_visible_patch_mask_requires_valid_mask_ratio(self):
+        with pytest.raises(ValueError, match="0 <= value < 1"):
+            sample_visible_patch_mask(torch.ones(1, 4, dtype=torch.bool), mask_ratio=-0.1)
+
+    def test_sample_visible_patch_mask_handles_all_invalid_patches(self):
+        valid_mask = torch.zeros(2, 4, dtype=torch.bool)
+        result = sample_visible_patch_mask(valid_mask, mask_ratio=0.75)
+        assert result.shape == (2, 4)
+        assert not result.any()
+
+    def test_gather_visible_tokens_handles_all_invisible(self):
+        tokens = torch.randn(2, 4, 32)
+        visible_mask = torch.zeros(2, 4, dtype=torch.bool)
+        packed, padding_mask, visible_indices = _gather_visible_tokens(tokens, visible_mask)
+        assert packed.shape[1] == 1
+        assert padding_mask.all()
+        assert all(idx.numel() == 0 for idx in visible_indices)
+
+    def test_mae_init_requires_divisible_image_size(self):
+        with pytest.raises(ValueError, match="divisible by patch_size"):
+            MarsMaskedAutoencoder(image_size=225, patch_size=16)
+
+    def test_mae_init_requires_valid_min_valid_fraction(self):
+        with pytest.raises(ValueError, match="0 <= value <= 1"):
+            MarsMaskedAutoencoder(image_size=16, patch_size=4, min_valid_fraction=2.0)
+
+    def test_mae_forward_patch_batch_extracts_scale_values_when_missing(self):
+        model = MarsMaskedAutoencoder(
+            image_size=8, patch_size=4, encoder_dim=16, encoder_depth=1,
+            encoder_heads=2, decoder_dim=8, decoder_depth=1, decoder_heads=2,
+        )
+        batch = {
+            "image": torch.rand(1, 3, 8, 8),
+            "valid_mask": torch.ones(1, 8, 8, dtype=torch.bool),
+            "scale_features": torch.rand(1, 4),
+        }
+        out = model.forward_patch_batch(batch, mask_ratio=0.5)
+        assert torch.isfinite(out.loss)
+
+    def test_mae_forward_requires_4d_image(self):
+        model = MarsMaskedAutoencoder(
+            image_size=8, patch_size=4, encoder_dim=16, encoder_depth=1,
+            encoder_heads=2, decoder_dim=8, decoder_depth=1, decoder_heads=2,
+        )
+        with pytest.raises(ValueError, match="B, C, H, W"):
+            model.forward(torch.randn(3, 8, 8), torch.ones(1, 8, 8, dtype=torch.bool), torch.ones(1))
+
+    def test_mae_forward_requires_3d_valid_mask(self):
+        model = MarsMaskedAutoencoder(
+            image_size=8, patch_size=4, encoder_dim=16, encoder_depth=1,
+            encoder_heads=2, decoder_dim=8, decoder_depth=1, decoder_heads=2,
+        )
+        with pytest.raises(ValueError, match="B, H, W"):
+            model.forward(torch.randn(1, 3, 8, 8), torch.ones(8, 8, dtype=torch.bool), torch.ones(1))
+
+    def test_mae_forward_requires_matching_image_size(self):
+        model = MarsMaskedAutoencoder(
+            image_size=8, patch_size=4, encoder_dim=16, encoder_depth=1,
+            encoder_heads=2, decoder_dim=8, decoder_depth=1, decoder_heads=2,
+        )
+        with pytest.raises(ValueError, match="does not match model image_size"):
+            model.forward(torch.randn(1, 3, 16, 16), torch.ones(1, 16, 16, dtype=torch.bool), torch.ones(1))
+
+    def test_mae_forward_all_invalid_patches_continue_path(self):
+        model = MarsMaskedAutoencoder(
+            image_size=8, patch_size=4, encoder_dim=16, encoder_depth=1,
+            encoder_heads=2, decoder_dim=8, decoder_depth=1, decoder_heads=2,
+        )
+        image = torch.rand(2, 3, 8, 8)
+        valid_mask = torch.zeros(2, 8, 8, dtype=torch.bool)
+        scale_values = torch.ones(2)
+        out = model.forward(image, valid_mask, scale_values, mask_ratio=0.75)
+        assert out.loss.item() == pytest.approx(0.0)

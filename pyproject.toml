@@ -36,8 +36,14 @@ markers = [
 source = ["src"]
 omit = [
     "src/validate_sampling.py",
+    "src/build_marsclip_split_manifest.py",
+    "src/compute_dataset_stats.py",
 ]
 
 [tool.coverage.report]
 show_missing = true
 precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]

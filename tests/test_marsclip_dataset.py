@@ -25,6 +25,7 @@ from marsclip_dataset import (
     _build_geo_features,
     _build_scale_features,
     _build_viewing_features,
+    _load_color_thumbnail,
 )
 
 _MARS_RCRS = rasterio.crs.CRS.from_proj4("+proj=longlat +a=3396190 +b=3376200 +no_defs")
@@ -254,3 +255,42 @@ def test_real_dataset_returns_observation_sample():
     assert sample["valid_mask"].shape == (64, 64)
     assert sample["rationale_raw"]
     assert sample["metadata"]["overall_valid_fraction"] > 0.0
+
+
+def test_load_color_thumbnail_raises_for_nonexistent_path(tmp_path):
+    missing = tmp_path / "missing.tif"
+    with pytest.raises(FileNotFoundError, match="Image not found"):
+        _load_color_thumbnail(missing, image_size=4)
+
+
+def test_dataset_raises_when_both_manifest_and_root_are_none():
+    with pytest.raises(ValueError, match="Either manifest or root must be provided"):
+        MarsCLIPDataset(manifest=None, root=None)
+
+
+def test_dataset_raises_when_manifest_empty_after_filtering():
+    manifest = _manifest_row(None)
+    manifest["has_local_image"] = False
+    with pytest.raises(ValueError, match="Manifest is empty after filtering"):
+        MarsCLIPDataset(manifest=manifest, require_local_image=True)
+
+
+def test_dataset_applies_transforms_to_sample(tmp_path):
+    path = tmp_path / "images" / "OBS_A_COLOR.tif"
+    data = np.ones((3, 4, 4), dtype=np.uint16) * 500
+    _write_tiff(path, data)
+    _write_lbl(path.with_suffix(".LBL"))
+
+    transformed_keys = []
+
+    def _add_key(sample):
+        sample["extra_key"] = "added"
+        transformed_keys.append(True)
+        return sample
+
+    ds = MarsCLIPDataset(manifest=_manifest_row(path), image_size=4, transforms=_add_key)
+    sample = ds[0]
+
+    assert "extra_key" in sample
+    assert sample["extra_key"] == "added"
+    assert len(transformed_keys) == 1

@@ -107,7 +107,7 @@ def save_sample_preview(
     return out
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Preview MarsCLIP observation samples.")
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("marsclip_preview.png"))
