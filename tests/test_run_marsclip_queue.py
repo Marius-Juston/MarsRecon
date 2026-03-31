@@ -12,7 +12,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from run_marsclip_queue import initialize_queue_status, load_queue_spec, run_queue
+from clip.run_marsclip_queue import initialize_queue_status, load_queue_spec, run_queue
 
 
 def test_load_queue_spec_requires_jobs(tmp_path):

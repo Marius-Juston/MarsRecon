@@ -35,7 +35,7 @@ import matplotlib
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
-from mars_hirise import (
+from dataset.mars_hirise import (
     MarsHiRISE,
     _ProductMeta,
     _corners_to_polygon,
@@ -321,7 +321,7 @@ class TestReadJp2Bounds:
 
     def test_out_of_range_bounds_returns_none(self, mock_dataset, tmp_path):
         """transform_bounds returning invalid geographic range → None."""
-        with patch("mars_hirise.transform_bounds", return_value=(400.0, 200.0, 500.0, 300.0)):
+        with patch("dataset.mars_hirise.transform_bounds", return_value=(400.0, 200.0, 500.0, 300.0)):
             # Create a dummy file that rasterio can open
             p = tmp_path / "dummy.tif"
             transform = rasterio.transform.from_bounds(-131, 18, -130, 19, 4, 4)
@@ -396,7 +396,7 @@ class TestExtractDataFootprint:
         mock_mp_instance = MagicMock()
         mock_mp_instance.convex_hull = empty_geom
 
-        with patch("mars_hirise.MultiPoint", return_value=mock_mp_instance):
+        with patch("dataset.mars_hirise.MultiPoint", return_value=mock_mp_instance):
             result = mock_dataset._extract_data_footprint(mars_geotiff)
         assert result is None
 
@@ -424,7 +424,7 @@ class TestLoadFromJp2:
     def test_antimeridian_file_skips_early_exit(self, mock_dataset, mars_geotiff):
         """When fl > fr (antimeridian wrap), early-exit check is skipped."""
         # transform_bounds returns values whose normalised result gives fl=175 > fr=-175
-        with patch("mars_hirise.transform_bounds", return_value=(175.0, 18.0, 185.0, 19.0)):
+        with patch("dataset.mars_hirise.transform_bounds", return_value=(175.0, 18.0, 185.0, 19.0)):
             result = mock_dataset._load_from_jp2(
                 mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
             )
@@ -434,7 +434,7 @@ class TestLoadFromJp2:
     def test_non_overlapping_file_early_exit(self, mock_dataset, mars_geotiff):
         """File bounds completely outside query → early exit, returns {}."""
         # File bounds at (0,0,10,10) normalised to (-180,-170) ← well left of x=-131
-        with patch("mars_hirise.transform_bounds", return_value=(0.0, 0.0, 10.0, 10.0)):
+        with patch("dataset.mars_hirise.transform_bounds", return_value=(0.0, 0.0, 10.0, 10.0)):
             result = mock_dataset._load_from_jp2(
                 mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
             )
@@ -442,7 +442,7 @@ class TestLoadFromJp2:
 
     def test_reproject_exception_skips_band(self, mock_dataset, mars_geotiff):
         """If reproject() raises, the band is skipped and result is {}."""
-        with patch("mars_hirise.reproject", side_effect=RuntimeError("boom")):
+        with patch("dataset.mars_hirise.reproject", side_effect=RuntimeError("boom")):
             result = mock_dataset._load_from_jp2(
                 mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
             )
@@ -490,7 +490,7 @@ class TestLoadTile:
         """COLOR unavailable, NIR/BG channels lost → warning logged."""
         mock_dataset.channels = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
         nonexistent_color = tmp_path / "nocolor.tif"  # doesn't exist
-        with caplog.at_level(logging.WARNING, logger="mars_hirise"):
+        with caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"):
             result = mock_dataset._load_tile(nonexistent_color, mars_geotiff, _X, _Y)
         assert "cannot provide channels" in caplog.text.lower() or "lost" in caplog.text.lower() or result is not None
 
@@ -517,7 +517,7 @@ class TestLoadTile:
     ):
         """NIR requested, color missing, RED also missing → None with warning."""
         mock_dataset.channels = ["NEAR-INFRARED"]
-        with caplog.at_level(logging.WARNING, logger="mars_hirise"):
+        with caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"):
             result = mock_dataset._load_tile(
                 tmp_path / "no_color.tif",
                 tmp_path / "no_red.tif",
@@ -800,7 +800,7 @@ class TestMergeTilesWarning:
         """_merge_tiles with different channel counts emits a WARNING."""
         t3 = torch.ones(3, 8, 8)
         t1 = torch.ones(1, 8, 8) * 0.5
-        with caplog.at_level(logging.WARNING, logger="mars_hirise"):
+        with caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"):
             result = MarsHiRISE._merge_tiles([t3, t1])
         assert "channel count mismatch" in caplog.text.lower()
         assert result.shape[0] == 3
@@ -843,8 +843,8 @@ class TestLoadIndex:
         mock_dataset.target = "XYZZY_NOT_FOUND"
         mock_pdr = _make_pdr_mock(self._base_df())
         with (
-            patch("mars_hirise.pdr.read", return_value=mock_pdr),
-            caplog.at_level(logging.WARNING, logger="mars_hirise"),
+            patch("dataset.mars_hirise.pdr.read", return_value=mock_pdr),
+            caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"),
         ):
             mock_dataset._load_index()
         assert "matched no rows" in caplog.text
@@ -856,8 +856,8 @@ class TestLoadIndex:
         mock_dataset.target = "PSP"  # matches PRODUCT_ID
         mock_pdr = _make_pdr_mock(self._base_df())
         with (
-            patch("mars_hirise.pdr.read", return_value=mock_pdr),
-            caplog.at_level(logging.INFO, logger="mars_hirise"),
+            patch("dataset.mars_hirise.pdr.read", return_value=mock_pdr),
+            caplog.at_level(logging.INFO, logger="dataset.mars_hirise"),
         ):
             mock_dataset._load_index()
         assert "After text filter" in caplog.text
@@ -869,8 +869,8 @@ class TestLoadIndex:
         mock_dataset.bbox = (-132.0, 17.0, -129.0, 20.0)
         mock_pdr = _make_pdr_mock(self._base_df())
         with (
-            patch("mars_hirise.pdr.read", return_value=mock_pdr),
-            caplog.at_level(logging.INFO, logger="mars_hirise"),
+            patch("dataset.mars_hirise.pdr.read", return_value=mock_pdr),
+            caplog.at_level(logging.INFO, logger="dataset.mars_hirise"),
         ):
             mock_dataset._load_index()
         assert "After bbox filter" in caplog.text
@@ -910,7 +910,7 @@ class TestBuildSpatialIndex:
     ):
         """Observation straddling antimeridian is skipped with a warning."""
         mock_dataset._raw_index = _make_raw_index_two_obs()
-        with caplog.at_level(logging.WARNING, logger="mars_hirise"):
+        with caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"):
             mock_dataset._build_spatial_index(force_rebuild=True)
         assert "antimeridian" in caplog.text.lower()
         # Only the second (normal) observation should be in the index
@@ -936,7 +936,7 @@ class TestBuildSpatialIndex:
         mock_dataset.index = None
         mock_dataset.reuse_cache = True
         # Use standard _raw_index (1 normal obs) so rebuild succeeds
-        with caplog.at_level(logging.INFO, logger="mars_hirise"):
+        with caplog.at_level(logging.INFO, logger="dataset.mars_hirise"):
             mock_dataset._build_spatial_index(force_rebuild=False)
 
         assert "Legacy bbox cache detected" in caplog.text
@@ -1027,7 +1027,7 @@ class TestVerifyJp2Warnings:
         with (
             patch.object(ds, "_load_index"),
             patch.object(ds, "_build_spatial_index"),
-            caplog.at_level(logging.WARNING, logger="mars_hirise"),
+            caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"),
         ):
             ds._verify()
         assert "No JP2 files found" in caplog.text
@@ -1038,7 +1038,7 @@ class TestVerifyJp2Warnings:
             patch.object(ds, "_load_index"),
             patch.object(ds, "_build_spatial_index"),
             patch.object(ds, "_download_images", return_value=False),
-            caplog.at_level(logging.WARNING, logger="mars_hirise"),
+            caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"),
         ):
             ds._verify()
         assert "Download completed but no JP2 files" in caplog.text
@@ -1285,7 +1285,7 @@ class TestVerifyNewPaths:
 class TestDownloadIndex:
     def test_download_index_calls_download_url_twice(self, mock_dataset):
         """_download_index fetches .LBL and .TAB (lines 766-769)."""
-        with patch("mars_hirise.download_url") as mock_du:
+        with patch("dataset.mars_hirise.download_url") as mock_du:
             mock_dataset._download_index()
         assert mock_du.call_count == 2
 
@@ -1361,7 +1361,7 @@ class TestExtractDataFootprintInvalidPolygon:
         bowtie = RealPolygon([(0, 0), (0, 1), (1, 0), (1, 1)])
         assert not bowtie.is_valid
 
-        with patch("mars_hirise.Polygon", return_value=bowtie):
+        with patch("dataset.mars_hirise.Polygon", return_value=bowtie):
             # No exception should be raised; result may be None or Polygon
             result = mock_dataset._extract_data_footprint(mars_geotiff)
         # The branch was exercised; the return value depends on buffer(0) outcome
@@ -1450,7 +1450,7 @@ class TestBuildSpatialIndexWithFiles:
     def test_case_a_hull_from_dense_file(self, dataset_with_dense_file, caplog):
         """Dense file → hull extracted → Case A geometry set (lines 1027-1028, 1054-1059,
         1077, 1092-1097)."""
-        with caplog.at_level(logging.INFO, logger="mars_hirise"):
+        with caplog.at_level(logging.INFO, logger="dataset.mars_hirise"):
             dataset_with_dense_file._build_spatial_index(force_rebuild=True)
         assert len(dataset_with_dense_file.index) == 1
         assert "footprint extraction" in caplog.text
@@ -1470,7 +1470,7 @@ class TestBuildSpatialIndexWithFiles:
         # Bowtie coords: (0,0)→(1,1)→(0,1)→(1,0) — self-intersecting, is_valid=False
         bowtie_coords = [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)]
         # Patch the module-level _extract_footprint to return the bowtie hull
-        with patch("mars_hirise._extract_footprint", return_value=(bowtie_coords, (-131.0, 18.0, -130.0, 19.0))):
+        with patch("dataset.mars_hirise._extract_footprint", return_value=(bowtie_coords, (-131.0, 18.0, -130.0, 19.0))):
             dataset_with_dense_file._build_spatial_index(force_rebuild=True)
 
         assert len(dataset_with_dense_file.index) == 1
@@ -1540,8 +1540,8 @@ class TestDownloadImages:
 
         with (
             patch.object(mock_dataset, "_build_download_tasks", return_value=tasks),
-            patch("mars_hirise.multiprocessing.Manager", return_value=mock_manager),
-            patch("mars_hirise.ProcessPoolExecutor", return_value=mock_pool),
+            patch("dataset.mars_hirise.multiprocessing.Manager", return_value=mock_manager),
+            patch("dataset.mars_hirise.ProcessPoolExecutor", return_value=mock_pool),
         ):
             result = mock_dataset._download_images()
 
@@ -1568,9 +1568,9 @@ class TestDownloadImages:
 
         with (
             patch.object(mock_dataset, "_build_download_tasks", return_value=tasks),
-            patch("mars_hirise.multiprocessing.Manager", return_value=mock_manager),
-            patch("mars_hirise.ProcessPoolExecutor", return_value=mock_pool),
-            caplog.at_level(logging.WARNING, logger="mars_hirise"),
+            patch("dataset.mars_hirise.multiprocessing.Manager", return_value=mock_manager),
+            patch("dataset.mars_hirise.ProcessPoolExecutor", return_value=mock_pool),
+            caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"),
         ):
             result = mock_dataset._download_images()
 
@@ -1586,7 +1586,7 @@ class TestDownloadImages:
 class TestLoadTileFilterNamesFallback:
     def test_no_lbl_uses_default_color_band_map(self, mock_dataset, tmp_path):
         """filter_names=[] on meta → _COLOR_BAND.copy() fallback (line 1318)."""
-        from mars_hirise import _ProductMeta
+        from dataset.mars_hirise import _ProductMeta
 
         color_path = tmp_path / "test_COLOR.tif"
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
@@ -1600,7 +1600,7 @@ class TestLoadTileFilterNamesFallback:
         # Force filter_names=[] so len(filter_names) != bands → else branch at line 1318
         sparse_meta = _ProductMeta()
         sparse_meta.filter_names = []
-        with patch("mars_hirise._ProductMeta.from_lbl", return_value=sparse_meta):
+        with patch("dataset.mars_hirise._ProductMeta.from_lbl", return_value=sparse_meta):
             result = mock_dataset._load_tile(color_path, None, _X, _Y)
         assert result is not None
 
@@ -1616,7 +1616,7 @@ class TestLoadFromJp2BoundsException:
             self, mock_dataset, mars_geotiff
     ):
         """transform_bounds raises in inner try → pass → reproject still runs (1418-1419)."""
-        with patch("mars_hirise.transform_bounds", side_effect=RuntimeError("bad crs")):
+        with patch("dataset.mars_hirise.transform_bounds", side_effect=RuntimeError("bad crs")):
             result = mock_dataset._load_from_jp2(
                 mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
             )
@@ -1633,9 +1633,9 @@ class TestLoadFromJp2BoundsException:
 class TestMain:
     def test_main_runs_without_error_with_all_mocked(self):
         """main() exercises lines 1747-1794 with all I/O mocked."""
-        import hirise_sampler
+        from dataset import hirise_sampler
         import torch.utils.data
-        from mars_hirise import main
+        from dataset.mars_hirise import main
 
         mock_ds = MagicMock()
         mock_fig = MagicMock()
@@ -1653,12 +1653,12 @@ class TestMain:
         mock_dl.__iter__ = lambda self: iter([sample])
 
         with (
-            patch("mars_hirise.MarsHiRISE", return_value=mock_ds),
-            patch("mars_hirise.setup_logging"),
+            patch("dataset.mars_hirise.MarsHiRISE", return_value=mock_ds),
+            patch("dataset.mars_hirise.setup_logging"),
             patch.object(hirise_sampler, "HiRISEGeoSampler", return_value=mock_sampler_inst),
             patch.object(torch.utils.data, "DataLoader", return_value=mock_dl),
             patch.object(pathlib.Path, "mkdir"),
-            patch("mars_hirise.plt.close"),
+            patch("dataset.mars_hirise.plt.close"),
         ):
             main([])
 

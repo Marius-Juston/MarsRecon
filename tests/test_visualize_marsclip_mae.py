@@ -11,8 +11,8 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_mae import MarsMAEOutput
-from visualize_marsclip_mae import save_mae_reconstruction_preview
+from clip.marsclip_mae import MarsMAEOutput
+from clip.visualize_marsclip_mae import save_mae_reconstruction_preview
 
 
 def test_save_mae_reconstruction_preview_writes_png(tmp_path):

@@ -19,7 +19,7 @@ import torch
 mpl.use("Agg")
 from matplotlib import pyplot as plt
 
-from marsclip_mae import (
+from clip.marsclip_mae import (
     MarsMAEOutput,
     MarsMaskedAutoencoder,
     build_masked_input_image,
@@ -27,8 +27,8 @@ from marsclip_mae import (
     collate_patch_samples_for_mae,
     expand_patch_mask,
 )
-from marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
-from visualize_marsclip import _to_display_rgb
+from clip.marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
+from clip.visualize_marsclip import _to_display_rgb
 
 
 def _build_patch_state_overlay(

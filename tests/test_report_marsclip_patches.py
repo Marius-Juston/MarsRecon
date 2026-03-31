@@ -12,8 +12,8 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
-from report_marsclip_patches import save_patch_report
+from clip.marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
+from clip.report_marsclip_patches import save_patch_report
 
 
 class _FakeGeoDataset:

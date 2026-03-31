@@ -708,8 +708,8 @@ def main() -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
 
     # Late imports so sys.path is set
-    from mars_hirise import MarsHiRISE  # noqa: E402
-    from hirise_sampler import HiRISEGeoSampler  # noqa: E402
+    from dataset.mars_hirise import MarsHiRISE  # noqa: E402
+    from dataset.hirise_sampler import HiRISEGeoSampler  # noqa: E402
     from torchgeo.samplers import Units  # noqa: E402
 
     out_dir = Path(args.out)

@@ -21,15 +21,15 @@ import torch
 mpl.use("Agg")
 from matplotlib import pyplot as plt
 
-from marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
-from train_marsclip_mae import (
+from clip.marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
+from clip.train_marsclip_mae import (
     MAE_MODEL_CONFIG_DEFAULTS,
     build_mae_dataloader,
     build_mae_model_from_config,
     load_mae_checkpoint,
     resolve_map_location,
 )
-from visualize_marsclip import _to_display_rgb
+from clip.visualize_marsclip import _to_display_rgb
 
 
 def _resolve_device(device: str | torch.device | None, model: torch.nn.Module) -> torch.device:

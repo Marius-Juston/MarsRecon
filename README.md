@@ -11,7 +11,7 @@ HiRISE (High Resolution Imaging Science Experiment) aboard the Mars Reconnaissan
 - Strip-aware sampling — `HiRISEGeoSampler` pre-grids valid patch centres within actual HiRISE strip polygons, avoiding 60–90% of empty-pixel patches that result from bounding-box sampling.
 - Automatic radiometric calibration — `I/F = DN × SCALING_FACTOR + OFFSET`, clipped to `[0, 1]`, using per-product `.LBL` files.
 - Spatial index with polygon footprints — convex hull of non-zero pixels intersected with each JP2's reprojected bounds for accurate footprints.
-- COG-ready — `src/preprocessing.py` converts JP2 files to Cloud Optimised GeoTIFF for 10–100× faster random-access reads.
+- COG-ready — `src/dataset/preprocessing.py` converts JP2 files to Cloud Optimised GeoTIFF for 10–100× faster random-access reads.
 - Geographic train/test split — longitude- or latitude-blocked splits prevent spatial leakage.
 
 ## Requirements
@@ -47,8 +47,8 @@ Pass `download=True` on first use to auto-download files. Mirrors via `rsync` or
 
 ```python
 from torch.utils.data import DataLoader
-from mars_hirise import MarsHiRISE
-from hirise_sampler import HiRISEGeoSampler
+from dataset.mars_hirise import MarsHiRISE
+from dataset.hirise_sampler import HiRISEGeoSampler
 from torchgeo.samplers import Units
 
 # Olympus Mons region, all three colour channels
@@ -64,7 +64,7 @@ sampler = HiRISEGeoSampler(dataset, size=0.005, length=200, units=Units.CRS)
 loader = DataLoader(dataset, sampler=sampler)
 
 for sample in loader:
-    image = sample["image"]   # (C, H, W) float32 in [0, 1]
+    image = sample["image"]  # (C, H, W) float32 in [0, 1]
     print(image.shape)
     break
 ```
@@ -83,7 +83,7 @@ When `_COLOR.JP2` is absent for an observation, available channels fall back to 
 
 ## Sampler
 
-`HiRISEGeoSampler` in `src/hirise_sampler.py` replaces TorchGeo's `RandomGeoSampler` for HiRISE data:
+`HiRISEGeoSampler` in `src/dataset/hirise_sampler.py` replaces TorchGeo's `RandomGeoSampler` for HiRISE data:
 
 ```python
 sampler = HiRISEGeoSampler(
@@ -111,20 +111,20 @@ The dataset transparently prefers `.tif` COG sidecars when they exist alongside 
 
 ```bash
 # Generate coverage map + sample patches (saves to Figures/)
-uv run python src/mars_hirise.py
+uv run python src/dataset/mars_hirise.py
 ```
 
 ## Tests
 
 ```bash
 # Unit tests (no HiRISE data required)
-uv run pytest tests/ -m "not integration" -v
+uv run pytest tests/ -m "not integration" -v -n auto
 
 # With coverage
-uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing
+uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing -n auto
 
 # Integration tests (require real data at /scratch/mars_hirise)
-uv run pytest tests/ -m integration -v
+uv run pytest tests/ -m integration -v -n auto
 ```
 
 ### Coverage
@@ -142,7 +142,7 @@ All three library modules are at **100% line coverage** across 274 unit tests:
 | Test file                  | Tests | What it covers                                                                                  |
 |----------------------------|-------|-------------------------------------------------------------------------------------------------|
 | `test_mars_hirise_unit.py` | 100   | `MarsHiRISE` — dataset init, spatial index, tile loading, plotting, download pipeline, `main()` |
-| `test_preprocessing.py`    | 73    | All of `src/preprocessing.py` — JP2→COG conversion, geographic split, CLI                       |
+| `test_preprocessing.py`    | 73    | All of `src/dataset/preprocessing.py` — JP2→COG conversion, geographic split, CLI                       |
 | `test_download.py`         | 22    | Async download helpers, retry logic, disk-space guard, stop-event handling                      |
 | `test_sampler.py`          | 23    | `HiRISEGeoSampler` grid pre-computation, stride, pixel units, reproducibility                   |
 | `test_coordinates.py`      | 16    | Longitude normalisation and CRS helpers                                                         |

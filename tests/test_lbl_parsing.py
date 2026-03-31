@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 # src/ is on sys.path via conftest.py
-from mars_hirise import _ProductMeta
+from dataset.mars_hirise import _ProductMeta
 
 # ---------------------------------------------------------------------------
 # Default constants (replicate the values from temp.py for comparison)

@@ -6,13 +6,12 @@ import pathlib
 import sys
 
 import pandas as pd
-import pytest
 
 _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from rationale_cache import (
+from clip.rationale_cache import (
     DEFAULT_PROMPT_TEMPLATE,
     _clean_text,
     build_rationale_expansion_cache,

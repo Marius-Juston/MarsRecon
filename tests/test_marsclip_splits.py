@@ -13,7 +13,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_splits import (
+from clip.marsclip_splits import (
     build_patch_split_manifest,
     build_dataset_subsets,
     compute_split_counts,
@@ -124,7 +124,7 @@ def test_resolve_manifest_indices_raises_when_manifest_is_misaligned():
 
 # --- Additional tests for uncovered validation paths ---
 
-from marsclip_splits import save_split_summary, select_patch_ids_for_role
+from clip.marsclip_splits import save_split_summary, select_patch_ids_for_role
 
 
 class TestComputeSplitCountsValidation:

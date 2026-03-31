@@ -1755,7 +1755,7 @@ def main(argv=None) -> None:  # pragma: no cover
 
     from torch.utils.data import DataLoader
 
-    from hirise_sampler import HiRISEGeoSampler
+    from dataset.hirise_sampler import HiRISEGeoSampler
     import argparse
 
     parser = argparse.ArgumentParser(description="Run a sample test on the main HiRISE dataset for validation")

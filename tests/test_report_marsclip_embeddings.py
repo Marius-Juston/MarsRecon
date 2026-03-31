@@ -5,7 +5,6 @@ from __future__ import annotations
 import pathlib
 import sys
 
-import pytest
 import torch
 from torch.optim import AdamW
 
@@ -13,8 +12,8 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_mae import MarsMaskedAutoencoder
-from report_marsclip_embeddings import (
+from clip.marsclip_mae import MarsMaskedAutoencoder
+from clip.report_marsclip_embeddings import (
     _resolve_device,
     collect_mae_embeddings,
     compute_topk_neighbors,
@@ -22,7 +21,7 @@ from report_marsclip_embeddings import (
     project_embeddings_pca,
     save_embedding_report,
 )
-from train_marsclip_mae import save_mae_checkpoint
+from clip.train_marsclip_mae import save_mae_checkpoint
 
 
 def _make_samples(num_samples: int = 4, image_size: int = 8) -> list[dict[str, object]]:

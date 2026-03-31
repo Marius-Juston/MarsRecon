@@ -14,16 +14,16 @@ from shapely.geometry import box as shapely_box
 from torch.utils.data import Dataset
 from torchgeo.samplers import Units
 
-from hirise_sampler import HiRISEGeoSampler, _to_tuple
-from mars_hirise import ALL_CHANNELS, MarsHiRISE
-from marsclip_dataset import (
+from dataset.hirise_sampler import HiRISEGeoSampler, _to_tuple
+from dataset.mars_hirise import ALL_CHANNELS, MarsHiRISE
+from clip.marsclip_dataset import (
     GEO_FEATURE_NAMES,
     VIEWING_FEATURE_NAMES,
     _build_geo_features,
     _build_viewing_features,
 )
-from observation_manifest import _clean_text, _normalize_longitude
-from rationale_cache import merge_rationale_cache
+from clip.observation_manifest import _clean_text, _normalize_longitude
+from clip.rationale_cache import merge_rationale_cache
 
 PATCH_SCALE_FEATURE_NAMES: tuple[str, ...] = (
     "map_scale",

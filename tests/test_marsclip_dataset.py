@@ -17,7 +17,7 @@ if str(_SRC) not in sys.path:
 
 import torch
 
-from marsclip_dataset import (
+from clip.marsclip_dataset import (
     GEO_FEATURE_NAMES,
     SCALE_FEATURE_NAMES,
     VIEWING_FEATURE_NAMES,
@@ -200,7 +200,7 @@ def test_dataset_raises_when_image_missing():
 
 def test_dataset_can_build_manifest_from_root(tmp_path):
     manifest = _manifest_row(tmp_path / "images" / "OBS_A_COLOR.tif")
-    with patch("marsclip_dataset.build_observation_manifest", return_value=manifest) as mock_build:
+    with patch("clip.marsclip_dataset.build_observation_manifest", return_value=manifest) as mock_build:
         ds = MarsCLIPDataset(root=tmp_path)
 
     assert len(ds) == 1

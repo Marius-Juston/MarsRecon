@@ -1,4 +1,4 @@
-"""Tests for src/preprocessing.py.
+"""Tests for src/dataset/preprocessing.py.
 
 Covers jp2_to_cog, convert_all, geographic_split, _available_memory_bytes,
 and _safe_worker_count using synthetic data only.
@@ -26,7 +26,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from preprocessing import (
+from dataset.preprocessing import (
     _available_memory_bytes,
     _is_corrupt_jp2_error,
     _safe_worker_count,
@@ -204,7 +204,7 @@ class TestSafeWorkerCount:
         mb100 = 100 * 1024 ** 2
         files = _fake_jp2s(tmp_path, [mb100] * 4)
         with _patch_sizes(files, [mb100] * 4):
-            with mock.patch("preprocessing._available_memory_bytes", return_value=64 * 1024 ** 3):
+            with mock.patch("dataset.preprocessing._available_memory_bytes", return_value=64 * 1024 ** 3):
                 result = _safe_worker_count(files, 4)
         assert result == 4
 
@@ -216,7 +216,7 @@ class TestSafeWorkerCount:
         usable = 6 * gib1
         available = int(usable / 0.75)
         with _patch_sizes(files, [gib1] * 4):
-            with mock.patch("preprocessing._available_memory_bytes", return_value=available):
+            with mock.patch("dataset.preprocessing._available_memory_bytes", return_value=available):
                 result = _safe_worker_count(files, 4)
         assert result == 1
 
@@ -225,7 +225,7 @@ class TestSafeWorkerCount:
         gib4 = 4 * 1024 ** 3
         files = _fake_jp2s(tmp_path, [gib4])
         with _patch_sizes(files, [gib4]):
-            with mock.patch("preprocessing._available_memory_bytes", return_value=1024 ** 3):
+            with mock.patch("dataset.preprocessing._available_memory_bytes", return_value=1024 ** 3):
                 result = _safe_worker_count(files, 8)
         assert result >= 1
 
@@ -233,7 +233,7 @@ class TestSafeWorkerCount:
         mb10 = 10 * 1024 ** 2
         files = _fake_jp2s(tmp_path, [mb10] * 100)
         with _patch_sizes(files, [mb10] * 100):
-            with mock.patch("preprocessing._available_memory_bytes", return_value=512 * 1024 ** 3):
+            with mock.patch("dataset.preprocessing._available_memory_bytes", return_value=512 * 1024 ** 3):
                 result = _safe_worker_count(files, 3)
         assert result <= 3
 
@@ -256,7 +256,7 @@ class TestSafeWorkerCount:
         usable = 10 * gib1
         available = int(usable / 0.75)
         with _patch_sizes(all_files, all_sizes):
-            with mock.patch("preprocessing._available_memory_bytes", return_value=available):
+            with mock.patch("dataset.preprocessing._available_memory_bytes", return_value=available):
                 result_largest_first = _safe_worker_count(all_files, 8)
 
         # If we sampled only the 20 small files the cap would be 200+.
@@ -272,8 +272,8 @@ class TestSafeWorkerCount:
         files = _fake_jp2s(tmp_path, [gib1] * 2)
         available = int((1 * gib1) / 0.75)  # forces cap to 1 worker
         with _patch_sizes(files, [gib1] * 2):
-            with mock.patch("preprocessing._available_memory_bytes", return_value=available):
-                with caplog.at_level(logging.WARNING, logger="preprocessing"):
+            with mock.patch("dataset.preprocessing._available_memory_bytes", return_value=available):
+                with caplog.at_level(logging.WARNING, logger="dataset.preprocessing"):
                     _safe_worker_count(files, 4)
         assert any("Capping workers" in r.message for r in caplog.records)
 
@@ -282,8 +282,8 @@ class TestSafeWorkerCount:
         mb10 = 10 * 1024 ** 2
         files = _fake_jp2s(tmp_path, [mb10])
         with _patch_sizes(files, [mb10]):
-            with mock.patch("preprocessing._available_memory_bytes", return_value=512 * 1024 ** 3):
-                with caplog.at_level(logging.WARNING, logger="preprocessing"):
+            with mock.patch("dataset.preprocessing._available_memory_bytes", return_value=512 * 1024 ** 3):
+                with caplog.at_level(logging.WARNING, logger="dataset.preprocessing"):
                     _safe_worker_count(files, 2)
         assert not any("Capping workers" in r.message for r in caplog.records)
 
@@ -725,7 +725,7 @@ class TestGeographicSplitExtra:
 # CLI __main__ block
 # ---------------------------------------------------------------------------
 
-_PREPROCESSING_SCRIPT = pathlib.Path(__file__).parent.parent / "src" / "preprocessing.py"
+_PREPROCESSING_SCRIPT = pathlib.Path(__file__).parent.parent / "src" / 'dataset' / "preprocessing.py"
 
 
 class TestCLI:
@@ -738,7 +738,7 @@ class TestCLI:
     def _run_main(self, argv: list[str]) -> None:
         import runpy
 
-        with mock.patch.object(sys, "argv", ["preprocessing.py"] + argv):
+        with mock.patch.object(sys, "argv", ["dataset/preprocessing.py"] + argv):
             runpy.run_path(str(_PREPROCESSING_SCRIPT), run_name="__main__")
 
     def test_runs_on_empty_root(self, tmp_path):
@@ -758,6 +758,6 @@ class TestCLI:
         nonexistent = tmp_path / "no_config.json"
         with mock.patch("pathlib.Path.exists", return_value=False):
             with mock.patch("logging.basicConfig") as mock_basic:
-                with mock.patch.object(sys, "argv", ["preprocessing.py", "--root", str(tmp_path)]):
+                with mock.patch.object(sys, "argv", ["dataset/preprocessing.py", "--root", str(tmp_path)]):
                     runpy.run_path(str(_PREPROCESSING_SCRIPT), run_name="__main__")
         mock_basic.assert_called()

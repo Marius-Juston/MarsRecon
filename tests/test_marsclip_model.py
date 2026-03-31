@@ -11,7 +11,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_model import (
+from clip.marsclip_model import (
     MarsCLIPModel,
     compute_patch_valid_mask,
     sample_patch_keep_mask,
@@ -125,6 +125,6 @@ class TestValidationErrors:
 
     def test_image_vit_tower_requires_divisible_image_size(self):
         import pytest
-        from marsclip_model import ImageViTTower
+        from clip.marsclip_model import ImageViTTower
         with pytest.raises(ValueError, match="divisible by patch_size"):
             ImageViTTower(image_size=15, patch_size=4)

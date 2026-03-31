@@ -10,7 +10,7 @@ import pytest
 from shapely.geometry import Polygon, box
 
 # src/ is on sys.path via conftest.py
-from mars_hirise import _corners_to_polygon
+from dataset.mars_hirise import _corners_to_polygon
 
 
 # ---------------------------------------------------------------------------

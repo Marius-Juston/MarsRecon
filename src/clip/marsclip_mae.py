@@ -10,7 +10,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from marsclip_patches import DEFAULT_PATCH_VALID_FRACTION
+from clip.marsclip_patches import DEFAULT_PATCH_VALID_FRACTION
 
 
 def patchify(image: torch.Tensor, patch_size: int) -> torch.Tensor:

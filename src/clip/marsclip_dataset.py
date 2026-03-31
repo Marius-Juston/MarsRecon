@@ -14,9 +14,9 @@ import torch
 from rasterio.enums import Resampling
 from torch.utils.data import Dataset
 
-from mars_hirise import _ProductMeta
-from observation_manifest import build_observation_manifest
-from rationale_cache import merge_rationale_cache
+from dataset.mars_hirise import _ProductMeta
+from clip.observation_manifest import build_observation_manifest
+from clip.rationale_cache import merge_rationale_cache
 
 GEO_FEATURE_NAMES: tuple[str, ...] = (
     "centroid_lon_sin",

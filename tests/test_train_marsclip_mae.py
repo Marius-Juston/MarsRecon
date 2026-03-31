@@ -14,8 +14,8 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_mae import MarsMaskedAutoencoder
-from train_marsclip_mae import (
+from clip.marsclip_mae import MarsMaskedAutoencoder
+from clip.train_marsclip_mae import (
     _resolve_device,
     build_mae_model_from_config,
     build_mae_dataloader,
@@ -952,8 +952,8 @@ def test_run_mae_training_logs_to_wandb_when_enabled(monkeypatch, tmp_path):
 
 @pytest.mark.integration
 def test_train_mae_steps_real_patch_smoke():
-    from mars_hirise import MarsHiRISE
-    from marsclip_patches import (
+    from dataset.mars_hirise import MarsHiRISE
+    from clip.marsclip_patches import (
         MarsCLIPPatchDataset,
         build_patch_observation_metadata,
         build_patch_records,

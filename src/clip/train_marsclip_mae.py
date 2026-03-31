@@ -27,14 +27,14 @@ from torch.utils.data import DataLoader, Dataset, Subset
 mpl.use("Agg")
 from matplotlib import pyplot as plt
 
-from marsclip_mae import MarsMAEOutput, MarsMaskedAutoencoder, collate_patch_samples_for_mae
-from marsclip_patches import (
+from clip.marsclip_mae import MarsMAEOutput, MarsMaskedAutoencoder, collate_patch_samples_for_mae
+from clip.marsclip_patches import (
     DEFAULT_PATCH_VALID_FRACTION,
     MarsCLIPPatchDataset,
     load_patch_records,
 )
-from marsclip_splits import build_dataset_subsets, load_patch_split_manifest
-from visualize_marsclip_mae import save_mae_reconstruction_preview
+from clip.marsclip_splits import build_dataset_subsets, load_patch_split_manifest
+from clip.visualize_marsclip_mae import save_mae_reconstruction_preview
 
 MAE_MODEL_CONFIG_DEFAULTS: dict[str, Any] = {
     "image_size": 64,
@@ -277,7 +277,7 @@ def init_wandb_logger(
     mode: str = "disabled",
     project: str = "marsclip-stagea",
     run_name: str | None = None,
-    out_dir: pathlib.Path | str = pathlib.Path("."),
+    out_dir: pathlib.Path | str = pathlib.Path("../../tests"),
     log_dir: pathlib.Path | str | None = None,
     config: dict[str, Any] | None = None,
 ) -> WandbLogger | None:

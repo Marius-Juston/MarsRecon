@@ -16,8 +16,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from helpers import make_mock_dataset
-from marsclip_dataset import GEO_FEATURE_NAMES, VIEWING_FEATURE_NAMES
-from marsclip_patches import (
+from clip.marsclip_dataset import GEO_FEATURE_NAMES, VIEWING_FEATURE_NAMES
+from clip.marsclip_patches import (
     DEFAULT_PATCH_VALID_FRACTION,
     PATCH_SCALE_FEATURE_NAMES,
     MarsCLIPPatchDataset,
@@ -579,7 +579,6 @@ def test_filter_observation_metadata_to_color_raises_no_color_rows():
 # ---------------------------------------------------------------------------
 
 def test_filter_geo_dataset_to_obs_ids_raises_missing_obs_id_column(mars_crs):
-    import geopandas as gpd
     geometries = [box(-1.0, 0.0, 1.0, 2.0)]
     dataset = make_mock_dataset(geometries, mars_crs)
     # Remove obs_id column from index
@@ -667,7 +666,7 @@ def test_build_patch_observation_metadata_raises_for_none_raw_index_value():
 
 
 def test_build_patch_observation_metadata_applies_rationale_cache():
-    from rationale_cache import DEFAULT_PROMPT_TEMPLATE
+    from clip.rationale_cache import DEFAULT_PROMPT_TEMPLATE
     fake = types.SimpleNamespace(_raw_index=_raw_index_rows().iloc[[0]].copy())
     cache = pd.DataFrame([{
         "obs_id": "OBS_A",
@@ -896,7 +895,7 @@ def test_patch_dataset_raises_when_both_geo_dataset_and_root_are_none():
 
 
 def test_patch_dataset_merges_rationale_cache_with_explicit_observation_metadata():
-    from rationale_cache import DEFAULT_PROMPT_TEMPLATE
+    from clip.rationale_cache import DEFAULT_PROMPT_TEMPLATE
     image = torch.zeros(3, 4, 4, dtype=torch.float32)
     fake = _FakeGeoDataset(image)
     # Provide obs_meta WITHOUT rationale_expanded — merge_rationale_cache adds it
@@ -1001,7 +1000,7 @@ def test_patch_dataset_applies_transform(mars_crs):
 
 @pytest.mark.integration
 def test_real_patch_dataset_returns_stage_a_sample():
-    from mars_hirise import MarsHiRISE
+    from dataset.mars_hirise import MarsHiRISE
 
     geo = MarsHiRISE(
         bbox=(-136.0, 12.0, -124.0, 24.0),

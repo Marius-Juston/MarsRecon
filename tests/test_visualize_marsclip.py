@@ -11,7 +11,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from visualize_marsclip import _build_mask_overlay, save_sample_preview
+from clip.visualize_marsclip import _build_mask_overlay, save_sample_preview
 
 
 def test_build_mask_overlay_is_informative_for_full_valid_mask():

@@ -13,13 +13,13 @@ _MPL_CACHE = pathlib.Path(tempfile.gettempdir()) / "marsrecon-mpl"
 _MPL_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CACHE))
 
-from marsclip_patches import (
+from clip.marsclip_patches import (
     DEFAULT_PATCH_VALID_FRACTION,
     MarsCLIPPatchDataset,
     summarize_patch_records,
     summarize_patch_samples,
 )
-from visualize_marsclip import save_sample_preview
+from clip.visualize_marsclip import save_sample_preview
 
 
 def save_patch_report(

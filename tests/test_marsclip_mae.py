@@ -12,7 +12,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_mae import (
+from clip.marsclip_mae import (
     MarsMaskedAutoencoder,
     _coerce_channel_stats,
     _gather_visible_tokens,
@@ -402,8 +402,8 @@ def test_scale_encoding_requires_even_dimension():
 
 @pytest.mark.integration
 def test_mae_real_patch_batch_forward_backward_smoke():
-    from mars_hirise import MarsHiRISE
-    from marsclip_patches import (
+    from dataset.mars_hirise import MarsHiRISE
+    from clip.marsclip_patches import (
         MarsCLIPPatchDataset,
         build_patch_observation_metadata,
         build_patch_records,

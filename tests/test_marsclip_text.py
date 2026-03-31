@@ -11,7 +11,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from marsclip_text import (
+from clip.marsclip_text import (
     MarsCLIPBatchCollator,
     SimpleTextTokenizer,
     build_tokenizer_from_manifest,

@@ -14,23 +14,23 @@ This project uses `uv` as the package manager (Python 3.12 required):
 uv sync                        # Install runtime dependencies
 uv sync --extra dev            # Also install pytest and test deps
 
-uv run pytest tests/ -v                    # Run all unit tests
-uv run pytest tests/ -m "not integration" # Skip tests that need real data on disk
-uv run pytest tests/ --cov=src --cov-report=term-missing  # With coverage
+uv run pytest tests/ -v -n auto                   # Run all unit tests
+uv run pytest tests/ -m "not integration" -n auto # Skip tests that need real data on disk
+uv run pytest tests/ --cov=src --cov-report=term-missing -n auto # With coverage
 
-uv run python src/mars_hirise.py  # Run main pipeline (downloads + samples + plots)
+uv run python src/dataset/mars_hirise.py  # Run main pipeline (downloads + samples + plots)
 
 # Pre-convert JP2 files to COG GeoTIFF for faster training (run once)
-uv run python -m src.preprocessing --root /scratch/mars_hirise --workers 4
+uv run python -m src.dataset.preprocessing --root /scratch/mars_hirise --workers 4
 ```
 
 ## Architecture
 
 Source files:
-- **`src/mars_hirise.py`** — `MarsHiRISE` dataset class; main entry point
-- **`src/hirise_sampler.py`** — `HiRISEGeoSampler`: strip-aware sampler
-- **`src/preprocessing.py`** — COG conversion pipeline and geographic train/test split
-- **`src/validate_sampling.py`** — diagnostic script (not a library module; excluded from coverage)
+- **`src/dataset/mars_hirise.py`** — `MarsHiRISE` dataset class; main entry point
+- **`src/dataset/hirise_sampler.py`** — `HiRISEGeoSampler`: strip-aware sampler
+- **`src/dataset/preprocessing.py`** — COG conversion pipeline and geographic train/test split
+- **`src/dataset/validate_sampling.py`** — diagnostic script (not a library module; excluded from coverage)
 
 ### Core Class: `MarsHiRISE(GeoDataset)`
 
@@ -50,11 +50,12 @@ HiRISE strips are long, thin, rotated parallelograms. `RandomGeoSampler` samples
 3. Randomly sampling from this pre-computed set each epoch
 
 ```python
-from hirise_sampler import HiRISEGeoSampler
+from dataset.hirise_sampler import HiRISEGeoSampler
+
 sampler = HiRISEGeoSampler(dataset, size=0.005, length=500, units=Units.CRS)
 ```
 
-### COG Conversion (`src/preprocessing.py`)
+### COG Conversion (`src/dataset/preprocessing.py`)
 
 JP2 files (200MB–2.5GB) are slow for random windowed reads. `jp2_to_cog()` creates a sidecar `.tif` (same stem) in COG format with 512×512 internal tiles. `MarsHiRISE._prefer_cog()` automatically uses the sidecar when it exists. Geographic train/test split via `geographic_split(dataset.index)`.
 
@@ -103,13 +104,13 @@ Configured via `logger_config.json`:
 All three library modules are at 100% line coverage (274 unit tests, no real HiRISE data required):
 
 ```bash
-uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing
+uv run pytest tests/ -m "not integration" --cov=src --cov-report=term-missing -n auto
 ```
 
-| Module                  | Statements | Coverage |
-|-------------------------|------------|----------|
-| `src/mars_hirise.py`    | 828        | 100%     |
-| `src/hirise_sampler.py` | 80         | 100%     |
-| `src/preprocessing.py`  | 161        | 100%     |
+| Module                          | Statements | Coverage |
+|---------------------------------|------------|----------|
+| `src/dataset/mars_hirise.py`    | 828        | 100%     |
+| `src/dataset/hirise_sampler.py` | 80         | 100%     |
+| `src/dataset/preprocessing.py`  | 161        | 100%     |
 
 Integration tests (require real data at `/scratch/mars_hirise`) are marked `@pytest.mark.integration` and excluded from the unit suite via `-m "not integration"`.

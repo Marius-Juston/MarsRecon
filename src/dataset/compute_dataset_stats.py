@@ -28,7 +28,7 @@ loses negligible valid signal.
 
 Usage
 -----
-    uv run python src/compute_dataset_stats.py
+    uv run python src/dataset/compute_dataset_stats.py
 """
 
 from __future__ import annotations

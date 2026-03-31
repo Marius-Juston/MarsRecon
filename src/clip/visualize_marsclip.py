@@ -19,8 +19,8 @@ import torch
 mpl.use("Agg")
 from matplotlib import pyplot as plt
 
-from marsclip_dataset import MarsCLIPDataset
-from marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
+from clip.marsclip_dataset import MarsCLIPDataset
+from clip.marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
 
 
 def _to_display_rgb(image: torch.Tensor) -> np.ndarray:

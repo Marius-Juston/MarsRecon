@@ -13,7 +13,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from observation_manifest import (
+from clip.observation_manifest import (
     _apply_bbox_filter,
     _choose_image_path,
     _clean_text,
@@ -224,7 +224,7 @@ def test_build_manifest_can_keep_rows_without_local_image(tmp_path):
 
 def test_build_manifest_skips_antimeridian_rows(tmp_path, caplog):
     df = _synthetic_index().iloc[[4]].copy()
-    with caplog.at_level("WARNING", logger="observation_manifest"):
+    with caplog.at_level("WARNING", logger="clip.observation_manifest"):
         manifest = build_observation_manifest_from_index(
             df,
             tmp_path,
@@ -240,7 +240,7 @@ def test_build_observation_manifest_loads_index_from_disk(tmp_path):
     _touch(tmp_path / "images" / "OBS_A_COLOR.JP2")
     mock_pdr = _make_pdr_mock(df)
 
-    with patch("observation_manifest.pdr.read", return_value=mock_pdr):
+    with patch("clip.observation_manifest.pdr.read", return_value=mock_pdr):
         manifest = build_observation_manifest(tmp_path)
 
     assert manifest["obs_id"].tolist() == ["OBS_A"]
