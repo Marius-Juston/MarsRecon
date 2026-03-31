@@ -4,7 +4,7 @@ This document turns the embedding workflow into a finite execution plan. The wor
 
 ## Status Snapshot
 
-Current position: Phase 0 and all of Stage A are complete in the current environment. We now have a reusable GPU-backed Stage A MAE checkpoint, a longer non-smoke CUDA run, an explicit checkpoint-selection note, and embedding sanity artifacts. The next gap is Stage B1: building workflow-aligned paired local/global crops and reusing the Stage A encoder in the multimodal path.
+Current position: Phase 0 and all of Stage A are complete in the current environment. We now have a reusable GPU-backed Stage A MAE checkpoint, a longer non-smoke CUDA run, and embedding sanity artifacts. The next gap is Stage B1: building workflow-aligned paired local/global crops and reusing the Stage A encoder in the multimodal path.
 
 Overall workflow progress: `[#######---] ~68%`
 
@@ -168,7 +168,6 @@ What exists now:
 - real Olympus Mons embedding sanity artifacts from a saved checkpoint
 - longer 40-step Stage A run with periodic checkpoints on Olympus Mons
 - longer 80-step CUDA Stage A run with GPU-backed checkpoint selection at batch size `8`
-- explicit checkpoint-selection note in `reports/MarsCLIP_StageA_Checkpoint_Note.md`
 
 Validation:
 - Resume-from-checkpoint works
@@ -178,7 +177,7 @@ Validation:
 
 Final report artifacts:
 - Training configuration table
-- Checkpoint selection note
+- Checkpoint selection rationale
 - Embedding visualization or nearest-neighbor gallery
 
 Exit criteria:
