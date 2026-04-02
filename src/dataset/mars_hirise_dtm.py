@@ -16,16 +16,18 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
+import shapely.geometry
+import shapely.ops
 import torch
 from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
-from shapely.geometry import Polygon, box
+from mpl_toolkits.mplot3d import Axes3D
+from shapely.geometry import box
 from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.utils import GeoSlice, Path, Sample
 from torchgeo.samplers import Units
 
 from dataset.mars_hirise_base import (
-    MARS_GEOGRAPHIC_CRS,
     MarsHiRISEBase,
     ProductMeta,
     check_overlap,
@@ -39,8 +41,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # DATA_TYPE column values in DTMCUMINDEX.TAB (trimmed / upper-cased):
-DTM_DATA_TYPES = frozenset({"ELEVATION", "RADII"})
-ORTHO_DATA_TYPES = frozenset({"LEFT ORTHOIMAGE", "RIGHT ORTHOIMAGE"})
+DTM_DATA_TYPES = frozenset({"DTM"})
+ORTHO_DATA_TYPES = frozenset({"ORTHOIMAGE"})
 
 # Orthoimage colour-content tags and their in-file band mappings:
 IRB_CHANNELS: tuple[str, ...] = ("NEAR-INFRARED", "RED", "BLUE-GREEN")
@@ -124,21 +126,21 @@ class MarsHiRISEDTM(MarsHiRISEBase):
     _INDEX_STEM: str = "DTMCUMINDEX"
 
     def __init__(
-        self,
-        root: Path = "/scratch/mars_hirise_dtm",
-        *,
-        split: str = "train",
-        target: str | None = None,
-        include_ortho: bool = True,
-        ortho_type: OrthoType | list[OrthoType] = "RED",
-        ortho_scale: str | None = None,
-        transforms: Callable[[Sample], Sample] | None = None,
-        download: bool = False,
-        bbox: tuple[float, float, float, float] | None = None,
-        checksum: bool = False,
-        reuse_cache: bool = True,
-        normalize_elevation: bool = False,
-        elevation_stats_path: str | None = None,
+            self,
+            root: Path = "/scratch/mars_hirise_dtm",
+            *,
+            split: str = "train",
+            target: str | None = None,
+            include_ortho: bool = True,
+            ortho_type: OrthoType | list[OrthoType] = "RED",
+            ortho_scale: str | None = None,
+            transforms: Callable[[Sample], Sample] | None = None,
+            download: bool = False,
+            bbox: tuple[float, float, float, float] | None = None,
+            checksum: bool = False,
+            reuse_cache: bool = True,
+            normalize_elevation: bool = False,
+            elevation_stats_path: str | None = None,
     ) -> None:
         """Initialise the dataset.
 
@@ -308,11 +310,11 @@ class MarsHiRISEDTM(MarsHiRISEBase):
     # ------------------------------------------------------------------
 
     def plot(
-        self,
-        sample: Sample,
-        show_titles: bool = True,
-        suptitle: str | None = None,
-        **kwargs,
+            self,
+            sample: Sample,
+            show_titles: bool = True,
+            suptitle: str | None = None,
+            **kwargs,
     ) -> Figure:
         """Visualise a sample: elevation + ortho panels."""
         has_elev = "elevation" in sample
@@ -380,6 +382,53 @@ class MarsHiRISEDTM(MarsHiRISEBase):
         fig.tight_layout()
         return fig
 
+    def plot3d(
+            self,
+            sample: Sample,
+            show_titles: bool = True,
+            suptitle: str | None = None,
+            **kwargs,
+    ) -> Figure:
+        """Visualise a sample: 3D elevation panel."""
+        has_elev = "elevation" in sample
+
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6), subplot_kw={"projection": "3d"})
+        ax: Axes3D
+
+        if has_elev:
+            elev = sample["elevation"]
+            if elev.ndim == 4:
+                elev = elev[0]
+            elev_np = elev[0].numpy().copy()
+            valid = np.isfinite(elev_np)
+
+            x, y = np.meshgrid(range(elev_np.shape[1]), range(elev_np.shape[0]))
+
+            if valid.any():
+                stride = max(1, min(elev_np.shape[0], elev_np.shape[1]) // 100)
+
+                im = ax.plot_surface(
+                    np.where(valid, x, np.nan),
+                    np.where(valid, y, np.nan),
+                    np.where(valid, elev_np, np.nan),
+                    cmap="terrain",
+                    rstride=stride,
+                    cstride=stride,
+                    linewidth=0,
+                    antialiased=False,
+                )
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                             label="Elevation (m)")
+
+            ax.axis("off")
+            if show_titles:
+                ax.set_title("3D Elevation (DTM)")
+
+        if suptitle is not None:
+            fig.suptitle(suptitle)
+        fig.tight_layout()
+        return fig
+
     @staticmethod
     def _percentile_stretch(img: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         """Per-channel 2–98 percentile stretch over non-zero pixels."""
@@ -435,35 +484,74 @@ class MarsHiRISEDTM(MarsHiRISEBase):
                     "10 TB.  Use --bbox or --target to limit scope."
                 )
 
+    def _get_ortho_overlap(self, dtm_geom: shapely.geometry.Polygon, ortho_path: str) -> float:
+        """Calculate the area intersection ratio of an Orthoimage against the DTM footprint."""
+        try:
+            actual_path = self.prefer_cog(pathlib.Path(ortho_path))
+            if not actual_path or not actual_path.exists():
+                return 0.0
+
+            with rasterio.open(actual_path) as src:
+                src_crs = src.crs
+                if src_crs is None:
+                    return 1.0  # Assume it overlaps if we can't project
+
+                fl, fb, fr, ft = rasterio.warp.transform_bounds(src_crs, self.mars_crs, *src.bounds)
+
+                # Normalize to [-180, 180]
+                fl_norm = ((fl + 180.0) % 360.0) - 180.0
+                fr_norm = ((fr + 180.0) % 360.0) - 180.0
+
+                if fl_norm > fr_norm:
+                    # Antimeridian crossing: split into two bounding boxes
+                    ortho_geom = shapely.ops.unary_union([
+                        box(fl_norm, fb, 180.0, ft),
+                        box(-180.0, fb, fr_norm, ft)
+                    ])
+                else:
+                    ortho_geom = box(fl_norm, fb, fr_norm, ft)
+
+                if dtm_geom.area == 0:
+                    return 0.0
+
+                intersection = dtm_geom.intersection(ortho_geom)
+                return intersection.area / dtm_geom.area
+
+        except Exception as e:
+            logger.debug("Failed overlap check for %s: %s", ortho_path, e)
+            return 0.0
+
     # ------------------------------------------------------------------
     # Spatial index
     # ------------------------------------------------------------------
 
     def _build_spatial_index(self, force_rebuild: bool = False) -> None:
-        """Group products by stereo pair and compute footprints.
+        """Construct GeoDataFrame with exactly one row per DTM stereo pair.
 
-        Each row in :attr:`index` represents one stereo pair and carries
-        paths to the DTM and up to four ortho products (left/right ×
-        RED/IRB).
+        Uses raster-based footprint extraction (DTM + orthos) and unions
+        all valid footprints per stereo pair.
         """
         if not force_rebuild and self._try_load_cache():
             return
 
         df = self._raw_index.copy()
-        data_type = df["DATA_TYPE"].str.strip().str.upper()
 
-        left_obs = df["LEFT_OBSERVATION_ID"].str.strip()
-        right_obs = df["RIGHT_OBSERVATION_ID"].str.strip()
-        df["_pair_key"] = left_obs + "__" + right_obs
-        df["_data_type"] = data_type
+        # ──────────────────────────────────────────────────────────────
+        # Normalize fields
+        # ──────────────────────────────────────────────────────────────
+        df["_data_type"] = df["DATA_TYPE"].str.strip().str.upper()
+        df["LEFT_OBSERVATION_ID"] = df["LEFT_OBSERVATION_ID"].astype(str).str.strip()
+        df["RIGHT_OBSERVATION_ID"] = df["RIGHT_OBSERVATION_ID"].astype(str).str.strip()
+
         df["_local_path"] = df["FILE_NAME_SPECIFICATION"].apply(
             lambda s: str(self._pds_local_path(s))
         )
 
-        # Parse ortho metadata from PRODUCT_ID
+        # Parse ortho metadata
         df["_ortho_color"] = None
         df["_ortho_scale"] = None
         df["_ortho_obs_id"] = None
+
         for i, row in df.iterrows():
             m = _ORTHO_PATTERN.search(str(row["PRODUCT_ID"]).strip())
             if m:
@@ -471,111 +559,222 @@ class MarsHiRISEDTM(MarsHiRISEBase):
                 df.at[i, "_ortho_color"] = m.group(2)
                 df.at[i, "_ortho_scale"] = m.group(3)
 
-        # ── Group by stereo pair ─────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────
+        # Step 1: Extract DTM rows (authoritative pairs)
+        # ──────────────────────────────────────────────────────────────
+        dtm_df = df[df["_data_type"].isin(DTM_DATA_TYPES)].copy()
+
+        if dtm_df.empty:
+            raise DatasetNotFoundError(self)
+
+        dtm_df["_pair_key"] = (
+                dtm_df["LEFT_OBSERVATION_ID"] + "__" +
+                dtm_df["RIGHT_OBSERVATION_ID"]
+        )
+
+        # ──────────────────────────────────────────────────────────────
+        # Step 2: Build obs_id → list[pair_key] mapping
+        # ──────────────────────────────────────────────────────────────
+        obs_to_pairs: dict[str, list[str]] = {}
+
+        for _, row in dtm_df.iterrows():
+            L = row["LEFT_OBSERVATION_ID"]
+            R = row["RIGHT_OBSERVATION_ID"]
+            key = row["_pair_key"]
+
+            if key not in obs_to_pairs.setdefault(L, []):
+                obs_to_pairs[L].append(key)
+            if key not in obs_to_pairs.setdefault(R, []):
+                obs_to_pairs[R].append(key)
+
+        # ──────────────────────────────────────────────────────────────
+        # Step 3: Assign pair_key to ALL rows (Exploded Orthos)
+        # ──────────────────────────────────────────────────────────────
+        exploded_rows = []
+
+        for _, row in df.iterrows():
+            if row["_data_type"] in DTM_DATA_TYPES:
+                row_copy = row.copy()
+                row_copy["_pair_key"] = row_copy["LEFT_OBSERVATION_ID"] + "__" + row_copy["RIGHT_OBSERVATION_ID"]
+                exploded_rows.append(row_copy)
+            else:
+                # Map ortho rows via observation ID → multiple pair_keys
+                obs_id = row.get("_ortho_obs_id")
+                if obs_id in obs_to_pairs:
+                    for p_key in obs_to_pairs[obs_id]:
+                        row_copy = row.copy()
+                        row_copy["_pair_key"] = p_key
+                        exploded_rows.append(row_copy)
+
+        df = pd.DataFrame(exploded_rows)
+
+        # ──────────────────────────────────────────────────────────────
+        # Step 4: Build records + DTM authoritative footprint paths
+        # ──────────────────────────────────────────────────────────────
         pair_records: list[dict] = []
-        fp_paths: list[str | None] = []
+        fp_paths_flat: list[str | None] = []
+        pair_slices: list[tuple[int, int]] = []
 
         for pair_key, grp in df.groupby("_pair_key", sort=False):
-            left_id = grp["LEFT_OBSERVATION_ID"].iloc[0].strip()
-            right_id = grp["RIGHT_OBSERVATION_ID"].iloc[0].strip()
 
-            rec: dict = dict(
+            dtm_rows = grp[grp["_data_type"].isin(DTM_DATA_TYPES)]
+            if dtm_rows.empty:
+                continue
+
+            dr = dtm_rows.iloc[0]
+
+            left_id = dr["LEFT_OBSERVATION_ID"]
+            right_id = dr["RIGHT_OBSERVATION_ID"]
+
+            rec = dict(
                 pair_key=pair_key,
                 left_obs_id=left_id,
                 right_obs_id=right_id,
-                dtm_path=None,
-                dtm_product_id=None,
-                data_elevation_type=None,
+                dtm_path=dr["_local_path"],
+                dtm_product_id=str(dr["PRODUCT_ID"]).strip(),
+                data_elevation_type=str(dr["_data_type"]),
                 map_scale=None,
-                rationale_desc=None,
+                rationale_desc=str(dr.get("RATIONALE_DESC", "")).strip(),
                 left_red_path=None,
                 right_red_path=None,
                 left_irb_path=None,
                 right_irb_path=None,
-                _ref_row=grp.iloc[0],
+                _ref_row=dr,
             )
 
-            # ── DTM row(s) ───────────────────────────────────────────
-            dtm_rows = grp[grp["_data_type"].isin(DTM_DATA_TYPES)]
-            if not dtm_rows.empty:
-                dr = dtm_rows.iloc[0]
-                rec.update(
-                    dtm_path=dr["_local_path"],
-                    dtm_product_id=str(dr["PRODUCT_ID"]).strip(),
-                    data_elevation_type=str(dr["_data_type"]),
-                    rationale_desc=str(
-                        dr.get("RATIONALE_DESC", "")
-                    ).strip(),
-                    _ref_row=dr,
-                )
-                try:
-                    rec["map_scale"] = float(dr["MAP_SCALE"])
-                except (ValueError, TypeError):
-                    pass
+            try:
+                rec["map_scale"] = float(dr["MAP_SCALE"])
+            except (ValueError, TypeError):
+                pass
 
-            # ── Orthoimage rows ──────────────────────────────────────
-            ortho_rows = grp[grp["_data_type"].isin(
-                {d.upper() for d in ORTHO_DATA_TYPES}
-            )]
+            # Assign orthos
+            ortho_rows = grp[
+                grp["_data_type"].isin({d.upper() for d in ORTHO_DATA_TYPES})
+            ]
+
             for _, orow in ortho_rows.iterrows():
                 self._assign_ortho_path(rec, orow, left_id, right_id)
 
-            # Pick best file for footprint extraction (prefer DTM on disk)
-            fp = self._pick_footprint_file(rec)
-            pair_records.append(rec)
-            fp_paths.append(fp)
+            # Strict Ortho Validation: Ensure the pair has both Left and Right
+            # data for ALL requested ortho types. Exclude the pair if incomplete.
+            if self.include_ortho:
+                missing_required_ortho = False
+                for otype in self.ortho_types:
+                    color_key = otype.lower()
+                    if rec.get(f"left_{color_key}_path") is None or rec.get(f"right_{color_key}_path") is None:
+                        missing_required_ortho = True
+                        break
 
-        # ── Parallel footprint extraction ────────────────────────────
+                if missing_required_ortho:
+                    continue  # Skip this stereo pair entirely
+
+            # Only use the DTM to compute the footprint. Orthoimages contain
+            # unreliable padding that generates "ghost" geometries.
+            dtm_p = rec.get("dtm_path")
+            if dtm_p is not None and pathlib.Path(dtm_p).exists():
+                paths = [dtm_p]
+            else:
+                paths = []
+
+            start = len(fp_paths_flat)
+            fp_paths_flat.extend(paths)
+            end = len(fp_paths_flat)
+
+            pair_slices.append((start, end))
+            pair_records.append(rec)
+
+        # ──────────────────────────────────────────────────────────────
+        # Step 5: Run footprint extraction (UNCHANGED)
+        # ──────────────────────────────────────────────────────────────
         def _dtm_valid(data: np.ndarray) -> np.ndarray:
             return np.isfinite(data) & (data > -1e30)
 
-        fp_results = self._run_footprint_extraction(
-            fp_paths, nodata_test=_dtm_valid
+        fp_results_flat = self._run_footprint_extraction(
+            fp_paths_flat,
+            nodata_test=_dtm_valid
         )
 
-        # ── Assemble records with geometry ───────────────────────────
+        # ──────────────────────────────────────────────────────────────
+        # Step 6: Assemble geometries (DTM Authoritative & Overlap Verif)
+        # ──────────────────────────────────────────────────────────────
         records: list[dict] = []
+
         for i, rec in enumerate(pair_records):
-            hull_coords, file_bounds = fp_results[i]
+            start, end = pair_slices[i]
+            pair_fp_results = fp_results_flat[start:end]
+
             ref = rec.pop("_ref_row")
+
+            # Default to None, meaning we rely on index metadata if no file exists
+            hull_coords = None
+            file_bounds = None
+
+            # If we successfully extracted a footprint from the DTM, use it
+            if pair_fp_results:
+                hull_coords, file_bounds = pair_fp_results[0]
 
             geom = self._geometry_from_footprint_result(
                 hull_coords, file_bounds, ref
             )
-            if geom is None:
-                logger.warning(
-                    "Stereo pair %s straddles antimeridian; skipping.",
-                    rec["pair_key"],
-                )
+
+            if geom is None or geom.is_empty:
+                logger.warning("Could not generate valid geometry for %s", rec["pair_key"])
                 continue
+
+            # --- NEW: Orthoimage overlap verification (>75%) ---
+            if self.include_ortho:
+                overlap_failed = False
+                for otype in self.ortho_types:
+                    color_key = otype.lower()
+                    for side in ("left", "right"):
+                        ortho_path = rec.get(f"{side}_{color_key}_path")
+                        if ortho_path is not None and pathlib.Path(ortho_path).exists():
+                            overlap_ratio = self._get_ortho_overlap(geom, ortho_path)
+
+                            if overlap_ratio < 0.75:
+                                logger.error(
+                                    "Misalignment detected! DTM '%s' and Ortho '%s' "
+                                    "only overlap by %.1f%%. Dropping pair from index.",
+                                    rec["dtm_product_id"],
+                                    pathlib.Path(ortho_path).name,
+                                    overlap_ratio * 100
+                                )
+                                overlap_failed = True
+                                break
+
+                    if overlap_failed:
+                        break
+
+                # If any assigned ortho fails the overlap check, drop the entire pair
+                if overlap_failed:
+                    continue
 
             rec["geometry"] = geom
 
-            # DTMCUMINDEX has no START_TIME / STOP_TIME columns.
-            # Use them if present (future-proofing), otherwise fall
-            # back to a fixed epoch so the IntervalIndex is valid.
+            # Time handling
             _epoch_str = "2006-01-01T00:00:00"
             rec["t_start"] = (
-                ref["START_TIME"]
-                if "START_TIME" in ref.index
-                else _epoch_str
+                ref["START_TIME"] if "START_TIME" in ref.index else _epoch_str
             )
             rec["t_stop"] = (
-                ref["STOP_TIME"]
-                if "STOP_TIME" in ref.index
-                else _epoch_str
+                ref["STOP_TIME"] if "STOP_TIME" in ref.index else _epoch_str
             )
+
             records.append(rec)
 
-        # ── Build GeoDataFrame ───────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────
+        # Step 7: Build GeoDataFrame
+        # ──────────────────────────────────────────────────────────────
         obs_df = pd.DataFrame(records)
         if obs_df.empty:
             raise DatasetNotFoundError(self)
 
         _epoch = pd.Timestamp("2006-01-01", tz="UTC")
+
         t_start = pd.to_datetime(
             obs_df["t_start"], utc=True, errors="coerce"
         ).fillna(_epoch)
+
         t_stop = pd.to_datetime(
             obs_df["t_stop"], utc=True, errors="coerce"
         ).fillna(t_start)
@@ -583,6 +782,7 @@ class MarsHiRISEDTM(MarsHiRISEBase):
         geometries = gpd.GeoSeries(
             obs_df["geometry"].tolist(), crs=self.mars_crs
         )
+
         data_cols = {
             col: obs_df[col].values
             for col in obs_df.columns
@@ -597,6 +797,7 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             geometry=geometries.values,
             crs=self.mars_crs,
         )
+
         self._log_index_extent()
 
     # ------------------------------------------------------------------
@@ -604,11 +805,11 @@ class MarsHiRISEDTM(MarsHiRISEBase):
     # ------------------------------------------------------------------
 
     def _assign_ortho_path(
-        self,
-        rec: dict,
-        orow: pd.Series,
-        left_id: str,
-        right_id: str,
+            self,
+            rec: dict,
+            orow: pd.Series,
+            left_id: str,
+            right_id: str,
     ) -> None:
         """Assign an ortho row's path to the correct slot in *rec*."""
         color = orow["_ortho_color"]
@@ -632,21 +833,30 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             return
 
         col_key = f"{side}_{color.lower()}_path"
+        scale_key = f"{col_key}_scale"
 
-        # If a preferred scale is set, skip non-matching scales when we
-        # already have an entry, but accept as fallback when empty.
-        if self.ortho_scale and scale != self.ortho_scale:
-            if rec[col_key] is not None:
-                return
+        current_path = rec.get(col_key)
+        current_scale = rec.get(scale_key)
 
-        if rec[col_key] is None:
-            rec[col_key] = orow["_local_path"]
+        # Enforce exact scale preference if defined, otherwise prioritize finest resolution
+        if self.ortho_scale:
+            if scale == self.ortho_scale:
+                rec[col_key] = orow["_local_path"]
+                rec[scale_key] = scale
+            elif current_path is None:
+                rec[col_key] = orow["_local_path"]
+                rec[scale_key] = scale
+        else:
+            # Scale notation ranges from A (finest) to D (coarsest)
+            if current_path is None or (current_scale and scale < current_scale):
+                rec[col_key] = orow["_local_path"]
+                rec[scale_key] = scale
 
     @staticmethod
     def _pick_footprint_file(rec: dict) -> str | None:
         """Return the first file that exists on disk for footprint extraction."""
         for col in ("dtm_path", "left_red_path", "right_red_path",
-                     "left_irb_path", "right_irb_path"):
+                    "left_irb_path", "right_irb_path"):
             p = rec.get(col)
             if p is not None:
                 pp = pathlib.Path(p)
@@ -683,10 +893,10 @@ class MarsHiRISEDTM(MarsHiRISEBase):
     # ------------------------------------------------------------------
 
     def _load_dtm_tile(
-        self,
-        dtm_path: pathlib.Path,
-        x: slice,
-        y: slice,
+            self,
+            dtm_path: pathlib.Path,
+            x: slice,
+            y: slice,
     ) -> torch.Tensor | None:
         """Load and reproject a DTM .IMG patch.
 
@@ -731,11 +941,11 @@ class MarsHiRISEDTM(MarsHiRISEBase):
     # ------------------------------------------------------------------
 
     def _load_ortho_tile(
-        self,
-        jp2_path: pathlib.Path,
-        color: str,
-        x: slice,
-        y: slice,
+            self,
+            jp2_path: pathlib.Path,
+            color: str,
+            x: slice,
+            y: slice,
     ) -> torch.Tensor | None:
         """Load and reproject an orthoimage JP2 patch.
 
@@ -847,6 +1057,11 @@ def main(argv=None) -> None:  # pragma: no cover
     parser.add_argument("--no-ortho", action="store_true")
     parser.add_argument("-l", "--length", type=int, default=-1)
     parser.add_argument("-s", "--seed", type=int, default=42)
+    parser.add_argument(
+        "-d", action=argparse.BooleanOptionalAction,
+        help="Whether to generate 3D visualisation plots of the surface",
+    )
+
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
@@ -870,7 +1085,7 @@ def main(argv=None) -> None:  # pragma: no cover
             "--target to override."
         )
 
-        bbox_tuple = (-136, 12, -124, 24)
+        bbox_tuple = (-150, 5, -110, 40)
 
     dataset = MarsHiRISEDTM(
         target=args.target,
@@ -885,7 +1100,7 @@ def main(argv=None) -> None:  # pragma: no cover
     output_path.mkdir(parents=True, exist_ok=True)
 
     fig = dataset.plot_coverage()
-    fig.savefig(output_path / "dtm_coverage.png")
+    fig.savefig(output_path / "dtm_coverage.png", bbox_inches='tight')
     logger.info("Saved coverage figure.")
 
     from dataset.hirise_sampler import HiRISEGeoSampler
@@ -905,11 +1120,20 @@ def main(argv=None) -> None:  # pragma: no cover
         num_workers=4, multiprocessing_context="spawn", prefetch_factor=2,
     )
 
-    for i, sample in enumerate(dataloader):
-        if
+    output_path_3d = output_path / '3d'
 
+    for i, sample in enumerate(dataloader):
+        if args.d:
+            output_path_3d.mkdir(parents=True, exist_ok=True)
+            fig = dataset.plot3d(sample)
+            fig.savefig(output_path_3d / f"dtm_output{i}_3d.png")
+            logger.info("Saved dtm_output%d_3d.png", i)
+            plt.close(fig)
+
+        output_path_flat = output_path / 'flat'
+        output_path_flat.mkdir(parents=True, exist_ok=True)
         fig = dataset.plot(sample)
-        fig.savefig(output_path / f"dtm_output{i}.png")
+        fig.savefig(output_path_flat / f"dtm_output{i}.png")
         logger.info("Saved dtm_output%d.png", i)
         plt.close(fig)
 
