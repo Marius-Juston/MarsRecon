@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-_OFFSET_DEFAULT = 0.037954361744101  # from _ProductMeta defaults
+_OFFSET_DEFAULT = 0.037954361744101  # from ProductMeta defaults
 
 
 def _stretch(img: np.ndarray, nodata_thresh: float = 1e-6) -> np.ndarray:

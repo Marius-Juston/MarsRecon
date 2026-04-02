@@ -177,7 +177,7 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
     """Convert a single HiRISE JP2 to a Cloud-Optimized GeoTIFF sidecar.
 
     The COG is written alongside the source JP2 with the same stem and a
-    ``.tif`` extension.  :meth:`~temp.MarsHiRISE._prefer_cog` will
+    ``.tif`` extension.  :meth:`~temp.MarsHiRISE.prefer_cog` will
     automatically use it when it exists, bypassing the slower JP2 path.
 
     The conversion proceeds in two passes:

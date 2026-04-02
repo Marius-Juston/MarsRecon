@@ -11,7 +11,7 @@
     },
     "filters": {
         "warnings_and_below": {
-            "()" : "__main__.filter_maker",
+            "()" : "dataset.mars_hirise_base.filter_maker",
             "level": "WARNING"
         }
     },

@@ -1,10 +1,10 @@
 """Unit tests for mars_hirise.py — comprehensive branch coverage.
 
 Covers all branches not exercised by existing tests:
-  filter_maker, _corners_to_polygon (buffer fix), _extract_footprint,
-  _prefer_cog, _read_jp2_bounds, _extract_data_footprint, _load_from_jp2,
+  filter_maker, corners_to_polygon (buffer fix), extract_footprint,
+  prefer_cog, _load_from_jp2, extract_footprint, _load_from_jp2,
   _load_tile, plot(), plot_coverage(), _coverage_grid, spatial_index_cache,
-  __getitem__ transforms, _merge_tiles warning, _load_index, _build_spatial_index
+  __getitem__ transforms, merge_tiles warning, _load_index, _build_spatial_index
   (legacy + antimeridian + non-legacy cache), _verify JP2 warnings, setup_logging.
 
 All tests are pure unit tests — no real HiRISE data required.
@@ -35,14 +35,16 @@ import matplotlib
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
-from dataset.mars_hirise import (
-    MarsHiRISE,
-    _ProductMeta,
-    _corners_to_polygon,
-    _extract_footprint,
-    filter_maker,
-    setup_logging,
-)
+from dataset.mars_hirise import MarsHiRISE
+
+
+from dataset.mars_hirise_base import (ProductMeta,
+                                      corners_to_polygon,
+                                      extract_footprint,
+                                      filter_maker,
+                                      setup_logging,
+extract_footprint
+                                      )
 
 # ---------------------------------------------------------------------------
 # Module-level constants for test geometry
@@ -186,7 +188,7 @@ class TestFilterMakerMarsHiRISE:
 
 
 # ---------------------------------------------------------------------------
-# B. _corners_to_polygon — buffer(0) fix for self-intersecting polygon
+# B. corners_to_polygon — buffer(0) fix for self-intersecting polygon
 # ---------------------------------------------------------------------------
 
 
@@ -211,34 +213,34 @@ class TestCornersToPolygonBuffer:
                 "CORNER4_LATITUDE": 5.0,
             }
         )
-        result = _corners_to_polygon(row)
+        result = corners_to_polygon(row)
         # buffer(0) should heal the bowtie into a valid polygon
         assert result is not None
         assert result.is_valid
 
 
 # ---------------------------------------------------------------------------
-# C. _extract_footprint (standalone module-level function)
+# C. extract_footprint (standalone module-level function)
 # ---------------------------------------------------------------------------
 
 
 class TestExtractFootprintStandalone:
-    """Tests for the top-level _extract_footprint() helper."""
+    """Tests for the top-level extract_footprint() helper."""
 
     def test_none_path_returns_none_none(self):
-        result = _extract_footprint(None, _MARS_RCRS)
+        result = extract_footprint(None, _MARS_RCRS)
         assert result == (None, None)
 
     def test_nonexistent_file_returns_none_none(self, tmp_path):
-        result = _extract_footprint(str(tmp_path / "ghost.tif"), _MARS_RCRS)
+        result = extract_footprint(str(tmp_path / "ghost.tif"), _MARS_RCRS)
         assert result == (None, None)
 
     def test_no_crs_returns_none_none(self, no_crs_geotiff):
-        hull, bounds = _extract_footprint(str(no_crs_geotiff), _MARS_RCRS)
+        hull, bounds = extract_footprint(str(no_crs_geotiff), _MARS_RCRS)
         assert hull is None
 
     def test_valid_file_returns_hull_and_bounds(self, mars_geotiff):
-        hull, bounds = _extract_footprint(str(mars_geotiff), _MARS_RCRS)
+        hull, bounds = extract_footprint(str(mars_geotiff), _MARS_RCRS)
         assert hull is not None
         assert bounds is not None
         assert len(hull) >= 3
@@ -247,7 +249,9 @@ class TestExtractFootprintStandalone:
         """< 3 non-zero pixels: hull is None but file_bounds may still be returned."""
         # Create a file with only 2 non-zero pixels
         p = tmp_path / "sparse.tif"
-        transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
+        bounds = (-131.0, 18.0, -130.0, 19.0)
+
+        transform = rasterio.transform.from_bounds(*bounds, 16, 16)
         data = np.zeros((1, 16, 16), dtype=np.uint16)
         data[0, 0, 0] = 1
         data[0, 0, 1] = 1  # only 2 non-zero → len(xs) < 3
@@ -256,14 +260,14 @@ class TestExtractFootprintStandalone:
                 width=16, height=16, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
-        hull, bounds = _extract_footprint(str(p), _MARS_RCRS)
-        assert hull is None
+        hull, bounds = extract_footprint(str(p), _MARS_RCRS)
+        assert hull == (None, bounds)
 
     def test_exception_during_open_returns_none_none(self, tmp_path):
         """Exception inside rasterio.open caught → (None, None)."""
         p = tmp_path / "bad.tif"
         p.write_bytes(b"not a valid rasterio file at all")
-        result = _extract_footprint(str(p), _MARS_RCRS)
+        result = extract_footprint(str(p), _MARS_RCRS)
         assert result == (None, None)
 
     def test_empty_hull_path(self, mars_geotiff):
@@ -275,7 +279,7 @@ class TestExtractFootprintStandalone:
         mock_mp_instance.convex_hull = empty_geom
 
         with patch("shapely.geometry.MultiPoint", return_value=mock_mp_instance):
-            hull, bounds = _extract_footprint(str(mars_geotiff), _MARS_RCRS)
+            hull, bounds = extract_footprint(str(mars_geotiff), _MARS_RCRS)
 
         assert hull is None
         # file_bounds may or may not be set depending on how far we get
@@ -283,45 +287,45 @@ class TestExtractFootprintStandalone:
 
 
 # ---------------------------------------------------------------------------
-# D. _prefer_cog
+# D. prefer_cog
 # ---------------------------------------------------------------------------
 
 
 class TestPreferCog:
     def test_none_returns_none(self):
-        assert MarsHiRISE._prefer_cog(None) is None
+        assert MarsHiRISE.prefer_cog(None) is None
 
     def test_cog_exists_returns_cog(self, tmp_path):
         jp2 = tmp_path / "image.JP2"
         cog = tmp_path / "image.tif"
         cog.touch()
-        result = MarsHiRISE._prefer_cog(jp2)
+        result = MarsHiRISE.prefer_cog(jp2)
         assert result == cog
 
     def test_cog_not_exists_returns_original(self, tmp_path):
         jp2 = tmp_path / "image.JP2"
         jp2.touch()
-        result = MarsHiRISE._prefer_cog(jp2)
+        result = MarsHiRISE.prefer_cog(jp2)
         assert result == jp2
 
 
 # ---------------------------------------------------------------------------
-# E. _read_jp2_bounds
+# E. _load_from_jp2
 # ---------------------------------------------------------------------------
 
 
 class TestReadJp2Bounds:
     def test_nonexistent_file_returns_none(self, mock_dataset, tmp_path):
-        result = mock_dataset._read_jp2_bounds(tmp_path / "ghost.tif")
+        result = mock_dataset._load_from_jp2(tmp_path / "ghost.tif")
         assert result is None
 
     def test_no_crs_returns_none(self, mock_dataset, no_crs_geotiff):
-        result = mock_dataset._read_jp2_bounds(no_crs_geotiff)
+        result = mock_dataset._load_from_jp2(no_crs_geotiff)
         assert result is None
 
     def test_out_of_range_bounds_returns_none(self, mock_dataset, tmp_path):
         """transform_bounds returning invalid geographic range → None."""
-        with patch("dataset.mars_hirise.transform_bounds", return_value=(400.0, 200.0, 500.0, 300.0)):
+        with patch("dataset.mars_hirise_base.transform_bounds", return_value=(400.0, 200.0, 500.0, 300.0)):
             # Create a dummy file that rasterio can open
             p = tmp_path / "dummy.tif"
             transform = rasterio.transform.from_bounds(-131, 18, -130, 19, 4, 4)
@@ -331,18 +335,18 @@ class TestReadJp2Bounds:
                     width=4, height=4, crs=_MARS_RCRS, transform=transform,
             ) as dst:
                 dst.write(data)
-            result = mock_dataset._read_jp2_bounds(p)
+            result = mock_dataset._load_from_jp2(p)
         assert result is None
 
     def test_exception_returns_none(self, mock_dataset, tmp_path):
         """Exception during open → None."""
         p = tmp_path / "bad.tif"
         p.write_bytes(b"garbage")
-        result = mock_dataset._read_jp2_bounds(p)
+        result = mock_dataset._load_from_jp2(p)
         assert result is None
 
     def test_valid_file_returns_bounds(self, mock_dataset, mars_geotiff):
-        result = mock_dataset._read_jp2_bounds(mars_geotiff)
+        result = mock_dataset._load_from_jp2(mars_geotiff)
         assert result is not None
         fl, fb, fr, ft = result
         assert -180.0 <= fl < fr <= 180.0
@@ -350,18 +354,18 @@ class TestReadJp2Bounds:
 
 
 # ---------------------------------------------------------------------------
-# F. _extract_data_footprint
+# F. extract_footprint
 # ---------------------------------------------------------------------------
 
 
 class TestExtractDataFootprint:
     def test_nonexistent_path_returns_none(self, mock_dataset, tmp_path):
-        result = mock_dataset._extract_data_footprint(tmp_path / "ghost.tif")
-        assert result is None
+        result = extract_footprint(tmp_path / "ghost.tif", _MARS_RCRS)
+        assert result == (None, None)
 
     def test_no_crs_returns_none(self, mock_dataset, no_crs_geotiff):
-        result = mock_dataset._extract_data_footprint(no_crs_geotiff)
-        assert result is None
+        result = extract_footprint(no_crs_geotiff, _MARS_RCRS)
+        assert result == (None, None)
 
     def test_fewer_than_3_nonzero_pixels_returns_none(self, mock_dataset, tmp_path):
         p = tmp_path / "sparse.tif"
@@ -374,19 +378,19 @@ class TestExtractDataFootprint:
                 width=16, height=16, crs=_MARS_RCRS, transform=transform,
         ) as dst:
             dst.write(data)
-        result = mock_dataset._extract_data_footprint(p)
+        result = extract_footprint(str(p), _MARS_RCRS)
         assert result is None
 
     def test_valid_file_returns_polygon(self, mock_dataset, mars_geotiff):
-        result = mock_dataset._extract_data_footprint(mars_geotiff)
+        result = extract_footprint(mars_geotiff)
         assert result is not None
         assert isinstance(result, Polygon)
 
     def test_exception_returns_none(self, mock_dataset, tmp_path):
         p = tmp_path / "bad.tif"
         p.write_bytes(b"not a rasterio file")
-        result = mock_dataset._extract_data_footprint(p)
-        assert result is None
+        result = extract_footprint(p)
+        assert result == (None, None)
 
     def test_empty_hull_returns_none(self, mock_dataset, mars_geotiff):
         """hull_shapely.is_empty path via mocked MultiPoint."""
@@ -396,8 +400,8 @@ class TestExtractDataFootprint:
         mock_mp_instance = MagicMock()
         mock_mp_instance.convex_hull = empty_geom
 
-        with patch("dataset.mars_hirise.MultiPoint", return_value=mock_mp_instance):
-            result = mock_dataset._extract_data_footprint(mars_geotiff)
+        with patch("dataset.mars_hirise_base.MultiPoint", return_value=mock_mp_instance):
+            result = extract_footprint(mars_geotiff)
         assert result is None
 
 
@@ -409,14 +413,14 @@ class TestExtractDataFootprint:
 class TestLoadFromJp2:
     def test_empty_band_map_returns_empty(self, mock_dataset, mars_geotiff):
         result = mock_dataset._load_from_jp2(
-            mars_geotiff, {}, _ProductMeta(), _X, _Y
+            mars_geotiff, {}, ProductMeta(), _X, _Y
         )
         assert result == {}
 
     def test_no_crs_uses_dst_crs(self, mock_dataset, no_crs_geotiff):
         """File with no CRS: warns and assumes dataset CRS, still returns data."""
         result = mock_dataset._load_from_jp2(
-            no_crs_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
+            no_crs_geotiff, {"RED": 1}, ProductMeta(), _X, _Y
         )
         # Should attempt reprojection (may succeed or not depending on bounds)
         assert isinstance(result, dict)
@@ -424,9 +428,9 @@ class TestLoadFromJp2:
     def test_antimeridian_file_skips_early_exit(self, mock_dataset, mars_geotiff):
         """When fl > fr (antimeridian wrap), early-exit check is skipped."""
         # transform_bounds returns values whose normalised result gives fl=175 > fr=-175
-        with patch("dataset.mars_hirise.transform_bounds", return_value=(175.0, 18.0, 185.0, 19.0)):
+        with patch("dataset.mars_hirise_base.transform_bounds", return_value=(175.0, 18.0, 185.0, 19.0)):
             result = mock_dataset._load_from_jp2(
-                mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
+                mars_geotiff, {"RED": 1}, ProductMeta(), _X, _Y
             )
         # Key: we got through without hitting the early-exit return {}
         assert isinstance(result, dict)
@@ -434,17 +438,17 @@ class TestLoadFromJp2:
     def test_non_overlapping_file_early_exit(self, mock_dataset, mars_geotiff):
         """File bounds completely outside query → early exit, returns {}."""
         # File bounds at (0,0,10,10) normalised to (-180,-170) ← well left of x=-131
-        with patch("dataset.mars_hirise.transform_bounds", return_value=(0.0, 0.0, 10.0, 10.0)):
+        with patch("dataset.mars_hirise_base.transform_bounds", return_value=(0.0, 0.0, 10.0, 10.0)):
             result = mock_dataset._load_from_jp2(
-                mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
+                mars_geotiff, {"RED": 1}, ProductMeta(), _X, _Y
             )
         assert result == {}
 
     def test_reproject_exception_skips_band(self, mock_dataset, mars_geotiff):
         """If reproject() raises, the band is skipped and result is {}."""
-        with patch("dataset.mars_hirise.reproject", side_effect=RuntimeError("boom")):
+        with patch("dataset.mars_hirise_base.reproject", side_effect=RuntimeError("boom")):
             result = mock_dataset._load_from_jp2(
-                mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
+                mars_geotiff, {"RED": 1}, ProductMeta(), _X, _Y
             )
         assert result == {}
 
@@ -453,14 +457,14 @@ class TestLoadFromJp2:
         p = tmp_path / "corrupt.tif"
         p.write_bytes(b"not a tiff")
         result = mock_dataset._load_from_jp2(
-            p, {"RED": 1}, _ProductMeta(), _X, _Y
+            p, {"RED": 1}, ProductMeta(), _X, _Y
         )
         assert result == {}
 
     def test_valid_reprojection_returns_calibrated_data(self, mock_dataset, mars_geotiff):
         """Valid file + overlapping query → returns float32 array in [0,1]."""
         result = mock_dataset._load_from_jp2(
-            mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
+            mars_geotiff, {"RED": 1}, ProductMeta(), _X, _Y
         )
         assert "RED" in result
         arr = result["RED"]
@@ -791,17 +795,17 @@ class TestGetItemTransforms:
 
 
 # ---------------------------------------------------------------------------
-# N. _merge_tiles channel-mismatch warning
+# N. merge_tiles channel-mismatch warning
 # ---------------------------------------------------------------------------
 
 
 class TestMergeTilesWarning:
     def test_channel_mismatch_logs_warning(self, caplog):
-        """_merge_tiles with different channel counts emits a WARNING."""
+        """merge_tiles with different channel counts emits a WARNING."""
         t3 = torch.ones(3, 8, 8)
         t1 = torch.ones(1, 8, 8) * 0.5
         with caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"):
-            result = MarsHiRISE._merge_tiles([t3, t1])
+            result = MarsHiRISE.merge_tiles([t3, t1])
         assert "channel count mismatch" in caplog.text.lower()
         assert result.shape[0] == 3
 
@@ -843,8 +847,8 @@ class TestLoadIndex:
         mock_dataset.target = "XYZZY_NOT_FOUND"
         mock_pdr = _make_pdr_mock(self._base_df())
         with (
-            patch("dataset.mars_hirise.pdr.read", return_value=mock_pdr),
-            caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"),
+            patch("dataset.mars_hirise_base.pdr.read", return_value=mock_pdr),
+            caplog.at_level(logging.WARNING, logger="dataset.mars_hirise_base"),
         ):
             mock_dataset._load_index()
         assert "matched no rows" in caplog.text
@@ -856,7 +860,7 @@ class TestLoadIndex:
         mock_dataset.target = "PSP"  # matches PRODUCT_ID
         mock_pdr = _make_pdr_mock(self._base_df())
         with (
-            patch("dataset.mars_hirise.pdr.read", return_value=mock_pdr),
+            patch("dataset.mars_hirise_base.pdr.read", return_value=mock_pdr),
             caplog.at_level(logging.INFO, logger="dataset.mars_hirise"),
         ):
             mock_dataset._load_index()
@@ -869,7 +873,7 @@ class TestLoadIndex:
         mock_dataset.bbox = (-132.0, 17.0, -129.0, 20.0)
         mock_pdr = _make_pdr_mock(self._base_df())
         with (
-            patch("dataset.mars_hirise.pdr.read", return_value=mock_pdr),
+            patch("dataset.mars_hirise_base.pdr.read", return_value=mock_pdr),
             caplog.at_level(logging.INFO, logger="dataset.mars_hirise"),
         ):
             mock_dataset._load_index()
@@ -1065,7 +1069,7 @@ class TestSetupLogging:
 
 
 # ---------------------------------------------------------------------------
-# C+. _extract_footprint bounds edge cases (lines 374, 377-378)
+# C+. extract_footprint bounds edge cases (lines 374, 377-378)
 # ---------------------------------------------------------------------------
 
 
@@ -1082,7 +1086,7 @@ class TestExtractFootprintBoundsEdgeCases:
             dst.write(data)
         # fb=200 fails -90 <= fb < ft <= 90 → file_bounds = None
         with patch("rasterio.warp.transform_bounds", return_value=(40.0, 200.0, 140.0, 300.0)):
-            hull, bounds = _extract_footprint(str(p), _MARS_RCRS)
+            hull, bounds = extract_footprint(str(p), _MARS_RCRS)
         assert bounds is None
 
     def test_transform_bounds_exception_sets_file_bounds_none(self, tmp_path):
@@ -1096,7 +1100,7 @@ class TestExtractFootprintBoundsEdgeCases:
         ) as dst:
             dst.write(data)
         with patch("rasterio.warp.transform_bounds", side_effect=RuntimeError("bad crs")):
-            hull, bounds = _extract_footprint(str(p), _MARS_RCRS)
+            hull, bounds = extract_footprint(str(p), _MARS_RCRS)
         assert bounds is None
 
 
@@ -1285,7 +1289,7 @@ class TestVerifyNewPaths:
 class TestDownloadIndex:
     def test_download_index_calls_download_url_twice(self, mock_dataset):
         """_download_index fetches .LBL and .TAB (lines 766-769)."""
-        with patch("dataset.mars_hirise.download_url") as mock_du:
+        with patch("dataset.mars_hirise_base.download_url") as mock_du:
             mock_dataset._download_index()
         assert mock_du.call_count == 2
 
@@ -1342,7 +1346,7 @@ class TestExtractDataFootprintOverviews:
             dst.build_overviews([2, 4], RioResampling.nearest)
             dst.update_tags(ns="rio_overview", resampling="nearest")
 
-        result = mock_dataset._extract_data_footprint(p)
+        result = extract_footprint(p)
         assert result is not None
         assert isinstance(result, Polygon)
 
@@ -1361,9 +1365,9 @@ class TestExtractDataFootprintInvalidPolygon:
         bowtie = RealPolygon([(0, 0), (0, 1), (1, 0), (1, 1)])
         assert not bowtie.is_valid
 
-        with patch("dataset.mars_hirise.Polygon", return_value=bowtie):
+        with patch("dataset.mars_hirise_base.Polygon", return_value=bowtie):
             # No exception should be raised; result may be None or Polygon
-            result = mock_dataset._extract_data_footprint(mars_geotiff)
+            result = extract_footprint(mars_geotiff)
         # The branch was exercised; the return value depends on buffer(0) outcome
         assert result is None or isinstance(result, RealPolygon)
 
@@ -1469,8 +1473,8 @@ class TestBuildSpatialIndexWithFiles:
         """hull_coords forms an invalid (bowtie) polygon → buffer(0) applied (line 1094)."""
         # Bowtie coords: (0,0)→(1,1)→(0,1)→(1,0) — self-intersecting, is_valid=False
         bowtie_coords = [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)]
-        # Patch the module-level _extract_footprint to return the bowtie hull
-        with patch("dataset.mars_hirise._extract_footprint", return_value=(bowtie_coords, (-131.0, 18.0, -130.0, 19.0))):
+        # Patch the module-level extract_footprint to return the bowtie hull
+        with patch("dataset.mars_hirise_base.extract_footprint", return_value=(bowtie_coords, (-131.0, 18.0, -130.0, 19.0))):
             dataset_with_dense_file._build_spatial_index(force_rebuild=True)
 
         assert len(dataset_with_dense_file.index) == 1
@@ -1540,8 +1544,8 @@ class TestDownloadImages:
 
         with (
             patch.object(mock_dataset, "_build_download_tasks", return_value=tasks),
-            patch("dataset.mars_hirise.multiprocessing.Manager", return_value=mock_manager),
-            patch("dataset.mars_hirise.ProcessPoolExecutor", return_value=mock_pool),
+            patch("dataset.mars_hirise_base.multiprocessing.Manager", return_value=mock_manager),
+            patch("dataset.mars_hirise_base.ProcessPoolExecutor", return_value=mock_pool),
         ):
             result = mock_dataset._download_images()
 
@@ -1568,8 +1572,8 @@ class TestDownloadImages:
 
         with (
             patch.object(mock_dataset, "_build_download_tasks", return_value=tasks),
-            patch("dataset.mars_hirise.multiprocessing.Manager", return_value=mock_manager),
-            patch("dataset.mars_hirise.ProcessPoolExecutor", return_value=mock_pool),
+            patch("dataset.mars_hirise_base.multiprocessing.Manager", return_value=mock_manager),
+            patch("dataset.mars_hirise_base.ProcessPoolExecutor", return_value=mock_pool),
             caplog.at_level(logging.WARNING, logger="dataset.mars_hirise"),
         ):
             result = mock_dataset._download_images()
@@ -1586,7 +1590,7 @@ class TestDownloadImages:
 class TestLoadTileFilterNamesFallback:
     def test_no_lbl_uses_default_color_band_map(self, mock_dataset, tmp_path):
         """filter_names=[] on meta → _COLOR_BAND.copy() fallback (line 1318)."""
-        from dataset.mars_hirise import _ProductMeta
+        from dataset.mars_hirise import ProductMeta
 
         color_path = tmp_path / "test_COLOR.tif"
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
@@ -1598,9 +1602,9 @@ class TestLoadTileFilterNamesFallback:
             dst.write(data)
         mock_dataset.channels = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
         # Force filter_names=[] so len(filter_names) != bands → else branch at line 1318
-        sparse_meta = _ProductMeta()
+        sparse_meta = ProductMeta()
         sparse_meta.filter_names = []
-        with patch("dataset.mars_hirise._ProductMeta.from_lbl", return_value=sparse_meta):
+        with patch("dataset.mars_hirise_base.ProductMeta.from_lbl", return_value=sparse_meta):
             result = mock_dataset._load_tile(color_path, None, _X, _Y)
         assert result is not None
 
@@ -1616,9 +1620,9 @@ class TestLoadFromJp2BoundsException:
             self, mock_dataset, mars_geotiff
     ):
         """transform_bounds raises in inner try → pass → reproject still runs (1418-1419)."""
-        with patch("dataset.mars_hirise.transform_bounds", side_effect=RuntimeError("bad crs")):
+        with patch("dataset.mars_hirise_base.transform_bounds", side_effect=RuntimeError("bad crs")):
             result = mock_dataset._load_from_jp2(
-                mars_geotiff, {"RED": 1}, _ProductMeta(), _X, _Y
+                mars_geotiff, {"RED": 1}, ProductMeta(), _X, _Y
             )
         # Exception was swallowed; reprojection still attempted on the overlapping file
         assert isinstance(result, dict)
@@ -1654,7 +1658,7 @@ class TestMain:
 
         with (
             patch("dataset.mars_hirise.MarsHiRISE", return_value=mock_ds),
-            patch("dataset.mars_hirise.setup_logging"),
+            patch("dataset.mars_hirise_base.setup_logging"),
             patch.object(hirise_sampler, "HiRISEGeoSampler", return_value=mock_sampler_inst),
             patch.object(torch.utils.data, "DataLoader", return_value=mock_dl),
             patch.object(pathlib.Path, "mkdir"),
