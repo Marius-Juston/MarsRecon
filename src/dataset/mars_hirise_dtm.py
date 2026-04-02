@@ -1085,7 +1085,7 @@ def main(argv=None) -> None:  # pragma: no cover
             "--target to override."
         )
 
-        bbox_tuple = (-150, 5, -110, 40)
+        bbox_tuple = (-150, 15, -90, 70)
 
     dataset = MarsHiRISEDTM(
         target=args.target,
@@ -1106,7 +1106,7 @@ def main(argv=None) -> None:  # pragma: no cover
     from dataset.hirise_sampler import HiRISEGeoSampler
 
     sampler = HiRISEGeoSampler(
-        dataset, size=0.005,
+        dataset, size=0.01,
         length=None if args.length <= 0 else args.length,
         units=Units.CRS,
     )
@@ -1117,7 +1117,7 @@ def main(argv=None) -> None:  # pragma: no cover
 
     dataloader = DataLoader(
         dataset, sampler=sampler,
-        num_workers=4, multiprocessing_context="spawn", prefetch_factor=2,
+        num_workers=4, multiprocessing_context="spawn", prefetch_factor=10,
     )
 
     output_path_3d = output_path / '3d'
