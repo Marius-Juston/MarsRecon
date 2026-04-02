@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 from collections.abc import Callable
 from typing import Literal
@@ -775,7 +776,7 @@ def main(argv=None) -> None:  # pragma: no cover
     output_path.mkdir(parents=True, exist_ok=True)
 
     fig = dataset.plot_coverage()
-    fig.savefig(output_path / "coverage.png")
+    fig.savefig(output_path / "coverage.png", bbox_inches='tight')
     logger.info("saved fig")
 
     sampler = HiRISEGeoSampler(
@@ -792,6 +793,7 @@ def main(argv=None) -> None:  # pragma: no cover
     logger.info("Number of data-loader: %d", len(dataloader))
 
     for i, sample in enumerate(dataloader):
+        output_path.mkdir(parents=True, exist_ok=True)
         fig = dataset.plot(sample)
         fig.savefig(output_path / f"output{i}.png")
         logger.info("Saved fig output%d.png", i)

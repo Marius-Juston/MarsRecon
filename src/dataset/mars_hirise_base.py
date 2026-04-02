@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.config
 import math
 import multiprocessing
 import os
@@ -21,7 +22,6 @@ from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from os import PathLike
-import logging.config
 
 import aiohttp
 import geopandas as gpd
@@ -1106,7 +1106,7 @@ class MarsHiRISEBase(GeoDataset):
         if self.target:
             title += f"  (filter: '{self.target}')"
         fig.suptitle(title, fontsize=12, y=1.005)
-        fig.tight_layout()
+
         return fig
 
     def _coverage_grid(
