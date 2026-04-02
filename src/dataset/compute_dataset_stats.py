@@ -59,12 +59,12 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-PATCH_SIZE_DEG: float = 0.005          # ~0.005° ≈ 590 m at Mars equator
+PATCH_SIZE_DEG: float = 0.005  # ~0.005° ≈ 590 m at Mars equator
 CHANNELS: list[str] = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
 N_HIST_BINS: int = 256
 OUTPUT_DIR: pathlib.Path = pathlib.Path("dataset_stats")
-NPROCS: int = 4                        # one per GPU
-WORKERS_PER_GPU: int = 64             # DataLoader workers per process
+NPROCS: int = 4  # one per GPU
+WORKERS_PER_GPU: int = 64  # DataLoader workers per process
 TEMP_STATS_PATH: str = "/tmp/hirise_stats_rank{rank}.pt"
 
 
@@ -120,10 +120,10 @@ def _set_gdal_single_thread(_worker_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _welford_update(
-    n: torch.Tensor,
-    mean: torch.Tensor,
-    M2: torch.Tensor,
-    valid: torch.Tensor,
+        n: torch.Tensor,
+        mean: torch.Tensor,
+        M2: torch.Tensor,
+        valid: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Update a single-channel Welford accumulator with a batch of valid pixels.
 
@@ -310,9 +310,9 @@ def _combine_welford(partials: list[dict]) -> dict:
             delta = p["mean"][c] - combined["mean"][c]
             combined["mean"][c] = combined["mean"][c] + delta * n_b / n_c
             combined["M2"][c] = (
-                combined["M2"][c]
-                + p["M2"][c]
-                + delta ** 2 * n_a * n_b / n_c
+                    combined["M2"][c]
+                    + p["M2"][c]
+                    + delta ** 2 * n_a * n_b / n_c
             )
             combined["count"][c] = n_c
             combined["ch_min"][c] = torch.minimum(
@@ -331,10 +331,10 @@ def _combine_welford(partials: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def _save_stats(
-    combined: dict,
-    channels: list[str],
-    patch_size_deg: float,
-    output_dir: pathlib.Path,
+        combined: dict,
+        channels: list[str],
+        patch_size_deg: float,
+        output_dir: pathlib.Path,
 ) -> None:
     """Compute final stats from combined accumulators and write output files.
 
@@ -441,7 +441,7 @@ def main() -> None:
     full_sampler = HiRISEGeoSampler(
         dataset,
         size=patch_size_deg,
-        length=None,          # defaults to all valid centres
+        length=None,  # defaults to all valid centres
         units=Units.CRS,
         replacement=False,
     )
