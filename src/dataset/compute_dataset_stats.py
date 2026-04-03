@@ -33,6 +33,7 @@ Usage
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -41,9 +42,12 @@ import pathlib
 import sys
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
+
+from dataset.mars_hirise_dtm import MarsHiRISEDTM
 
 _SRC = pathlib.Path(__file__).parent
 if str(_SRC) not in sys.path:
@@ -61,11 +65,19 @@ logger = logging.getLogger(__name__)
 
 PATCH_SIZE_DEG: float = 0.005  # ~0.005° ≈ 590 m at Mars equator
 CHANNELS: list[str] = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
-N_HIST_BINS: int = 256
+DTM_CHANNELS: list[str] = ["RED"]
+N_HIST_BINS: int = 1024
 OUTPUT_DIR: pathlib.Path = pathlib.Path("dataset_stats")
 NPROCS: int = 4  # one per GPU
 WORKERS_PER_GPU: int = 64  # DataLoader workers per process
 TEMP_STATS_PATH: str = "/tmp/hirise_stats_rank{rank}.pt"
+
+BBOX_TUPLE = (-150, 15, -90, 70)
+
+HIST_RANGE = {
+    "dtm": {"min": -5300.0, "max": 21300.0},
+    "image": {"min": 0.0, "max": 1.0}
+}
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +194,28 @@ def _worker_fn(rank: int, args: dict) -> None:
     C = len(channels)
     centers_slice: list = args["slices"][rank]
     size_tuple: tuple[float, float] = args["size_tuple"]
+    dtm: bool = args["dtm"]
 
     # ----------------------------------------------------------------
     # Build dataset and subset sampler for this rank
     # ----------------------------------------------------------------
-    dataset = MarsHiRISE(
-        target="Olympus",
-        channels=channels,
-        download=True,
-        reuse_cache=True,
-    )
+
+    if dtm:
+        dataset = MarsHiRISEDTM(
+            bbox=BBOX_TUPLE,
+            include_ortho=True,
+            ortho_type=DTM_CHANNELS,
+            download=True,
+            reuse_cache=True,
+        )
+    else:
+        dataset = MarsHiRISE(
+            target="Olympus",
+            channels=channels,
+            download=True,
+            reuse_cache=True,
+        )
+
     subset_sampler = _CenterSubsetSampler(centers_slice, size_tuple)
 
     loader = DataLoader(
@@ -219,12 +243,28 @@ def _worker_fn(rank: int, args: dict) -> None:
     log_every = max(1, len(subset_sampler) // 20)
 
     for batch in loader:
-        image = batch["image"].squeeze(0).to(device=device, dtype=torch.float64)
-        # image shape: (C, H, W)
+        if not dtm:
+            image = batch["image"].squeeze(0).to(device=device, dtype=torch.float64)
 
-        for c in range(C):
-            channel_pixels = image[c]
-            valid = channel_pixels[channel_pixels != 0.0].reshape(-1)
+        for c, ch_name in enumerate(channels):
+            if dtm:
+                if ch_name not in batch:
+                    continue  # Safe fall-back if a patch misses orthos
+
+                channel_pixels = batch[ch_name].squeeze(0).to(device=device, dtype=torch.float64)
+
+                if ch_name == "elevation":
+                    valid_mask = torch.isfinite(channel_pixels)
+                    range_key = "dtm"
+                else:
+                    valid_mask = channel_pixels != 0.0
+                    range_key = "image"
+            else:
+                channel_pixels = image[c]
+                valid_mask = channel_pixels != 0.0
+                range_key = "image"
+
+            valid = channel_pixels[valid_mask].reshape(-1)
             if valid.numel() == 0:
                 continue
 
@@ -233,18 +273,15 @@ def _worker_fn(rank: int, args: dict) -> None:
             )
             ch_min[c] = torch.minimum(ch_min[c], valid.min())
             ch_max[c] = torch.maximum(ch_max[c], valid.max())
+
             hist[c] += torch.histc(
-                valid.float(), bins=N_HIST_BINS, min=0.0, max=1.0
+                valid.float(), bins=N_HIST_BINS, **HIST_RANGE[range_key]
             ).to(torch.int64)
 
         n_patches += 1
         if n_patches % log_every == 0:
             pct = 100.0 * n_patches / len(subset_sampler)
-            print(
-                f"[rank {rank}] {n_patches}/{len(subset_sampler)} patches "
-                f"({pct:.1f}%)",
-                flush=True,
-            )
+            print(f"[rank {rank}] {n_patches}/{len(subset_sampler)} patches ({pct:.1f}%)", flush=True)
 
     # ----------------------------------------------------------------
     # Serialise partial results to temp file
@@ -315,12 +352,8 @@ def _combine_welford(partials: list[dict]) -> dict:
                     + delta ** 2 * n_a * n_b / n_c
             )
             combined["count"][c] = n_c
-            combined["ch_min"][c] = torch.minimum(
-                combined["ch_min"][c], p["ch_min"][c]
-            )
-            combined["ch_max"][c] = torch.maximum(
-                combined["ch_max"][c], p["ch_max"][c]
-            )
+            combined["ch_min"][c] = torch.minimum(combined["ch_min"][c], p["ch_min"][c])
+            combined["ch_max"][c] = torch.maximum(combined["ch_max"][c], p["ch_max"][c])
             combined["hist"][c] += p["hist"][c]
 
     return combined
@@ -330,11 +363,36 @@ def _combine_welford(partials: list[dict]) -> dict:
 # Save JSON + PNGs
 # ---------------------------------------------------------------------------
 
+def _calculate_percentile_from_hist(hist_counts: list[int], bin_edges: list[float] | np.ndarray,
+                                    percentile: float) -> float:
+    """Estimates a percentile by interpolating the CDF of the histogram."""
+    total_pixels = sum(hist_counts)
+    if total_pixels == 0:
+        return 0.0
+
+    target_count = percentile * total_pixels
+    cumulative = 0
+
+    for i, count in enumerate(hist_counts):
+        if cumulative + count >= target_count:
+            if count == 0:
+                return bin_edges[i]
+
+            fraction_into_bin = (target_count - cumulative) / count
+            bin_width = bin_edges[i + 1] - bin_edges[i]
+            return bin_edges[i] + (fraction_into_bin * bin_width)
+
+        cumulative += count
+
+    return bin_edges[-1]  # Fallback to absolute max bin edge
+
+
 def _save_stats(
         combined: dict,
         channels: list[str],
         patch_size_deg: float,
         output_dir: pathlib.Path,
+        args: dict,
 ) -> None:
     """Compute final stats from combined accumulators and write output files.
 
@@ -359,8 +417,26 @@ def _save_stats(
         for c in range(C)
     ]
 
-    bin_edges = [i / N_HIST_BINS for i in range(N_HIST_BINS + 1)]
-    bin_centers = [(bin_edges[i] + bin_edges[i + 1]) / 2.0 for i in range(N_HIST_BINS)]
+    bin_edges_all = []
+    p02_vals = []
+    p98_vals = []
+
+    for c, ch_name in enumerate(channels):
+        range_key = "dtm" if ch_name == "elevation" else "image"
+        min_x, max_x = HIST_RANGE[range_key]["min"], HIST_RANGE[range_key]["max"]
+        range_val = max_x - min_x
+
+        edges = [(i / N_HIST_BINS) * range_val + min_x for i in range(N_HIST_BINS + 1)]
+        bin_edges_all.append(edges)
+
+        p02_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.02))
+        p98_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.98))
+
+    # Maintain strict backwards compatibility if all channels share the exact same edges
+    if all(edges == bin_edges_all[0] for edges in bin_edges_all):
+        json_bin_edges = bin_edges_all[0]
+    else:
+        json_bin_edges = bin_edges_all
 
     stats = {
         "patch_size_deg": patch_size_deg,
@@ -371,7 +447,9 @@ def _save_stats(
         "std": std_vals,
         "min": ch_min,
         "max": ch_max,
-        "histogram_bin_edges": bin_edges,
+        "p02": p02_vals,
+        "p98": p98_vals,
+        "histogram_bin_edges": json_bin_edges,
         "histogram_counts": hist_counts,
     }
 
@@ -384,21 +462,24 @@ def _save_stats(
     # Per-channel histogram PNGs
     # ----------------------------------------------------------------
     for c, ch_name in enumerate(channels):
+        edges = bin_edges_all[c]
+        bin_centers = [(edges[i] + edges[i + 1]) / 2.0 for i in range(N_HIST_BINS)]
+        bar_width = (edges[-1] - edges[0]) / N_HIST_BINS
+
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.bar(
-            bin_centers,
-            hist_counts[c],
-            width=1.0 / N_HIST_BINS,
-            align="center",
-            color="steelblue",
-            edgecolor="none",
+            bin_centers, hist_counts[c], width=bar_width,
+            align="center", color="steelblue", edgecolor="none",
         )
-        ax.set_xlabel("Calibrated I/F value")
+
+        ax.axvline(p02_vals[c], color='red', linestyle='--', linewidth=1, label='2% / 98%')
+        ax.axvline(p98_vals[c], color='red', linestyle='--', linewidth=1)
+
+        ax.set_xlabel("Elevation (m)" if ch_name == "elevation" else "Calibrated I/F value")
         ax.set_ylabel("Pixel count")
-        ax.set_title(
-            f"{ch_name}  |  mean={mean_vals[c]:.4f}  std={std_vals[c]:.4f}"
-        )
-        ax.set_xlim(0.0, 1.0)
+        ax.set_title(f"{ch_name}  |  mean={mean_vals[c]:.4f}  std={std_vals[c]:.4f}")
+        ax.set_xlim(edges[0], edges[-1])
+
         safe_name = ch_name.replace(" ", "_").replace("/", "-")
         png_path = output_dir / f"histogram_{safe_name}.png"
         fig.tight_layout()
@@ -415,7 +496,7 @@ def _save_stats(
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(argv=None) -> None:
     """Build the full sampler in the main process, dispatch to GPU workers,
     reduce partial results, and save statistics.
     """
@@ -424,28 +505,60 @@ def main() -> None:
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     )
 
+    parser = argparse.ArgumentParser(
+        description="Get statistics for the dataset"
+    )
+
+    parser.add_argument("--dtm", action=argparse.BooleanOptionalAction)
+    args = parser.parse_args(argv)
+
     output_dir = OUTPUT_DIR
     patch_size_deg = PATCH_SIZE_DEG
-    channels = CHANNELS
 
     # ----------------------------------------------------------------
     # Build the full sampler once to enumerate all valid centres
     # ----------------------------------------------------------------
     print("Building MarsHiRISE dataset and enumerating valid patch centres…")
-    dataset = MarsHiRISE(
-        target="Olympus",
-        channels=channels,
-        download=True,
-        reuse_cache=True,
-    )
+
+    if args.dtm:
+        output_dir /= "dtm"
+
+        # Dynamic Channels specifically for DTM Stats (Tracking elevation + orthos)
+        stats_channels = ["elevation", "left_red", "right_red"]
+
+        dataset = MarsHiRISEDTM(
+            bbox=BBOX_TUPLE,
+            include_ortho=True,
+            ortho_type=DTM_CHANNELS,
+            download=True,
+            reuse_cache=True,
+        )
+    else:
+        output_dir /= "image"
+        stats_channels = CHANNELS
+
+        dataset = MarsHiRISE(
+            target="Olympus",
+            channels=stats_channels,
+            download=True,
+            reuse_cache=True,
+        )
+
     full_sampler = HiRISEGeoSampler(
         dataset,
+        split=None,
         size=patch_size_deg,
         length=None,  # defaults to all valid centres
         units=Units.CRS,
         replacement=False,
     )
     all_centers = full_sampler._centers
+
+    # import random
+    # random.shuffle(all_centers)
+    # patch = 500
+    # all_centers = all_centers[:patch * NPROCS]
+
     size_tuple = full_sampler.size
     n_total = len(all_centers)
     print(f"Total valid patch centres: {n_total}")
@@ -465,17 +578,18 @@ def main() -> None:
         slices.append(all_centers[start:end])
         print(f"  rank {r}: centres {start}–{end - 1} ({end - start} patches)")
 
-    args = {
+    worker_args = {
         "slices": slices,
         "size_tuple": size_tuple,
-        "channels": channels,
+        "channels": stats_channels,
+        "dtm": args.dtm
     }
 
     # ----------------------------------------------------------------
     # Launch one worker per GPU
     # ----------------------------------------------------------------
     print(f"\nLaunching {NPROCS} GPU workers (each with {WORKERS_PER_GPU} DataLoader workers)…")
-    mp.spawn(_worker_fn, args=(args,), nprocs=NPROCS, join=True)
+    mp.spawn(_worker_fn, args=(worker_args,), nprocs=NPROCS, join=True)
 
     # ----------------------------------------------------------------
     # Load partial results and reduce
@@ -485,14 +599,18 @@ def main() -> None:
     for r in range(NPROCS):
         path = TEMP_STATS_PATH.format(rank=r)
         partials.append(torch.load(path, weights_only=False))
-        os.remove(path)
 
     combined = _combine_welford(partials)
 
     # ----------------------------------------------------------------
     # Save final stats
     # ----------------------------------------------------------------
-    _save_stats(combined, channels, patch_size_deg, output_dir)
+    _save_stats(combined, stats_channels, patch_size_deg, output_dir, vars(args))
+
+    # Cleanup
+    for r in range(NPROCS):
+        path = TEMP_STATS_PATH.format(rank=r)
+        os.remove(path)
 
 
 if __name__ == "__main__":
