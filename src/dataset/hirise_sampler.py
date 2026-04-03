@@ -48,7 +48,7 @@ import json
 import logging
 import pathlib
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -350,7 +350,7 @@ class HiRISEGeoSampler(GeoSampler):
             dataset: GeoDataset,
             size: float | tuple[float, float],
             *,
-            split: str | None = "train",
+            split: Literal["train", "test", "val", "all"] | None = "train",
             split_fractions: tuple[float, float, float] = (0.8, 0.1, 0.1),
             split_method: str = "geographic",
             split_axis: str = "longitude",
@@ -371,6 +371,9 @@ class HiRISEGeoSampler(GeoSampler):
 
         # Use the whole dataset
         if split is None:
+            split = "all"
+
+        if split == "all":
             split = "train"
             split_fractions = (1.0, 0.0, 0.0)
 
