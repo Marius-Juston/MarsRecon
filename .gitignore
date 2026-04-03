@@ -4,7 +4,9 @@ data/
 *.TAB
 *.JP2
 
-Figures/
+*.ckpt
+
+Figures*/
 validation/
 reports/Lectures/
 reports/Proposal/
