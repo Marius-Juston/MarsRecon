@@ -70,13 +70,18 @@ N_HIST_BINS: int = 1024
 OUTPUT_DIR: pathlib.Path = pathlib.Path("dataset_stats")
 NPROCS: int = 4  # one per GPU
 WORKERS_PER_GPU: int = 64  # DataLoader workers per process
-TEMP_STATS_PATH: str = "/tmp/hirise_stats_rank{rank}.pt"
+TEMP_STATS_PATH: str = "/tmp/hirise_stats_rank{rank}_{dtm}.pt"
 
 BBOX_TUPLE = (-150, 15, -90, 70)
 
 HIST_RANGE = {
     "dtm": {"min": -5300.0, "max": 21300.0},
     "image": {"min": 0.0, "max": 1.0}
+}
+
+CENTERED_HIST_RANGE = {
+    "dtm": {"min": -270.0, "max": 270.0},  # Max expected variance within 590m
+    "image": {"min": -0.22, "max": 0.22}
 }
 
 
@@ -239,6 +244,14 @@ def _worker_fn(rank: int, args: dict) -> None:
     ch_max = torch.full((C,), float("-inf"), dtype=torch.float64, device=device)
     hist = torch.zeros(C, N_HIST_BINS, dtype=torch.int64, device=device)
 
+    # Patch-Centered Accumulators
+    c_count = torch.zeros(C, dtype=torch.int64, device=device)
+    c_mean = torch.zeros(C, dtype=torch.float64, device=device)
+    c_M2 = torch.zeros(C, dtype=torch.float64, device=device)
+    c_min = torch.full((C,), float("inf"), dtype=torch.float64, device=device)
+    c_max = torch.full((C,), float("-inf"), dtype=torch.float64, device=device)
+    c_hist = torch.zeros(C, N_HIST_BINS, dtype=torch.int64, device=device)
+
     n_patches = 0
     log_every = max(1, len(subset_sampler) // 20)
 
@@ -268,6 +281,7 @@ def _worker_fn(rank: int, args: dict) -> None:
             if valid.numel() == 0:
                 continue
 
+            # 1. Update Raw Stats
             count[c], mean[c], M2[c] = _welford_update(
                 count[c], mean[c], M2[c], valid
             )
@@ -277,6 +291,16 @@ def _worker_fn(rank: int, args: dict) -> None:
             hist[c] += torch.histc(
                 valid.float(), bins=N_HIST_BINS, **HIST_RANGE[range_key]
             ).to(torch.int64)
+
+            # 2. Update Patch-Centered Stats
+            patch_mean = valid.mean()
+            centered_valid = valid - patch_mean
+
+            c_count[c], c_mean[c], c_M2[c] = _welford_update(c_count[c], c_mean[c], c_M2[c], centered_valid)
+            c_min[c] = torch.minimum(c_min[c], centered_valid.min())
+            c_max[c] = torch.maximum(c_max[c], centered_valid.max())
+            c_hist[c] += torch.histc(centered_valid.float(), bins=N_HIST_BINS, **CENTERED_HIST_RANGE[range_key]).to(
+                torch.int64)
 
         n_patches += 1
         if n_patches % log_every == 0:
@@ -295,8 +319,14 @@ def _worker_fn(rank: int, args: dict) -> None:
         "ch_min": ch_min.cpu(),
         "ch_max": ch_max.cpu(),
         "hist": hist.cpu(),
+        "c_count": c_count.cpu(),
+        "c_mean": c_mean.cpu(),
+        "c_M2": c_M2.cpu(),
+        "c_min": c_min.cpu(),
+        "c_max": c_max.cpu(),
+        "c_hist": c_hist.cpu(),
     }
-    path = TEMP_STATS_PATH.format(rank=rank)
+    path = TEMP_STATS_PATH.format(rank=rank, dtm=str(int(args["dtm"])))
     torch.save(partial, path)
     print(f"[rank {rank}] done — saved partial stats to {path}", flush=True)
 
@@ -325,39 +355,61 @@ def _combine_welford(partials: list[dict]) -> dict:
         "ch_min": partials[0]["ch_min"].clone(),
         "ch_max": partials[0]["ch_max"].clone(),
         "hist": partials[0]["hist"].clone(),
+
+        "c_count": partials[0]["c_count"].clone(),
+        "c_mean": partials[0]["c_mean"].clone(),
+        "c_M2": partials[0]["c_M2"].clone(),
+        "c_min": partials[0]["c_min"].clone(),
+        "c_max": partials[0]["c_max"].clone(),
+        "c_hist": partials[0]["c_hist"].clone(),
     }
 
     for p in partials[1:]:
         C = combined["count"].shape[0]
         for c in range(C):
+            # Raw combine
             n_a = combined["count"][c].item()
             n_b = p["count"][c].item()
-            if n_b == 0:
-                continue
-            if n_a == 0:
-                combined["count"][c] = p["count"][c]
-                combined["mean"][c] = p["mean"][c]
-                combined["M2"][c] = p["M2"][c]
-                combined["ch_min"][c] = p["ch_min"][c]
-                combined["ch_max"][c] = p["ch_max"][c]
-                combined["hist"][c] = p["hist"][c]
-                continue
+            if n_b > 0:
+                if n_a == 0:
+                    combined["count"][c] = p["count"][c]
+                    combined["mean"][c] = p["mean"][c]
+                    combined["M2"][c] = p["M2"][c]
+                    combined["ch_min"][c] = p["ch_min"][c]
+                    combined["ch_max"][c] = p["ch_max"][c]
+                    combined["hist"][c] = p["hist"][c]
+                else:
+                    n_c = n_a + n_b
+                    delta = p["mean"][c] - combined["mean"][c]
+                    combined["mean"][c] = combined["mean"][c] + delta * n_b / n_c
+                    combined["M2"][c] = combined["M2"][c] + p["M2"][c] + delta ** 2 * n_a * n_b / n_c
+                    combined["count"][c] = n_c
+                    combined["ch_min"][c] = torch.minimum(combined["ch_min"][c], p["ch_min"][c])
+                    combined["ch_max"][c] = torch.maximum(combined["ch_max"][c], p["ch_max"][c])
+                    combined["hist"][c] += p["hist"][c]
 
-            n_c = n_a + n_b
-            delta = p["mean"][c] - combined["mean"][c]
-            combined["mean"][c] = combined["mean"][c] + delta * n_b / n_c
-            combined["M2"][c] = (
-                    combined["M2"][c]
-                    + p["M2"][c]
-                    + delta ** 2 * n_a * n_b / n_c
-            )
-            combined["count"][c] = n_c
-            combined["ch_min"][c] = torch.minimum(combined["ch_min"][c], p["ch_min"][c])
-            combined["ch_max"][c] = torch.maximum(combined["ch_max"][c], p["ch_max"][c])
-            combined["hist"][c] += p["hist"][c]
+            # Centered combine
+            c_n_a = combined["c_count"][c].item()
+            c_n_b = p["c_count"][c].item()
+            if c_n_b > 0:
+                if c_n_a == 0:
+                    combined["c_count"][c] = p["c_count"][c]
+                    combined["c_mean"][c] = p["c_mean"][c]
+                    combined["c_M2"][c] = p["c_M2"][c]
+                    combined["c_min"][c] = p["c_min"][c]
+                    combined["c_max"][c] = p["c_max"][c]
+                    combined["c_hist"][c] = p["c_hist"][c]
+                else:
+                    c_n_c = c_n_a + c_n_b
+                    delta = p["c_mean"][c] - combined["c_mean"][c]
+                    combined["c_mean"][c] = combined["c_mean"][c] + delta * c_n_b / c_n_c
+                    combined["c_M2"][c] = combined["c_M2"][c] + p["c_M2"][c] + delta ** 2 * c_n_a * c_n_b / c_n_c
+                    combined["c_count"][c] = c_n_c
+                    combined["c_min"][c] = torch.minimum(combined["c_min"][c], p["c_min"][c])
+                    combined["c_max"][c] = torch.maximum(combined["c_max"][c], p["c_max"][c])
+                    combined["c_hist"][c] += p["c_hist"][c]
 
     return combined
-
 
 # ---------------------------------------------------------------------------
 # Save JSON + PNGs
@@ -403,46 +455,65 @@ def _save_stats(
         output_dir:    Directory to write JSON and PNG files.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
     C = len(channels)
 
+    # Process Raw
     count = combined["count"].tolist()
     mean_vals = combined["mean"].tolist()
     M2_vals = combined["M2"].tolist()
     ch_min = combined["ch_min"].tolist()
     ch_max = combined["ch_max"].tolist()
-    hist_counts = combined["hist"].tolist()  # list[list[int]], shape (C, 256)
+    hist_counts = combined["hist"].tolist()
+    std_vals = [math.sqrt(M2_vals[c] / count[c]) if count[c] > 1 else 0.0 for c in range(C)]
 
-    std_vals = [
-        math.sqrt(M2_vals[c] / count[c]) if count[c] > 1 else 0.0
-        for c in range(C)
-    ]
+    # Process Centered
+    c_count = combined["c_count"].tolist()
+    c_mean_vals = combined["c_mean"].tolist()
+    c_M2_vals = combined["c_M2"].tolist()
+    c_min_vals = combined["c_min"].tolist()
+    c_max_vals = combined["c_max"].tolist()
+    c_hist_counts = combined["c_hist"].tolist()
+    c_std_vals = [math.sqrt(c_M2_vals[c] / c_count[c]) if c_count[c] > 1 else 0.0 for c in range(C)]
 
     bin_edges_all = []
-    p02_vals = []
-    p98_vals = []
+    p02_vals, p98_vals = [], []
+
+    c_bin_edges_all = []
+    c_p02_vals, c_p98_vals = [], []
 
     for c, ch_name in enumerate(channels):
         range_key = "dtm" if ch_name == "elevation" else "image"
+
+        # Raw edges
         min_x, max_x = HIST_RANGE[range_key]["min"], HIST_RANGE[range_key]["max"]
         range_val = max_x - min_x
-
         edges = [(i / N_HIST_BINS) * range_val + min_x for i in range(N_HIST_BINS + 1)]
         bin_edges_all.append(edges)
-
         p02_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.02))
         p98_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.98))
 
-    # Maintain strict backwards compatibility if all channels share the exact same edges
+        # Centered edges
+        c_min_x, c_max_x = CENTERED_HIST_RANGE[range_key]["min"], CENTERED_HIST_RANGE[range_key]["max"]
+        c_range_val = c_max_x - c_min_x
+        c_edges = [(i / N_HIST_BINS) * c_range_val + c_min_x for i in range(N_HIST_BINS + 1)]
+        c_bin_edges_all.append(c_edges)
+        c_p02_vals.append(_calculate_percentile_from_hist(c_hist_counts[c], c_edges, 0.02))
+        c_p98_vals.append(_calculate_percentile_from_hist(c_hist_counts[c], c_edges, 0.98))
+
     if all(edges == bin_edges_all[0] for edges in bin_edges_all):
         json_bin_edges = bin_edges_all[0]
+        json_c_bin_edges = c_bin_edges_all[0]
     else:
         json_bin_edges = bin_edges_all
+        json_c_bin_edges = c_bin_edges_all
 
     stats = {
         "patch_size_deg": patch_size_deg,
         "channels": channels,
         "n_valid_patches": combined["n_patches"],
         "n_valid_pixels_per_channel": count,
+
         "mean": mean_vals,
         "std": std_vals,
         "min": ch_min,
@@ -451,6 +522,15 @@ def _save_stats(
         "p98": p98_vals,
         "histogram_bin_edges": json_bin_edges,
         "histogram_counts": hist_counts,
+
+        "centered_mean": c_mean_vals,
+        "centered_std": c_std_vals,
+        "centered_min": c_min_vals,
+        "centered_max": c_max_vals,
+        "centered_p02": c_p02_vals,
+        "centered_p98": c_p98_vals,
+        "centered_histogram_bin_edges": json_c_bin_edges,
+        "centered_histogram_counts": c_hist_counts,
     }
 
     json_path = output_dir / "dataset_stats.json"
@@ -458,39 +538,53 @@ def _save_stats(
         json.dump(stats, f, indent=2)
     print(f"Saved stats to {json_path}")
 
-    # ----------------------------------------------------------------
-    # Per-channel histogram PNGs
-    # ----------------------------------------------------------------
-    for c, ch_name in enumerate(channels):
-        edges = bin_edges_all[c]
-        bin_centers = [(edges[i] + edges[i + 1]) / 2.0 for i in range(N_HIST_BINS)]
-        bar_width = (edges[-1] - edges[0]) / N_HIST_BINS
+    # Plot both sets of histograms
+    for is_centered in [False, True]:
+        prefix = "centered_" if is_centered else ""
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.bar(
-            bin_centers, hist_counts[c], width=bar_width,
-            align="center", color="steelblue", edgecolor="none",
-        )
+        for c, ch_name in enumerate(channels):
+            edges = c_bin_edges_all[c] if is_centered else bin_edges_all[c]
+            counts = c_hist_counts[c] if is_centered else hist_counts[c]
+            mean_v = c_mean_vals[c] if is_centered else mean_vals[c]
+            std_v = c_std_vals[c] if is_centered else std_vals[c]
+            p02 = c_p02_vals[c] if is_centered else p02_vals[c]
+            p98 = c_p98_vals[c] if is_centered else p98_vals[c]
 
-        ax.axvline(p02_vals[c], color='red', linestyle='--', linewidth=1, label='2% / 98%')
-        ax.axvline(p98_vals[c], color='red', linestyle='--', linewidth=1)
+            bin_centers = [(edges[i] + edges[i + 1]) / 2.0 for i in range(N_HIST_BINS)]
+            bar_width = (edges[-1] - edges[0]) / N_HIST_BINS
 
-        ax.set_xlabel("Elevation (m)" if ch_name == "elevation" else "Calibrated I/F value")
-        ax.set_ylabel("Pixel count")
-        ax.set_title(f"{ch_name}  |  mean={mean_vals[c]:.4f}  std={std_vals[c]:.4f}")
-        ax.set_xlim(edges[0], edges[-1])
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(
+                bin_centers, counts, width=bar_width,
+                align="center", color="steelblue", edgecolor="none",
+            )
 
-        safe_name = ch_name.replace(" ", "_").replace("/", "-")
-        png_path = output_dir / f"histogram_{safe_name}.png"
-        fig.tight_layout()
-        fig.savefig(png_path, dpi=150)
-        plt.close(fig)
-        print(f"Saved histogram to {png_path}")
+            ax.axvline(p02, color='red', linestyle='--', linewidth=1, label='2% / 98%')
+            ax.axvline(p98, color='red', linestyle='--', linewidth=1)
+
+            x_label = "Elevation (m)" if ch_name == "elevation" else "Calibrated I/F value"
+            if is_centered:
+                x_label += " (Centered)"
+
+            ax.set_xlabel(x_label)
+            ax.set_ylabel("Pixel count")
+            title_prefix = f"[Centered] " if is_centered else ""
+            ax.set_title(f"{title_prefix}{ch_name}  |  mean={mean_v:.4f}  std={std_v:.4f}")
+            ax.set_xlim(edges[0], edges[-1])
+
+            safe_name = ch_name.replace(" ", "_").replace("/", "-")
+            png_path = output_dir / f"{prefix}histogram_{safe_name}.png"
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
+
+            png_path = output_dir / f"{prefix}histogram_{safe_name}.pdf"
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
 
     print("\nNormalization parameters for MAE:")
     for c, ch_name in enumerate(channels):
-        print(f"  {ch_name}: mean={mean_vals[c]:.6f}, std={std_vals[c]:.6f}")
-
+        print(f"  {ch_name}: raw_std={std_vals[c]:.6f}, centered_std={c_std_vals[c]:.6f}")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -597,7 +691,7 @@ def main(argv=None) -> None:
     print("\nReducing partial statistics…")
     partials: list[dict] = []
     for r in range(NPROCS):
-        path = TEMP_STATS_PATH.format(rank=r)
+        path = TEMP_STATS_PATH.format(rank=r, dtm=str(int(args["dtm"])))
         partials.append(torch.load(path, weights_only=False))
 
     combined = _combine_welford(partials)
@@ -609,7 +703,7 @@ def main(argv=None) -> None:
 
     # Cleanup
     for r in range(NPROCS):
-        path = TEMP_STATS_PATH.format(rank=r)
+        path = TEMP_STATS_PATH.format(rank=r, dtm=str(int(args["dtm"])))
         os.remove(path)
 
 
