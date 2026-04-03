@@ -233,7 +233,7 @@ def plot_error_heatmap(
     error[~valid] = np.nan
 
     fig = plt.figure(figsize=(8, 7))
-    gs = gridspec.GridSpec(2, 2, width_ratios=[4, 1], height_ratios=[4, 1])
+    gs = gridspec.GridSpec(2, 2, width_ratios=[4, 1], height_ratios=[4, 1], figure=fig)
 
     # Main heatmap
     ax_main = fig.add_subplot(gs[0, 0])

@@ -490,6 +490,9 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
 # ---------------------------------------------------------------------------
 
 def main():
+    import warnings
+    warnings.filterwarnings("ignore", message=r".*isinstance(treespec, LeafSpec).*")
+
     parser = argparse.ArgumentParser(description="Train Mars DepthFM")
     parser.add_argument("--config", type=str, default="configs/train_hirise.yaml")
     parser.add_argument("--n_runs", type=int, default=1,
