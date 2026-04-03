@@ -28,7 +28,7 @@ from clip.monitor_marsclip_queue import (
 def test_extract_out_dir_finds_training_output_dir():
     argv = [
         ".venv/bin/python",
-        "src/clip/train_marsclip_mae.py",
+        "src/clip/train_marsclip_mae_facebook.py",
         "--out-dir",
         "/tmp/marsclip_artifacts/run_a",
         "--batch-size",
@@ -68,7 +68,7 @@ def test_build_job_snapshot_reads_progress_and_summary(tmp_path):
         "heartbeat_at": "2026-03-30 10:05:00",
         "exit_code": None,
         "log_path": str(log_path),
-        "argv": [".venv/bin/python", "src/clip/train_marsclip_mae.py", "--out-dir", str(out_dir)],
+        "argv": [".venv/bin/python", "src/clip/train_marsclip_mae_facebook.py", "--out-dir", str(out_dir)],
     }
 
     snapshot = build_job_snapshot(job)
@@ -111,7 +111,7 @@ def test_render_queue_snapshot_includes_progress_fields(tmp_path):
                 "heartbeat_at": "2026-03-30 10:05:00",
                 "exit_code": None,
                 "log_path": str(log_path),
-                "argv": [".venv/bin/python", "src/clip/train_marsclip_mae.py", "--out-dir", str(out_dir)],
+                "argv": [".venv/bin/python", "src/clip/train_marsclip_mae_facebook.py", "--out-dir", str(out_dir)],
             }
         ],
     }

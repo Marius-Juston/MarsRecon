@@ -307,6 +307,7 @@ def build_patch_records(
             geo_dataset,
             size=size,
             stride=stride,
+            split="all",
             units=Units.CRS,
             min_overlap=min_geometry_overlap,
         )
@@ -533,6 +534,8 @@ class MarsCLIPPatchDataset(Dataset):
         rationale_cache: pd.DataFrame | pathlib.Path | str | None = None,
         observation_metadata: pd.DataFrame | None = None,
         patch_records: pd.DataFrame | None = None,
+        dataset_normalize: bool = False,
+        dataset_normalization_path: pathlib.Path | str | None = None,
         transforms: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         if geo_dataset is None:
@@ -543,6 +546,8 @@ class MarsCLIPPatchDataset(Dataset):
                 bbox=bbox,  # pragma: no cover
                 channels=list(ALL_CHANNELS),  # pragma: no cover
                 download=False,  # pragma: no cover
+                normalize=bool(dataset_normalize),  # pragma: no cover
+                normalization_path=dataset_normalization_path,  # pragma: no cover
             )  # pragma: no cover
 
         if observation_metadata is None:
@@ -596,6 +601,10 @@ class MarsCLIPPatchDataset(Dataset):
         self.patch_size = _to_tuple(patch_size)
         self.min_valid_fraction = float(min_valid_fraction)
         self.color_only = bool(color_only)
+        self.dataset_normalize = bool(dataset_normalize)
+        self.dataset_normalization_path = (
+            str(dataset_normalization_path) if dataset_normalization_path is not None else None
+        )
         self.transforms = transforms
 
     def __len__(self) -> int:

@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import sys
 
-from marsclip_patches import (
+if __package__ is None or __package__ == "":  # pragma: no cover - direct script execution
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from clip.marsclip_patches import (
     DEFAULT_PATCH_VALID_FRACTION,
     MarsCLIPPatchDataset,
     save_patch_records,
 )
-from marsclip_splits import (
+from clip.marsclip_splits import (
     build_patch_split_manifest,
     save_patch_split_manifest,
     save_split_summary,
