@@ -97,6 +97,13 @@ sampler = HiRISEGeoSampler(
 
 At construction, it pre-computes a regular grid of candidate centres for each strip polygon and keeps only those whose corresponding patch intersects the polygon (not just its bounding box). Iteration draws uniformly from this set — O(1) per sample.
 
+## Dataset statisitics
+
+```bash
+time PYTHONPATH=src uv run -m src.dataset.compute_dataset_stats
+time PYTHONPATH=src uv run -m src.dataset.compute_dataset_stats --dtm
+```
+
 ## COG conversion (optional, recommended)
 
 Converting JP2 files to Cloud Optimised GeoTIFF dramatically speeds up random-window reads:
