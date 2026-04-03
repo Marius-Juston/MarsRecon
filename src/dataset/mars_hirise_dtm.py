@@ -53,6 +53,7 @@ _RED_BAND: dict[str, int] = {"RED": 1}
 
 # HiRISE DTMs use IEEE float32 minimum as nodata.
 _DTM_NODATA: float = -3.4028226550889045e+38
+_EPS = 1e-6
 
 # DTM naming convention (from https://www.uahirise.org/dtm/about.php):
 #   PRODUCT_ID = aabcd_xxxxxx_xxxx_yyyyyy_yyyy_Vnn
@@ -723,12 +724,13 @@ class MarsHiRISEDTM(MarsHiRISEBase):
 
             # --- NEW: Orthoimage overlap verification (>75%) ---
             if self.include_ortho:
-                overlap_failed = False
+                ortho_validation = False
                 for otype in self.ortho_types:
                     color_key = otype.lower()
                     for side in ("left", "right"):
                         ortho_path = rec.get(f"{side}_{color_key}_path")
-                        if ortho_path is not None and pathlib.Path(ortho_path).exists():
+
+                        if ortho_path is not None and (ortho_path := pathlib.Path(ortho_path)).exists():
                             overlap_ratio = self._get_ortho_overlap(geom, ortho_path)
 
                             if overlap_ratio < 0.75:
@@ -739,14 +741,29 @@ class MarsHiRISEDTM(MarsHiRISEBase):
                                     pathlib.Path(ortho_path).name,
                                     overlap_ratio * 100
                                 )
-                                overlap_failed = True
+                                ortho_validation = True
                                 break
 
-                    if overlap_failed:
+                            lbl_path = ortho_path.with_suffix(".LBL")
+                            meta = ProductMeta.from_lbl(lbl_path)
+
+                            if abs(meta.offset) < _EPS and abs(meta.scaling_factor - 1) < _EPS:
+                                logger.error(
+                                    "Incorrect scaling_factor and offset! DTM '%s''s associated Ortho '%s' "
+                                    "does not have valid offset (%0.3f) and scaling factors (%0.3f). Dropping pair from index.",
+                                    rec["dtm_product_id"],
+                                    pathlib.Path(ortho_path).name,
+                                    meta.offset,
+                                    meta.scaling_factor
+                                )
+                                ortho_validation = True
+                                break
+
+                    if ortho_validation:
                         break
 
                 # If any assigned ortho fails the overlap check, drop the entire pair
-                if overlap_failed:
+                if ortho_validation:
                     continue
 
             rec["geometry"] = geom
