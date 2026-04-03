@@ -14,7 +14,7 @@ import torch
 from rasterio.enums import Resampling
 from torch.utils.data import Dataset
 
-from dataset.mars_hirise import _ProductMeta
+from dataset.mars_hirise_base import ProductMeta
 from clip.observation_manifest import build_observation_manifest
 from clip.rationale_cache import merge_rationale_cache
 
@@ -134,7 +134,7 @@ def _load_color_thumbnail(
         raise FileNotFoundError(f"Image not found: {image_path}")
 
     lbl_path = image_path.with_suffix(".LBL")
-    meta = _ProductMeta.from_lbl(lbl_path)
+    meta = ProductMeta.from_lbl(lbl_path)
 
     with rasterio.open(image_path) as src:
         band_count = min(max(1, src.count), 3)

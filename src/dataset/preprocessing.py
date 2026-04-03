@@ -40,6 +40,8 @@ import rasterio
 import rasterio.enums
 import rasterio.shutil
 
+from dataset.mars_hirise_base import MARS_GEOGRAPHIC_CRS
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -52,7 +54,7 @@ _OVERVIEW_LEVELS: list[int] = [2, 4, 8, 16]
 #: Resampling method used when building overviews.
 _OVERVIEW_RESAMPLING = rasterio.enums.Resampling.average
 
-#: Base rasterio profile applied to every COG output.
+#: Base rasterio profile applied to every COG output (integer / uint imagery).
 _COG_CREATION_OPTIONS: dict = {
     "driver": "GTiff",
     "compress": "deflate",
@@ -63,6 +65,17 @@ _COG_CREATION_OPTIONS: dict = {
     "copy_src_overviews": True,
     "bigtiff": "IF_SAFER",
 }
+
+#: COG profile for DTM .IMG files (float32 elevation data).
+#: Uses predictor=3 (floating-point differencing) instead of predictor=2
+#: (horizontal integer differencing) for better compression of float rasters.
+_COG_CREATION_OPTIONS_FLOAT: dict = {
+    **_COG_CREATION_OPTIONS,
+    "predictor": 3,  # floating-point differencing — better for float32 DTMs
+}
+
+#: HiRISE DTMs use IEEE float32 minimum as nodata sentinel.
+_DTM_NODATA: float = -3.4028226550889045e+38
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +190,7 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
     """Convert a single HiRISE JP2 to a Cloud-Optimized GeoTIFF sidecar.
 
     The COG is written alongside the source JP2 with the same stem and a
-    ``.tif`` extension.  :meth:`~temp.MarsHiRISE._prefer_cog` will
+    ``.tif`` extension.  :meth:`~temp.MarsHiRISE.prefer_cog` will
     automatically use it when it exists, bypassing the slower JP2 path.
 
     The conversion proceeds in two passes:
@@ -280,6 +293,114 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
         tmp.unlink(missing_ok=True)
 
 
+def _img_cog_path(img_path: pathlib.Path) -> pathlib.Path:
+    """Return the expected COG sidecar path for a DTM .IMG file."""
+    return img_path.with_suffix(".tif")
+
+
+def img_to_cog(img_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path | None:
+    """Convert a single HiRISE DTM .IMG (PDS3 float32) to a Cloud-Optimized GeoTIFF.
+
+    DTM ``.IMG`` files are flat binary rasters with attached PDS3 labels.
+    Unlike JP2 orthoimages, they are not compressed, so the conversion is
+    mainly about adding internal 512×512 tiling and overviews for fast
+    random-access reads during ML training.
+
+    Float32 elevation data uses ``predictor=3`` (floating-point differencing)
+    for better deflate compression.  The nodata sentinel
+    ``-3.4028226550889045e+38`` is preserved in the output GeoTIFF metadata.
+
+    Args:
+        img_path: Path to the PDS3 ``.IMG`` file.
+        overwrite: If ``False`` (default), skip files that already have a
+            ``.tif`` sidecar.
+
+    Returns:
+        Path to the output COG on success, or ``None`` if conversion failed.
+    """
+    cog = _img_cog_path(img_path)
+
+    if cog.exists() and not overwrite:
+        logger.debug("COG sidecar already exists, skipping: %s", cog.name)
+        return cog
+
+    tmp = cog.with_suffix(".tmp.tif")
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message=".*geotransform.*|.*identity matrix.*",
+            )
+            with rasterio.open(img_path) as src:
+                profile = src.profile.copy()
+                profile.update(
+                    driver="GTiff",
+                    tiled=True,
+                    blockxsize=512,
+                    blockysize=512,
+                    bigtiff="IF_SAFER",
+                )
+                # Strip JP2-specific keys that don't apply
+                for key in ("lossless", "quality", "compress", "predictor"):
+                    profile.pop(key, None)
+
+                # Ensure float32 dtype for elevation data
+                if profile.get("dtype") is None:
+                    profile["dtype"] = "float32"
+
+                # Preserve nodata
+                src_nodata = src.nodata
+                if src_nodata is None:
+                    # HiRISE DTMs use IEEE float32 min as nodata
+                    src_nodata = _DTM_NODATA
+                profile["nodata"] = src_nodata
+
+                logger.debug(
+                    "Writing intermediate GeoTIFF for DTM %s "
+                    "(dtype=%s, %dx%d, %d band(s)) …",
+                    img_path.name,
+                    profile.get("dtype"),
+                    src.width,
+                    src.height,
+                    src.count,
+                )
+                with rasterio.open(tmp, "w", **profile) as dst:
+                    for band_idx in src.indexes:
+                        band_data = src.read(band_idx)
+                        dst.write(band_data, band_idx)
+                        del band_data
+                    dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
+                    dst.update_tags(
+                        ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name
+                    )
+
+        gc.collect()
+
+        # Second pass: copy to final COG with float predictor
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message=".*geotransform.*|.*identity matrix.*",
+            )
+            rasterio.shutil.copy(tmp, cog, **_COG_CREATION_OPTIONS_FLOAT)
+
+        logger.info("DTM COG written: %s", cog.name)
+        return cog
+
+    except rasterio.errors.RasterioIOError as exc:
+        logger.error("DTM COG conversion failed for %s: %s", img_path.name, exc)
+        cog.unlink(missing_ok=True)
+        return None
+    except Exception as exc:
+        logger.error("DTM COG conversion failed for %s: %s", img_path.name, exc)
+        cog.unlink(missing_ok=True)
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Batch conversion
 # ---------------------------------------------------------------------------
@@ -317,15 +438,31 @@ def _iter_jp2_files(root: pathlib.Path) -> Iterator[pathlib.Path]:
         yield from root.rglob(pattern)
 
 
+def _iter_img_files(root: pathlib.Path) -> Iterator[pathlib.Path]:
+    """Yield all HiRISE DTM .IMG files under *root*.
+
+    Only matches files whose names start with ``DTE`` (the PDS naming
+    convention for HiRISE DTMs: ``DTEEC_…``, ``DTEED_…``, etc.) to avoid
+    picking up non-DTM .IMG files that may exist in the same tree.
+    """
+    for pattern in ("*.IMG", "*.img"):
+        for p in root.rglob(pattern):
+            if p.stem.upper().startswith("DTE"):
+                yield p
+
+
 def convert_all(
         root: pathlib.Path,
         workers: int = 4,
         overwrite: bool = False,
+        skip_jp2: bool = False,
+        skip_dtm: bool = False,
 ) -> dict[str, int]:
-    """Convert all JP2 files under *root* to COG GeoTIFF sidecars.
+    """Convert all JP2 and DTM .IMG files under *root* to COG GeoTIFF sidecars.
 
     Uses a :class:`~concurrent.futures.ProcessPoolExecutor` to parallelise
-    the CPU-bound conversion.  Each worker calls :func:`jp2_to_cog`.
+    the CPU-bound conversion.  Each worker calls :func:`jp2_to_cog` or
+    :func:`img_to_cog`.
 
     .. note::
         Large JP2 files (up to 2.5 GB) are fully decompressed in memory during
@@ -335,50 +472,71 @@ def convert_all(
         ``workers`` argument is therefore treated as an upper bound.
 
     Args:
-        root: Dataset root directory containing JP2 files.
+        root: Dataset root directory containing JP2 and/or IMG files.
         workers: Number of parallel conversion processes.
         overwrite: Re-convert files that already have a ``.tif`` sidecar.
+        skip_jp2: Skip JP2 orthoimage conversion (only process DTM .IMG).
+        skip_dtm: Skip DTM .IMG conversion (only process JP2 orthoimages).
 
     Returns:
         Dict with keys ``"converted"``, ``"skipped"``, and ``"failed"``.
     """
-    jp2_files = list(_iter_jp2_files(root))
-    logger.info("Found %d JP2 file(s) under %s.", len(jp2_files), root)
+    # Collect files to convert
+    tasks: list[tuple[pathlib.Path, Callable]] = []
+
+    if not skip_jp2:
+        jp2_files = list(_iter_jp2_files(root))
+        logger.info("Found %d JP2 file(s) under %s.", len(jp2_files), root)
+        tasks.extend((p, jp2_to_cog) for p in jp2_files)
+    else:
+        jp2_files = []
+
+    if not skip_dtm:
+        img_files = list(_iter_img_files(root))
+        logger.info("Found %d DTM .IMG file(s) under %s.", len(img_files), root)
+        tasks.extend((p, img_to_cog) for p in img_files)
+    else:
+        img_files = []
+
+    if not tasks:
+        logger.warning("No files found to convert under %s.", root)
+        return {"converted": 0, "skipped": 0, "failed": 0}
 
     counts: dict[str, int] = {"converted": 0, "skipped": 0, "failed": 0}
 
-    actual_workers = _safe_worker_count(jp2_files, workers)
+    # Memory-safe worker count is computed from JP2s (the larger files);
+    # IMG files are typically smaller in memory since they're already raw.
+    size_reference = jp2_files if jp2_files else img_files
+    actual_workers = _safe_worker_count(size_reference, workers)
 
     pool = concurrent.futures.ProcessPoolExecutor(
         max_workers=actual_workers,
         mp_context=multiprocessing.get_context("spawn"),
         initializer=_worker_init,
-        max_tasks_per_child=1,  # fresh process per JP2 — OS reclaims all heap
+        max_tasks_per_child=1,
     )
     future_to_path = {
-        pool.submit(jp2_to_cog, p, overwrite): p for p in jp2_files
+        pool.submit(convert_fn, p, overwrite): p
+        for p, convert_fn in tasks
     }
     try:
         for future in concurrent.futures.as_completed(future_to_path):
-            jp2_path = future_to_path[future]
+            src_path = future_to_path[future]
             try:
                 result = future.result()
                 if result is None:
                     counts["failed"] += 1
                 else:
-                    cog = _cog_path(jp2_path)
-                    # A freshly converted COG is newer than its source JP2.
-                    if cog.exists() and cog.stat().st_mtime >= jp2_path.stat().st_mtime:
+                    # Check if the COG sidecar was freshly written
+                    cog = src_path.with_suffix(".tif")
+                    if cog.exists() and cog.stat().st_mtime >= src_path.stat().st_mtime:
                         counts["converted"] += 1
                     else:
                         counts["skipped"] += 1
             except Exception as exc:
-                logger.error("Worker error for %s: %s", jp2_path.name, exc)
+                logger.error("Worker error for %s: %s", src_path.name, exc)
                 counts["failed"] += 1
     except KeyboardInterrupt:
-        # cancel_futures=True drops queued-but-not-started work immediately;
-        # wait=False returns without blocking on already-running workers (which
-        # are killed by SIGINT via _worker_init restoring SIG_DFL above).
         pool.shutdown(wait=False, cancel_futures=True)
         logger.warning("Interrupted — %d converted so far.", counts["converted"])
         raise SystemExit(130)
@@ -432,7 +590,7 @@ def geographic_split(
     """
     # Project to a planar CRS before computing centroids to avoid the
     # "Geometry is in a geographic CRS" UserWarning from geopandas.
-    projected = index.to_crs("+proj=eqc +a=3396190 +b=3376200 +no_defs")
+    projected = index.to_crs(MARS_GEOGRAPHIC_CRS)
     centroids = projected.geometry.centroid.to_crs(index.crs)
     coords: np.ndarray = (
         centroids.x.to_numpy() if split_axis == "longitude"
@@ -476,13 +634,13 @@ if __name__ == "__main__":
     import json
 
     _parser = argparse.ArgumentParser(
-        description="Convert HiRISE JP2 files to Cloud-Optimized GeoTIFF sidecars."
+        description="Convert HiRISE JP2 and DTM .IMG files to Cloud-Optimized GeoTIFF sidecars."
     )
     _parser.add_argument(
         "--root",
         required=True,
         type=pathlib.Path,
-        help="Dataset root directory containing JP2 files.",
+        help="Dataset root directory containing JP2 and/or IMG files.",
     )
     _parser.add_argument(
         "--workers",
@@ -495,6 +653,16 @@ if __name__ == "__main__":
         "--overwrite",
         action="store_true",
         help="Re-convert files that already have a .tif sidecar.",
+    )
+    _parser.add_argument(
+        "--skip-jp2",
+        action="store_true",
+        help="Skip JP2 orthoimage conversion (only process DTM .IMG files).",
+    )
+    _parser.add_argument(
+        "--skip-dtm",
+        action="store_true",
+        help="Skip DTM .IMG conversion (only process JP2 orthoimages).",
     )
     _args = _parser.parse_args()
 
@@ -509,4 +677,10 @@ if __name__ == "__main__":
             format="%(asctime)s  %(levelname)-8s  %(message)s",
         )
 
-    convert_all(_args.root, workers=_args.workers, overwrite=_args.overwrite)
+    convert_all(
+        _args.root,
+        workers=_args.workers,
+        overwrite=_args.overwrite,
+        skip_jp2=_args.skip_jp2,
+        skip_dtm=_args.skip_dtm,
+    )

@@ -17,20 +17,21 @@ if str(_SRC) not in sys.path:
 
 import torch
 
-from dataset.mars_hirise import _SPATIAL_TOL, MarsHiRISE
+from dataset.mars_hirise import MarsHiRISE
+from dataset.mars_hirise_base import _SPATIAL_TOL
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: _merge_tiles channel-count handling
+# Unit tests: merge_tiles channel-count handling
 # ---------------------------------------------------------------------------
 
 
 class TestMergeTiles:
-    """Verify _merge_tiles handles uniform and mismatched channel counts."""
+    """Verify merge_tiles handles uniform and mismatched channel counts."""
 
     def test_single_tile_returned_unchanged(self):
         t = torch.rand(3, 16, 16)
-        result = MarsHiRISE._merge_tiles([t])
+        result = MarsHiRISE.merge_tiles([t])
         assert result.shape == t.shape
         assert torch.allclose(result, t)
 
@@ -38,7 +39,7 @@ class TestMergeTiles:
         t1 = torch.zeros(3, 8, 8)
         t2 = torch.ones(3, 8, 8)
         # First-non-zero-wins: t1 is all zeros so t2 fills in.
-        result = MarsHiRISE._merge_tiles([t1, t2])
+        result = MarsHiRISE.merge_tiles([t1, t2])
         assert result.shape == (3, 8, 8)
         assert torch.allclose(result, t2)
 
@@ -46,7 +47,7 @@ class TestMergeTiles:
         t1 = torch.zeros(1, 4, 4)
         t1[0, 0, 0] = 0.5
         t2 = torch.ones(1, 4, 4)
-        result = MarsHiRISE._merge_tiles([t1, t2])
+        result = MarsHiRISE.merge_tiles([t1, t2])
         # Position (0,0) was set in t1 → t2 must not overwrite it.
         assert result[0, 0, 0] == pytest.approx(0.5)
         # Zero position in t1 → filled by t2.
@@ -57,18 +58,18 @@ class TestMergeTiles:
         t3 = torch.ones(3, 8, 8)  # 3-channel tile
         t1 = torch.ones(1, 8, 8) * 0.5  # 1-channel tile (simulates RED-only)
         # Must not raise AssertionError.
-        result = MarsHiRISE._merge_tiles([t3, t1])
+        result = MarsHiRISE.merge_tiles([t3, t1])
         assert result.shape[0] == 3  # max channels
 
     def test_output_channels_equals_max_input_channels(self):
         tiles = [torch.rand(c, 4, 4) for c in (3, 1, 3)]
-        result = MarsHiRISE._merge_tiles(tiles)
+        result = MarsHiRISE.merge_tiles(tiles)
         assert result.shape[0] == 3
 
     def test_spatial_dims_match_max(self):
         t1 = torch.ones(2, 4, 6)
         t2 = torch.ones(2, 3, 5)
-        result = MarsHiRISE._merge_tiles([t1, t2])
+        result = MarsHiRISE.merge_tiles([t1, t2])
         assert result.shape == (2, 4, 6)
 
 

@@ -16,7 +16,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from dataset.mars_hirise import _download_file, _download_many, _worker_process
+from dataset.mars_hirise_base import _download_file, _download_many, _worker_process
 
 _URL = "https://hirise-pds.lpl.arizona.edu/PDS/test/PSP_001430_1780_RED.JP2"
 
@@ -401,7 +401,7 @@ class TestWorkerProcess:
         from unittest.mock import AsyncMock, patch
 
         mock_download_many = AsyncMock(return_value=None)
-        with patch("dataset.mars_hirise._download_many", mock_download_many):
+        with patch("dataset.mars_hirise_base._download_many", mock_download_many):
             _worker_process([(_URL, dest)], concurrency_per_process=1, stop_event=stop_event)
 
         mock_download_many.assert_called_once_with(
