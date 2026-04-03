@@ -40,6 +40,8 @@ import rasterio
 import rasterio.enums
 import rasterio.shutil
 
+from dataset.mars_hirise_base import MARS_GEOGRAPHIC_CRS
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -588,7 +590,7 @@ def geographic_split(
     """
     # Project to a planar CRS before computing centroids to avoid the
     # "Geometry is in a geographic CRS" UserWarning from geopandas.
-    projected = index.to_crs("+proj=eqc +a=3396190 +b=3376200 +no_defs")
+    projected = index.to_crs(MARS_GEOGRAPHIC_CRS)
     centroids = projected.geometry.centroid.to_crs(index.crs)
     coords: np.ndarray = (
         centroids.x.to_numpy() if split_axis == "longitude"
