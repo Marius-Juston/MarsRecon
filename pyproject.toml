@@ -25,6 +25,28 @@ dev = [
 experiment = [
     "wandb>=0.19",
 ]
+depthfm = [
+    "accelerate>=1.13.0",
+    "diffusers>=0.37.1",
+    "einops>=0.8.2",
+    "jsonargparse[signatures]>=4.47.0",
+    "lightning>=2.6.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "omegaconf>=2.3.0",
+    "pandas>=3.0.1",
+    "pillow>=12.1.1",
+    "rasterio>=1.5.0",
+    "safetensors>=0.7.0",
+    "scikit-image>=0.26.0",
+    "scipy>=1.17.1",
+    "seaborn>=0.13.2",
+    "tifffile>=2026.3.3",
+    "torchmetrics>=1.9.0",
+    "tqdm>=4.67.3",
+    "transformers>=5.5.0",
+    "wandb>=0.25.1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

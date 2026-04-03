@@ -1,0 +1,150 @@
+# Mars DepthFM Training Configuration — SD 2.1 + DepthFM checkpoint
+# Optimized for 4x NVIDIA A6000 (48GB VRAM each) + 128 CPU cores
+
+model:
+  # "sd21" uses UNet from DepthFM checkpoint; "sd35" uses MMDiT-X from SD 3.5 Medium
+  backend: "sd21"
+
+  # SD 2.1 path: DepthFM checkpoint (contains fine-tuned UNet + VAE config)
+  depthfm_checkpoint: "checkpoints/depthfm-v1.ckpt"
+  # The VAE from SD 2.1 — frozen during training
+  vae_id: "stabilityai/stable-diffusion-2-1"
+
+  # SD 3.5 path (only used if backend: "sd35")
+  sd35_model_id: "stabilityai/stable-diffusion-3.5-medium"
+
+  # Whether to use LoRA or full fine-tuning
+  # Full FT for SD 2.1 (865M params fits easily), LoRA for SD 3.5 (2.5B params)
+  use_lora: false
+  lora_rank: 64
+  lora_alpha: 64
+
+  # Freeze encoder half of UNet, only train decoder
+  # The encoder extracts features from the image conditioning;
+  # the decoder generates the depth. Freezing encoder preserves image prior.
+  freeze_encoder: false
+
+  # Gradient checkpointing to save VRAM (trades compute for memory)
+  gradient_checkpointing: true
+
+data:
+  # Pre-computed latent directory (from precompute_latents.py)
+  # Set to null to encode on-the-fly (slower but no disk pre-processing needed)
+  latent_dir: "data/latents/train"
+  val_latent_dir: "data/latents/val"
+
+  # Raw data directories (used if latent_dir is null, or for precompute script)
+  train_image_dir: "data/train/images"
+  train_dtm_dir: "data/train/dtms"
+  train_confidence_dir: "data/train/confidence"  # optional, set null if unavailable
+  val_image_dir: "data/val/images"
+  val_dtm_dir: "data/val/dtms"
+
+  # Resolution: images/DTMs are cropped to this size before VAE encoding
+  # SD 2.1 VAE works at 8x downscaling: 512px -> 64x64 latent
+  resolution: 512
+
+  # DTM normalization strategy: "minmax" or "log"
+  # "minmax": per-tile min-max to [0, 1], then scale to [-1, 1]
+  # "log": log(dtm - min + 1), then min-max to [-1, 1]
+  # For orbital Mars DTMs, minmax is recommended (see README discussion)
+  dtm_normalization: "minmax"
+
+  # Use both L and R stereo images as separate training samples
+  use_stereo_augmentation: true
+
+  # Standard augmentations
+  random_horizontal_flip: true
+  random_vertical_flip: true
+  random_rotation_degrees: 10
+  brightness_jitter: 0.1  # simulates different solar illumination angles
+  contrast_jitter: 0.1
+
+training:
+  # Effective batch size = per_gpu_batch * num_gpus * gradient_accumulation
+  # = 2 * 4 * 4 = 32
+  per_gpu_batch_size: 2
+  gradient_accumulation_steps: 4
+  num_gpus: 4
+
+  # Total training steps
+  max_steps: 50000
+  
+  # Learning rate with warmup + cosine decay
+  learning_rate: 3.0e-5
+  weight_decay: 0.01
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 1000
+  lr_warmup_ratio: 0.0  # alternative: fraction of max_steps
+
+  # Optimizer
+  optimizer: "adamw"  # "adamw" or "adam8bit" (bitsandbytes)
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # Mixed precision
+  mixed_precision: "bf16"
+
+  # Flow matching hyperparameters
+  flow_matching:
+    # Timestep sampling distribution: "uniform" or "logit_normal"
+    # logit_normal concentrates samples around t=0.5 where the velocity field
+    # changes most — DepthFM uses this and found it helps convergence
+    timestep_sampling: "logit_normal"
+    logit_normal_mean: 0.0
+    logit_normal_std: 1.0
+
+    # Noise augmentation on the source distribution (image side)
+    # Smooths the base density; DepthFM uses ~0.997 for alpha_bar
+    noise_augmentation_alpha: 0.997
+
+    # Minimum smoothing factor sigma_min to avoid singularities
+    sigma_min: 1.0e-4
+
+  # Loss weights
+  losses:
+    # Primary CFM velocity loss (always active)
+    velocity_weight: 1.0
+
+    # Auxiliary surface normals consistency loss
+    # Computed from spatial gradients of predicted vs GT depth
+    normals_weight: 0.1
+    # Only activate normals loss after this many steps
+    # (let the velocity field stabilize first)
+    normals_start_step: 2000
+
+    # Optional: confidence weighting from stereo matching quality
+    # Downweights loss in regions where GT DTM is unreliable
+    use_confidence_weighting: false
+
+  # Validation and checkpointing
+  val_every_steps: 1.0
+  save_every_steps: 5000
+  log_every_steps: 50
+  num_val_samples: 8  # number of validation images to generate
+
+  # Logging
+  logger: "wandb"  # "wandb" or "tensorboard"
+  project_name: "mars-depthfm"
+  run_name: "sd21-finetune-v1"
+
+  # Checkpoint directory
+  output_dir: "checkpoints/mars_depthfm"
+  resume_from: null  # path to resume training
+
+  # EMA for stable inference weights
+  use_ema: true
+  ema_decay: 0.9999
+
+  # Dataloader workers — use all 128 CPU cores
+  # 128 cores / 4 GPUs = 32 workers per GPU
+  num_workers: 32
+  pin_memory: true
+  prefetch_factor: 4
+
+# DeepSpeed config (ZeRO Stage 2)
+deepspeed:
+  enabled: true
+  config_path: "configs/deepspeed_zero2.json"
