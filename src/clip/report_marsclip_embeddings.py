@@ -23,9 +23,9 @@ from matplotlib import pyplot as plt
 
 from clip.marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
 from clip.train_marsclip_mae import (
-    MAE_MODEL_CONFIG_DEFAULTS,
     build_mae_dataloader,
     build_mae_model_from_config,
+    infer_mae_config_from_state_dict,
     load_mae_checkpoint,
     resolve_map_location,
 )
@@ -58,64 +58,13 @@ def load_trained_mae_from_checkpoint(
     """Load a trained Stage A MAE and the associated checkpoint state."""
     checkpoint = torch.load(checkpoint_path, map_location=resolve_map_location(map_location))
     config = dict(checkpoint.get("config", {}))
-    config.update(_infer_mae_config_from_state_dict(checkpoint.get("model_state", {}), config))
+    config.update(
+        infer_mae_config_from_state_dict(checkpoint.get("model_state", {}), config)
+    )
     model = build_mae_model_from_config(config)
     state = load_mae_checkpoint(checkpoint_path, model, map_location=map_location)
     state["config"] = config
     return model, state
-
-
-def _count_transformer_layers(state_dict: dict[str, Any], prefix: str) -> int | None:
-    indices: set[int] = set()
-    for key in state_dict:
-        if key.startswith(prefix):
-            parts = key.split(".")
-            if len(parts) > 2 and parts[2].isdigit():
-                indices.add(int(parts[2]))
-    if not indices:
-        return None
-    return max(indices) + 1
-
-
-def _infer_mae_config_from_state_dict(
-    state_dict: dict[str, Any],
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Infer missing MAE architecture values from checkpoint tensor shapes."""
-    cfg = dict(config or {})
-    inferred: dict[str, Any] = {}
-    patch_weight = state_dict.get("patch_embed.weight")
-    encoder_pos = state_dict.get("encoder_pos_embed")
-    decoder_pos = state_dict.get("decoder_pos_embed")
-
-    if torch.is_tensor(patch_weight):
-        inferred.setdefault("patch_size_px", int(patch_weight.shape[-1]))
-        inferred.setdefault("in_channels", int(patch_weight.shape[1]))
-        inferred.setdefault("encoder_dim", int(patch_weight.shape[0]))
-    if torch.is_tensor(encoder_pos):
-        inferred.setdefault("encoder_dim", int(encoder_pos.shape[-1]))
-        num_patches = int(encoder_pos.shape[1])
-        grid = int(round(num_patches ** 0.5))
-        patch_size_px = int(cfg.get("patch_size_px", inferred.get("patch_size_px", MAE_MODEL_CONFIG_DEFAULTS["patch_size_px"])))
-        inferred.setdefault("image_size", grid * patch_size_px)
-    if torch.is_tensor(decoder_pos):
-        inferred.setdefault("decoder_dim", int(decoder_pos.shape[-1]))
-
-    encoder_depth = _count_transformer_layers(state_dict, "encoder.layers.")
-    if encoder_depth is not None:
-        inferred.setdefault("encoder_depth", encoder_depth)
-    decoder_depth = _count_transformer_layers(state_dict, "decoder.layers.")
-    if decoder_depth is not None:
-        inferred.setdefault("decoder_depth", decoder_depth)
-
-    # Attention head counts are not recoverable from tensor shapes alone.
-    inferred.setdefault("encoder_heads", int(cfg.get("encoder_heads", MAE_MODEL_CONFIG_DEFAULTS["encoder_heads"])))
-    inferred.setdefault("decoder_heads", int(cfg.get("decoder_heads", MAE_MODEL_CONFIG_DEFAULTS["decoder_heads"])))
-    inferred.setdefault(
-        "min_valid_fraction",
-        float(cfg.get("min_valid_fraction", MAE_MODEL_CONFIG_DEFAULTS["min_valid_fraction"])),
-    )
-    return {key: value for key, value in inferred.items() if key not in cfg}
 
 
 def _serialize_embedding_record(
@@ -409,7 +358,7 @@ def save_embedding_report(
     return summary
 
 
-def main() -> None:  # pragma: no cover
+def main() -> None:
     parser = argparse.ArgumentParser(description="Create a Stage A embedding sanity report.")
     parser.add_argument("--checkpoint", type=pathlib.Path, required=True)
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))

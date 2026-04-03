@@ -4,21 +4,37 @@ This document turns the embedding workflow into a finite execution plan. The wor
 
 ## Status Snapshot
 
-Current position: Phase 0 and all of Stage A are complete in the current environment. We now have a reusable GPU-backed Stage A MAE checkpoint, a longer non-smoke CUDA run, and embedding sanity artifacts. The next gap is Stage B1: building workflow-aligned paired local/global crops and reusing the Stage A encoder in the multimodal path.
+Current position: Phase 0 and all of Stage A are complete in the current environment. We now have a reusable GPU-backed Stage A MAE checkpoint, a longer non-smoke CUDA run, embedding sanity artifacts, the paired multiscale crop data foundation, the first workflow-aligned multimodal alignment model, and a runnable paired multiscale training utility stack. The next gap is running and validating the first end-to-end paired multiscale alignment smoke training experiment on top of that foundation.
 
-Overall workflow progress: `[#######---] ~68%`
+Overall workflow progress: `[#######---] ~76%`
 
 This percentage is intentionally conservative. It reflects alignment to the full workflow, not just the amount of code already written.
 
 ## Comparison References
 
 - `SatMAE`
-  Use as inspiration for Stage A multi-spectral masked autoencoding, band handling, and later Stage B transfer comparisons.
+  Use as inspiration for Stage A multi-spectral masked autoencoding, band handling, and later multimodal alignment transfer comparisons.
   Source: https://sustainlab-group.github.io/SatMAE/
 
 - `Scale-MAE`
   Use as inspiration for scale/GSD-aware Stage A ablations, especially scale encoding and future low/high-frequency reconstruction losses.
   Source: https://arxiv.org/pdf/2212.14532
+
+- `RemoteCLIP`
+  Use as inspiration for remote-sensing image-text alignment and for treating semantic text alignment as a real foundation-model objective rather than only a downstream fine-tuning task.
+  Source: https://www.catalyzex.com/paper/remoteclip-a-vision-language-foundation-model
+
+- `GeoCLIP`
+  Use as inspiration for location-image contrastive alignment and Fourier-style coordinate features.
+  Source: https://openreview.net/forum?id=I18BXotQ7j
+
+- `Sphere2Vec`
+  Use as inspiration for sphere-aware location encoding instead of flat-Euclidean coordinate handling.
+  Source: https://openreview.net/forum?id=FS0XKbpkdOu
+
+- `What to align in multimodal contrastive learning?`
+  Use as inspiration for aligning images to a fused context target, instead of indiscriminately aligning every modality pair the same way.
+  Source: https://openreview.net/pdf?id=Pe3AxLq6Wf
 
 ## Stage Tracker
 
@@ -183,11 +199,11 @@ Final report artifacts:
 Exit criteria:
 - We have a reusable Stage A pretrained vision encoder
 
-### 5. Stage B1: Paired Multi-Scale Crops And Workflow-Aligned Encoders
+### 5. Stage B1: Paired Multi-Scale Context Alignment Foundation
 
-Status: `pending`
+Status: `in_progress`
 
-Progress: `[#---------] 10%`
+Progress: `[####------] 45%`
 
 Why this is not zero:
 - We already have a baseline text path, geo-context path, and contrastive model scaffold
@@ -202,39 +218,62 @@ Deliverables:
 - Optional FiLM conditioning or another explicit geometry-conditioning mechanism
 - Context fusion target for text and location
 
+What exists now:
+- paired local/global crop record builder on top of Stage A patch records
+- paired multiscale dataset returning aligned local/global image crops at a shared centre
+- shared text/location/geo metadata contract for the crop pair
+- paired multiscale batch collator for local/global images plus shared text/context
+- Stage A MAE encoder-only reuse path for later multimodal alignment
+- first paired multiscale alignment model scaffold with shared local/global visual backbone reuse
+- Fourier-feature geometry encoder over acquisition angles and cyclic viewing metadata
+- sphere-aware location encoder using spherical coordinates plus a sine-network head
+- gated text-location context fusion
+- geometry-conditioned FiLM modulation of visual embeddings
+- local-context, global-context, and cross-scale contrastive losses
+- focused unit tests for paired-crop geometry, color-only filtering, and batch collation
+- focused unit tests for alignment-model shapes, loss finiteness, and Stage A encoder reuse
+
 Validation:
 - Unit tests for paired-crop validity
 - Tests for crop overlap / validity intersection rules
 - Tests for encoder output shapes and normalization
-- Smoke test for one Stage B batch
+- Smoke test for one paired multiscale batch
+- One-batch multimodal alignment forward pass with finite losses
 
 Final report artifacts:
 - Paired local/global crop figure
-- Stage B encoder diagram
+- Multimodal alignment encoder diagram
 - Context fusion diagram
+- Literature-backed design table for geometry, location, fusion, and contrastive objectives
 
 Exit criteria:
 - We can produce aligned local/global image embeddings and context targets for one batch
 
-### 6. Stage B2: Contrastive Training Aligned To The Workflow
+### 6. Stage B2: Multimodal Contrastive Alignment Training
 
-Status: `pending`
+Status: `in_progress`
 
-Progress: `[----------] 0%`
+Progress: `[###-------] 30%`
 
 Deliverables:
-- Training loop for Stage B
+- Training loop for multimodal alignment
 - Soft-target or workflow-appropriate contrastive loss
 - Cross-scale consistency loss
 - Logging of image-text, image-context, and scale-consistency metrics
+- Stage A checkpoint loader for the alignment backbone
+- Paired multiscale tokenizer fitting on the train split
+- Alignment checkpoint save/load helpers for later resume support
+- Split-aware paired multiscale dataloader builder
+- Cached paired-record support for faster reruns
 
 Validation:
 - One-epoch smoke run
 - Loss terms are finite and decrease in a short run
 - Checkpoint load / resume works
+- Focused unit tests for train/eval batch utilities and checkpoint round-trips
 
 Final report artifacts:
-- Stage B loss curves
+- Multimodal alignment loss curves
 - Training setup table
 - Qualitative retrieval examples during training
 
@@ -307,22 +346,22 @@ Exit criteria:
 
 The next best step is now:
 
-`Start Stage B1: paired local/global crops and workflow-aligned context encoders.`
+`Start paired multiscale context alignment: paired local/global crops and workflow-aligned context encoders.`
 
 That means:
 - build paired local/global crop sampling on top of the Stage A patch bridge
 - load and reuse the selected Stage A encoder checkpoint
 - define the first workflow-aligned location / geometry / text context batch contract
-- keep Stage B tests as strict as Stage A tests
+- keep multimodal alignment tests as strict as Stage A tests
 - keep tests and reconstruction previews first-class from the start
 
 Concretely, the immediate next actions are:
 - add a paired-crop record builder for local and global views from the same dominant observation
-- add a Stage B dataset / collator that returns local image, global image, text, and geo-context
+- add a paired multiscale dataset / collator that returns local image, global image, text, and geo-context
 - wire the Stage A checkpoint in as the visual backbone initialization
 - add unit tests for paired-crop validity, overlap, and metadata alignment
 
-This is the highest-leverage next move because Stage A now has a selected reusable checkpoint, and the next remaining structural gap is building the workflow-aligned Stage B input pipeline around it.
+This is the highest-leverage next move because Stage A now has a selected reusable checkpoint, and the next remaining structural gap is building the workflow-aligned multimodal alignment input pipeline around it.
 
 ## Done Criteria For The Whole Project
 
@@ -330,7 +369,7 @@ The project is complete when all of the following are true:
 
 - Stage A patch dataset exists and is validated
 - Stage A MAE pretraining runs and produces a reusable checkpoint
-- Stage B paired multi-scale alignment runs on top of the Stage A encoder
+- paired multi-scale multimodal alignment runs on top of the Stage A encoder
 - Retrieval and ablation evaluation scripts produce stable results
 - Final report figures and tables are generated from the codebase
 - Focused tests pass for all implemented MarsCLIP blocks

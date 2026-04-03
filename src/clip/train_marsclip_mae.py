@@ -145,6 +145,69 @@ def build_mae_model_from_config(config: dict[str, Any] | None = None) -> MarsMas
     return MarsMaskedAutoencoder(**resolve_mae_model_config(config))
 
 
+def _count_transformer_layers(state_dict: dict[str, Any], prefix: str) -> int | None:
+    indices: set[int] = set()
+    for key in state_dict:
+        if key.startswith(prefix):
+            parts = key.split(".")
+            if len(parts) > 2 and parts[2].isdigit():
+                indices.add(int(parts[2]))
+    if not indices:
+        return None
+    return max(indices) + 1
+
+
+def infer_mae_config_from_state_dict(
+    state_dict: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Infer missing MAE architecture values from checkpoint tensor shapes."""
+    cfg = dict(config or {})
+    inferred: dict[str, Any] = {}
+    patch_weight = state_dict.get("patch_embed.weight")
+    encoder_pos = state_dict.get("encoder_pos_embed")
+    decoder_pos = state_dict.get("decoder_pos_embed")
+
+    if torch.is_tensor(patch_weight):
+        inferred.setdefault("patch_size_px", int(patch_weight.shape[-1]))
+        inferred.setdefault("in_channels", int(patch_weight.shape[1]))
+        inferred.setdefault("encoder_dim", int(patch_weight.shape[0]))
+    if torch.is_tensor(encoder_pos):
+        inferred.setdefault("encoder_dim", int(encoder_pos.shape[-1]))
+        num_patches = int(encoder_pos.shape[1])
+        grid = int(round(num_patches ** 0.5))
+        patch_size_px = int(
+            cfg.get(
+                "patch_size_px",
+                inferred.get("patch_size_px", MAE_MODEL_CONFIG_DEFAULTS["patch_size_px"]),
+            )
+        )
+        inferred.setdefault("image_size", grid * patch_size_px)
+    if torch.is_tensor(decoder_pos):
+        inferred.setdefault("decoder_dim", int(decoder_pos.shape[-1]))
+
+    encoder_depth = _count_transformer_layers(state_dict, "encoder.layers.")
+    if encoder_depth is not None:
+        inferred.setdefault("encoder_depth", encoder_depth)
+    decoder_depth = _count_transformer_layers(state_dict, "decoder.layers.")
+    if decoder_depth is not None:
+        inferred.setdefault("decoder_depth", decoder_depth)
+
+    inferred.setdefault(
+        "encoder_heads",
+        int(cfg.get("encoder_heads", MAE_MODEL_CONFIG_DEFAULTS["encoder_heads"])),
+    )
+    inferred.setdefault(
+        "decoder_heads",
+        int(cfg.get("decoder_heads", MAE_MODEL_CONFIG_DEFAULTS["decoder_heads"])),
+    )
+    inferred.setdefault(
+        "min_valid_fraction",
+        float(cfg.get("min_valid_fraction", MAE_MODEL_CONFIG_DEFAULTS["min_valid_fraction"])),
+    )
+    return {key: value for key, value in inferred.items() if key not in cfg}
+
+
 def count_trainable_parameters(model: torch.nn.Module) -> tuple[int, int]:
     """Return (trainable, total) parameter counts for a model."""
     total = sum(parameter.numel() for parameter in model.parameters())
@@ -277,7 +340,7 @@ def init_wandb_logger(
     mode: str = "disabled",
     project: str = "marsclip-stagea",
     run_name: str | None = None,
-    out_dir: pathlib.Path | str = pathlib.Path("../../tests"),
+    out_dir: pathlib.Path | str = pathlib.Path("."),
     log_dir: pathlib.Path | str | None = None,
     config: dict[str, Any] | None = None,
 ) -> WandbLogger | None:
@@ -1210,7 +1273,7 @@ def run_mae_training(
     return summary
 
 
-def main() -> None:  # pragma: no cover
+def main() -> None:
     parser = argparse.ArgumentParser(description="Run a minimal Stage A MAE training loop.")
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))
     parser.add_argument(

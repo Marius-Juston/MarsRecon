@@ -82,7 +82,7 @@ The encoder is a standard Vision Transformer (ViT-Base or ViT-Large) as describe
 
 The encoder processes only the unmasked, valid tokens — the remaining 25% of the original sequence after 75% MAE masking is applied on top of nodata dropping. This is the efficiency advantage of MAE: the encoder never sees the full sequence, so training speed and memory are proportional to the small visible subset.
 
-The output of the encoder is a set of latent vectors h_i ∈ ℝ^d, one per visible token, plus a prepended CLS token h_cls that aggregates global information via self-attention. Stage A's CLS token is not used for reconstruction (the decoder receives all token positions); it becomes the primary output for Stage B.
+The output of the encoder is a set of latent vectors h_i ∈ ℝ^d, one per visible token, plus a prepended CLS token h_cls that aggregates global information via self-attention. Stage A's CLS token is not used for reconstruction (the decoder receives all token positions); it becomes the primary output for the multimodal alignment block.
 
 ### A.7 Decoder and reconstruction loss
 
@@ -100,21 +100,21 @@ where M is the set of masked patch indices and x_i are the calibrated I/F pixel 
 
 ### A.8 What Stage A produces
 
-After pretraining on the full HiRISE dataset (no labels, no metadata beyond band availability and GSD), the ViT encoder has learned to predict masked surface patches from visible context. This requires learning: spatial autocorrelation in Martian terrain (crater rims predict crater floors), spectral relationships (NIR reflectance correlates with iron oxide mineralogy), and texture statistics (aeolian ripples have characteristic spatial frequencies). The encoder weights are saved and used to initialise the vision encoder in Stage B.
+After pretraining on the full HiRISE dataset (no labels, no metadata beyond band availability and GSD), the ViT encoder has learned to predict masked surface patches from visible context. This requires learning: spatial autocorrelation in Martian terrain (crater rims predict crater floors), spectral relationships (NIR reflectance correlates with iron oxide mineralogy), and texture statistics (aeolian ripples have characteristic spatial frequencies). The encoder weights are saved and used to initialise the vision encoder in the multimodal alignment block.
 
 ---
 
-## Stage B: contrastive multi-modal alignment
+## Multimodal Alignment: contrastive multi-modal alignment
 
 ### B.1 Objective
 
-Stage B takes the visual encoder from Stage A and aligns its output with three auxiliary modalities — planetary location, orbital geometry, and geological text — in a shared d-dimensional embedding space. The alignment is accomplished through contrastive learning: matched pairs (an image patch and its corresponding location/text) are pulled together in embedding space, while unmatched pairs are pushed apart.
+The multimodal alignment block takes the visual encoder from Stage A and aligns its output with three auxiliary modalities — planetary location, orbital geometry, and geological text — in a shared d-dimensional embedding space. The alignment is accomplished through contrastive learning: matched pairs (an image patch and its corresponding location/text) are pulled together in embedding space, while unmatched pairs are pushed apart.
 
 This stage follows the SatCLIP paradigm (Klemmer et al., 2025, "SatCLIP: Global, General-Purpose Location Embeddings with Satellite Imagery", AAAI), which demonstrated that contrastive pretraining between satellite imagery and geographic coordinates produces general-purpose location embeddings that outperform task-specific models on diverse downstream tasks. MarsCLIP extends SatCLIP in three ways: it conditions on orbital viewing geometry via FiLM (to decouple illumination from geology), it aligns with geological text (to enable zero-shot retrieval), and it enforces cross-scale consistency via the CACo loss (to prevent scale collapse in the visual manifold).
 
 ### B.2 Sampler extension: paired multi-scale crops
 
-Stage B requires each training sample to contain two image crops at different scales, centred on the same geographic point. The local crop I_L is a 0.005° × 0.005° window (approximately 593 × 593 pixels) — the same size used in Stage A. The global crop I_G is a 0.015° × 0.015° window (approximately 1779 × 1779 pixels) providing 3× the spatial context, downsampled to the same pixel dimensions as I_L so both pass through the same ViT.
+The multimodal alignment block requires each training sample to contain two image crops at different scales, centred on the same geographic point. The local crop I_L is a 0.005° × 0.005° window (approximately 593 × 593 pixels) — the same size used in Stage A. The global crop I_G is a 0.015° × 0.015° window (approximately 1779 × 1779 pixels) providing 3× the spatial context, downsampled to the same pixel dimensions as I_L so both pass through the same ViT.
 
 The sampler validates that both I_L and I_G intersect the strip polygon. Since I_G is larger, some centres that are valid for I_L will produce an I_G that extends beyond the strip boundary. These centres are excluded from the paired-crop set — the sampler maintains two validity masks and takes their intersection.
 
@@ -263,7 +263,7 @@ Without IoVA gating, the model would learn to align valid-data embeddings with n
 
 ### B.10 Total loss
 
-The complete Stage B objective combines the soft-target alignment loss (applied at both scales) and the CACo cross-scale consistency loss:
+The complete multimodal alignment objective combines the soft-target alignment loss (applied at both scales) and the CACo cross-scale consistency loss:
 
 ```
 L_total = L_soft(v_L, z) + L_soft(v_G, z) + λ · L_CACo(v_L, v_G)
@@ -285,9 +285,9 @@ where λ is a weighting hyperparameter (default 0.5) that balances semantic alig
 | SH degree L | 40 | Matches SatCLIP-ViT16-L40 configuration |
 | RFF matrix σ | 10.0 | Controls the frequency bandwidth of the geometry encoding |
 
-### B.12 What Stage B produces
+### B.12 What the multimodal alignment block produces
 
-After Stage B, each encoder can be used independently:
+After multimodal alignment, each encoder can be used independently:
 
 **Vision encoder E_V** maps any HiRISE patch (with its viewing geometry) to an illumination-invariant d-dimensional vector on the unit hypersphere. Patches showing similar geology embed nearby, regardless of solar angle, season, or CCD binning.
 
@@ -316,7 +316,7 @@ The existing MarsHiRISE dataset and HiRISEGeoSampler require the following exten
 | `nodata_mask` | bool[H, W] | Per-pixel validity (from calibration fix) |
 | `map_scale` | float32 | MAP_SCALE from LBL (GSD in m/px) |
 
-**3. Paired-crop sampler.** `HiRISEGeoSampler` must yield `(I_L, I_G)` pairs for Stage B. For each valid centre, the sampler checks that the 3× global crop also intersects the strip polygon. Centres where the global crop extends beyond the strip are excluded from the paired-crop set. Stage A uses the existing single-crop sampler.
+**3. Paired-crop sampler.** `HiRISEGeoSampler` must yield `(I_L, I_G)` pairs for multimodal alignment. For each valid centre, the sampler checks that the 3× global crop also intersects the strip polygon. Centres where the global crop extends beyond the strip are excluded from the paired-crop set. Stage A uses the existing single-crop sampler.
 
 **4. Rationale expansion cache.** A JSON file mapping each unique `RATIONALE_DESC` to its LLM-expanded paragraph. Generated once offline. The spatial index GeoDataFrame carries a `rationale` column (added during `_build_spatial_index`) so the mapping from patch → observation → rationale is O(1) at load time.
 
@@ -332,7 +332,7 @@ The architecture integrates techniques from the following peer-reviewed sources,
 2. Cong, Y. et al. (2022). SatMAE: Pre-training Transformers for Temporal and Multi-Spectral Satellite Imagery. NeurIPS. — Independent spectral band tokenization, multi-spectral masked autoencoder for EO (§A.3).
 3. Reed, C. et al. (2023). Scale-MAE: A Scale-Aware Masked Autoencoder for Multiscale Geospatial Representation Learning. ICCV. — Continuous GSD sinusoidal encoding S(ρ) (§A.5).
 4. Dosovitskiy, A. et al. (2021). An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale. ICLR. — ViT encoder architecture (§A.6).
-5. Klemmer, K. et al. (2025). SatCLIP: Global, General-Purpose Location Embeddings with Satellite Imagery. AAAI. — Contrastive location-image pretraining framework (Stage B core).
+5. Klemmer, K. et al. (2025). SatCLIP: Global, General-Purpose Location Embeddings with Satellite Imagery. AAAI. — Contrastive location-image pretraining framework (multimodal alignment core).
 6. Rußwurm, M. et al. (2024). Geographic Location Encoding with Spherical Harmonics and Sinusoidal Representation Networks. ICLR. — Spherical harmonic location encoder + SirenNet (§B.5).
 7. Perez, E. et al. (2018). FiLM: Visual Reasoning with a General Conditioning Layer. AAAI. — Feature-wise Linear Modulation for conditional invariance (§B.3).
 8. Tancik, M. et al. (2020). Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains. NeurIPS. — Random Fourier Features for angular encoding (§B.4).

@@ -304,8 +304,8 @@ def sample_visible_patch_mask(
             continue
         n_visible = max(1, int(math.ceil(valid_idx.numel() * (1.0 - mask_ratio))))
         perm = torch.randperm(valid_idx.numel(), generator=generator)
-        if perm.device != valid_idx.device:  # pragma: no cover
-            perm = perm.to(valid_idx.device)  # pragma: no cover
+        if perm.device != valid_idx.device:
+            perm = perm.to(valid_idx.device)
         selected = valid_idx[perm[:n_visible]]
         visible_mask[i, selected] = True
     return visible_mask
@@ -367,6 +367,15 @@ class MarsMAEOutput:
     loss_mask: torch.Tensor
     reconstruction: torch.Tensor
     loss: torch.Tensor
+
+
+@dataclass
+class MarsMAEEncoderOutput:
+    encoded_tokens: torch.Tensor
+    pooled_embedding: torch.Tensor
+    patch_valid_fraction: torch.Tensor
+    patch_valid_mask: torch.Tensor
+    visible_mask: torch.Tensor
 
 
 class MarsMaskedAutoencoder(nn.Module):
@@ -465,15 +474,16 @@ class MarsMaskedAutoencoder(nn.Module):
             generator=generator,
         )
 
-    def forward(
+    def encode_image(
         self,
         image: torch.Tensor,
         valid_mask: torch.Tensor,
         scale_values: torch.Tensor,
         *,
-        mask_ratio: float = 0.75,
+        visible_mask: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
-    ) -> MarsMAEOutput:
+    ) -> MarsMAEEncoderOutput:
+        """Run only the Stage A encoder path for reuse in later alignment stages."""
         if image.ndim != 4:
             raise ValueError("image must have shape (B, C, H, W)")
         if valid_mask.ndim != 3:
@@ -490,7 +500,11 @@ class MarsMaskedAutoencoder(nn.Module):
                 channel_std=self.input_std.flatten(),
             )
 
-        encoder_image = normalized_image if self.normalize_inputs and normalized_image is not None else image
+        encoder_image = (
+            normalized_image
+            if self.normalize_inputs and normalized_image is not None
+            else image
+        )
         tokens = self.patch_embed(encoder_image).flatten(2).transpose(1, 2)
         encoder_scale = scale_sinusoidal_encoding(scale_values, tokens.shape[-1]).unsqueeze(1)
         tokens = tokens + self.encoder_pos_embed + encoder_scale
@@ -501,12 +515,14 @@ class MarsMaskedAutoencoder(nn.Module):
             self.patch_size,
             min_valid_fraction=self.min_valid_fraction,
         )
-        visible_mask = sample_visible_patch_mask(
-            patch_valid_mask,
-            mask_ratio=mask_ratio,
-            generator=generator,
-        )
-        masked_valid_mask = patch_valid_mask & ~visible_mask
+        if visible_mask is None:
+            visible_mask = patch_valid_mask
+        else:
+            if visible_mask.shape != patch_valid_mask.shape:
+                raise ValueError("visible_mask must match the patch-valid mask shape.")
+            visible_mask = visible_mask & patch_valid_mask
+            if not visible_mask.any():
+                visible_mask = patch_valid_mask
 
         visible_tokens, encoder_padding_mask, visible_indices = _gather_visible_tokens(
             tokens,
@@ -524,6 +540,63 @@ class MarsMaskedAutoencoder(nn.Module):
                 continue
             encoded_tokens[i, idx] = encoded_visible[i, : idx.numel()]
         pooled_embedding = _masked_mean(encoded_tokens, visible_mask)
+
+        return MarsMAEEncoderOutput(
+            encoded_tokens=encoded_tokens,
+            pooled_embedding=pooled_embedding,
+            patch_valid_fraction=patch_valid_fraction,
+            patch_valid_mask=patch_valid_mask,
+            visible_mask=visible_mask,
+        )
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        valid_mask: torch.Tensor,
+        scale_values: torch.Tensor,
+        *,
+        mask_ratio: float = 0.75,
+        generator: torch.Generator | None = None,
+    ) -> MarsMAEOutput:
+        if image.ndim != 4:
+            raise ValueError("image must have shape (B, C, H, W)")
+        if valid_mask.ndim != 3:
+            raise ValueError("valid_mask must have shape (B, H, W)")
+        if image.shape[2] != self.image_size or image.shape[3] != self.image_size:
+            raise ValueError("Input image size does not match model image_size.")
+
+        patch_valid_mask = compute_valid_patch_mask(
+            valid_mask,
+            self.patch_size,
+            min_valid_fraction=self.min_valid_fraction,
+        )
+        visible_mask = sample_visible_patch_mask(
+            patch_valid_mask,
+            mask_ratio=mask_ratio,
+            generator=generator,
+        )
+        encoded = self.encode_image(
+            image,
+            valid_mask,
+            scale_values,
+            visible_mask=visible_mask,
+            generator=generator,
+        )
+        normalized_image = None
+        if self.normalize_inputs or self.normalize_targets:
+            normalized_image = normalize_valid_image(
+                image,
+                valid_mask,
+                channel_mean=self.input_mean.flatten(),
+                channel_std=self.input_std.flatten(),
+            )
+
+        patch_valid_fraction = encoded.patch_valid_fraction
+        patch_valid_mask = encoded.patch_valid_mask
+        visible_mask = encoded.visible_mask
+        masked_valid_mask = patch_valid_mask & ~visible_mask
+        encoded_tokens = encoded.encoded_tokens
+        pooled_embedding = encoded.pooled_embedding
 
         decoder_tokens = self.encoder_to_decoder(encoded_tokens)
         decoder_scale = scale_sinusoidal_encoding(
