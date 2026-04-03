@@ -47,6 +47,7 @@ import hashlib
 import json
 import logging
 import pathlib
+import tempfile
 from collections.abc import Iterator
 from typing import Any, Literal
 
@@ -109,8 +110,12 @@ def _compute_split_assignments(
         # Random permutation
         order = rng.permutation(n_pairs)
 
-    n_test = max(1, int(round(n_pairs * test_fraction)))
-    n_val = max(1, int(round(n_pairs * val_fraction)))
+    n_test = int(round(n_pairs * test_fraction))
+    n_val = int(round(n_pairs * val_fraction))
+    if test_fraction > 0.0 and n_test == 0:
+        n_test = 1
+    if val_fraction > 0.0 and n_val == 0:
+        n_val = 1
     n_train = n_pairs - n_test - n_val
 
     if n_train < 1:
@@ -178,13 +183,19 @@ def _kfold_split(
     # Among non-test folds, split into train/val
     non_test_positions = np.where(~test_mask)[0]
     n_non_test = len(non_test_positions)
-    n_val = max(1, int(round(n_non_test * val_fraction)))
+    n_val = int(round(n_non_test * val_fraction))
+    if val_fraction > 0.0 and n_val == 0:
+        n_val = 1
 
     # Deterministic val selection: use a sub-permutation seeded by fold_idx
     val_rng = np.random.default_rng(rng.integers(0, 2**31) + fold_idx)
-    val_positions = set(
-        val_rng.choice(non_test_positions, size=n_val, replace=False).tolist()
-    )
+    val_positions: set[int]
+    if n_val > 0:
+        val_positions = set(
+            val_rng.choice(non_test_positions, size=n_val, replace=False).tolist()
+        )
+    else:
+        val_positions = set()
 
     assignments = {}
     for pos_in_order, pair_idx in enumerate(order):
@@ -240,7 +251,22 @@ def _split_cache_key(
 
 
 def _split_cache_dir(dataset_root: str) -> pathlib.Path:
-    return pathlib.Path(dataset_root) / ".cache" / "sampler_splits"
+    preferred = pathlib.Path(dataset_root) / ".cache" / "sampler_splits"
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        return preferred
+    except OSError:
+        root_hash = hashlib.sha256(str(dataset_root).encode()).hexdigest()[:16]
+        fallback = (
+            pathlib.Path(tempfile.gettempdir())
+            / "marsclip_artifacts"
+            / "support"
+            / "sampler_splits"
+            / root_hash
+        )
+        fallback.mkdir(parents=True, exist_ok=True)
+        logger.warning("Falling back to writable sampler split cache at %s", fallback)
+        return fallback
 
 
 def _load_cached_split(cache_path: pathlib.Path) -> dict[int, str] | None:
@@ -266,9 +292,12 @@ def _save_cached_split(
         "metadata": metadata,
         "assignments": {str(k): v for k, v in assignments.items()},
     }
-    with open(cache_path, "w") as f:
-        json.dump(payload, f, indent=2, default=str)
-    logger.info("Saved split cache: %s", cache_path)
+    try:
+        with open(cache_path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        logger.info("Saved split cache: %s", cache_path)
+    except OSError as exc:
+        logger.warning("Could not write split cache %s: %s", cache_path, exc)
 
 
 # ---------------------------------------------------------------------------
