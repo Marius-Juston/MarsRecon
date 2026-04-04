@@ -203,3 +203,33 @@ Built once at dataset construction and cached as a GeoPackage (`spatial_cache{su
 4. **Case D** — corner-coordinate polygon from the PDS index as a last resort
 
 A `_SPATIAL_TOL = 1e-5°` tolerance absorbs floating-point rounding between the index geometry and rasterio's recomputed bounds at load time.
+
+## Additional Vizualiation
+
+To generate the full `marsrise_dataset.mmd` MarsHiRISE dataset architecture flow diagram as,
+```bash
+npm install -g @mermaid-js/mermaid-cli
+mmdc -i reports/marsrise_dataset.mmd -o architecture.pdf -b transparent -f
+mmdc -i reports/preprocessing.mmd -o preprocessing.pdf -b transparent -f
+```
+
+To generate the overview of the MarsRecond architecutre overview:
+
+```bash
+uv sync --optional viz
+uv run scripts/marsrecon_architecture.py
+```
+
+To generate the LaTeX tables for the dataset statistics
+
+```bash
+uv run scripts/generate_dataset_stats_table.py dataset_stats/image/dataset_stats.json
+```
+
+To generate the validations for the sampling:
+
+```bash
+PYTHONPATH=src uv run python src/dataset/validate_sampling.py --root /scratch/mars_hirise --bbox -136 12 -124 24 --patch-size 0.005 --n-thumbnails 16 --n-hist-patches 30 --out validation/
+2026
+```
+

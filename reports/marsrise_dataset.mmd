@@ -1,0 +1,146 @@
+flowchart TD
+    %% -----------------------------------------------------------
+    %% 1. High-Level Execution Pipeline
+    %% -----------------------------------------------------------
+    subgraph Pipeline [1. High-Level Execution Pipeline]
+        P1([Start main execution]) --> P2[Parse Args: Target 'Olympus' vs Bounding Box, Length, Seed]
+        P2 --> P3[Initialize MarsHiRISE Dataset]
+        P3 --> P5[Initialize HiRISEGeoSampler]
+        P5 --> P6[Pass Sampler to PyTorch DataLoader]
+        P6 --> P7[Training Loop Requests Batches]
+        P7 --> P8[Dataset.plot: Apply Percentile Stretch & Save Figure]
+    end
+
+    %% -----------------------------------------------------------
+    %% 2. Dataset Initialization & Validation
+    %% -----------------------------------------------------------
+    subgraph Init [2. Dataset Initialization]
+        I1(MarsHiRISE.__init__) --> I2[Validate Channels: NIR, RED, BG]
+        I2 --> I3[Setup Image Normalizer via dataset_stats.json]
+        I3 --> I4(MarsHiRISEBase.__init__)
+        I4 --> I5[_verify: Trigger index validation]
+    end
+    P3 -. Triggers .-> I1
+
+    %% -----------------------------------------------------------
+    %% 3. Verification & Spatial Indexing
+    %% -----------------------------------------------------------
+    subgraph Verify [3. Verification, Indexing & Download Orchestration]
+        V1{RDRCUMINDEX LBL/TAB Exist?} -->|No| V2[_download_index from PDS]
+        V1 -->|Yes| V3
+        V2 --> V3[_load_index: Read Cumulative Table]
+
+        V3 --> V3a[Apply Target text filter e.g., 'Olympus']
+        V3a --> V3b[Apply Bounding Box spatial filter]
+        V3b --> V4[_build_spatial_index]
+
+        V4 --> V4a{Reuse Cache = True?}
+        V4a -->|Yes & Exists| V4b[_try_load_cache: Load GeoPackage]
+        V4a -->|No / Miss| V4c[Group _raw_index by obs_id]
+
+        V4c --> V4d[_run_footprint_extraction:\nParallel ThreadPool extracting Convex Hulls]
+        V4d --> V4e[_geometry_from_footprint_result:\nFallback logic: Hull -> BBox -> Corners -> Index Limits]
+        V4e --> V4f[Build GeoDataFrame & Save to GeoPackage]
+
+        V4b --> V5{Download = True?}
+        V4f --> V5
+
+        V5 -->|Yes| V6[_download_images]
+        V6 --> V6a[_build_download_tasks: Map Missing JP2s/LBLs]
+        V6a --> V6b[Asyncio / aiohttp Download Pool with Exponential Backoff]
+        V6b --> V6c{Files Successfully Downloaded?}
+        V6c -->|Yes| V4c
+        V6c -->|No| V7[_post_download_verify:\nSample Check disk for valid JP2s]
+
+        V5 -->|No| V7
+    end
+    I5 -. Triggers .-> V1
+
+    %% -----------------------------------------------------------
+    %% 4. Sampler Split Strategy & Caching
+    %% -----------------------------------------------------------
+    subgraph SplitLogic [4. Sampler Splitting & Assignment]
+        S1(HiRISEGeoSampler.__init__) --> S2[Validate Split Params & Resolve Size/Stride]
+        S2 --> S3[_get_split_assignments]
+
+        S3 --> S4[_split_cache_key: Hash Config\nSeed, Method, Folds, Sizes, Overlap]
+        S4 --> S5{Cache Match?}
+
+        S5 -->|Yes| S6[_load_cached_split: Load JSON Assignments]
+        S5 -->|No| S7{Which Split Strategy?}
+
+        S7 -->|Geographic| S8a[_extract_pair_coordinates:\nReproject to Flat CRS -> Get Centroids -> Reproject to Degrees -> Sort]
+        S7 -->|Random| S8b[Use Seeded RNG Permutation Array]
+
+        S8a --> S9{Cross-Validation?}
+        S8b --> S9
+
+        S9 -->|K-Fold| S10a[_kfold_split: Divide strips into K buckets.\nAssign Target Fold to Test, sub-split remainder to Train/Val]
+        S9 -->|Percentage| S10b[_compute_split_assignments:\nDivide ordered strips strictly by fractions 80/10/10]
+
+        S10a --> S11[_save_cached_split to JSON]
+        S10b --> S11
+    end
+    P5 -. Triggers .-> S1
+
+    %% -----------------------------------------------------------
+    %% 5. Candidate Grid Generation
+    %% -----------------------------------------------------------
+    subgraph GridGen [5. Valid Patch Pre-Computation]
+        G1(_build_valid_centers:\nFilter dataset down to ONLY strips assigned to current Split) --> G2[Loop through assigned strips]
+
+        G2 --> G3[Shrink strip Polygon footprint inwards by 5% to avoid edge artifacts]
+        G3 --> G4[Calculate Bounding Box of shrunken footprint]
+
+        G4 --> G5[Generate dense uniform grid of X/Y points across BBox based on Stride]
+        G5 --> G6[Loop through generated points]
+
+        G6 --> G7[Project a theoretical Patch polygon around the X/Y coordinate]
+        G7 --> G8[Shapely Intersection: Calculate area overlap between Patch and Strip Footprint]
+
+        G8 --> G9{Overlap > min_overlap threshold?}
+        G9 -->|Yes| G10[Store X/Y/T coordinate in Valid _centers list]
+        G9 -->|No| G11[Discard coordinate]
+    end
+    S6 -. Triggers .-> G1
+    S11 -. Triggers .-> G1
+
+    %% -----------------------------------------------------------
+    %% 6. Runtime Data Retrieval & Processing
+    %% -----------------------------------------------------------
+    subgraph Retrieval [6. Runtime Data Retrieval & Processing]
+        R1(DataLoader requests Batch) --> R2[Sampler.__iter__: Randomly select N points from pre-computed _centers]
+        R2 --> R3[Convert X/Y center points into Bounding Box Slices]
+        R3 --> R4[Dataset.__getitem__: Receive Slices]
+
+        R4 --> R5[Query GeoDataFrame Spatial Index for Intersecting Strips]
+        R5 --> R6{Matches Found?}
+        R6 -->|No| R7[Raise IndexError]
+        R6 -->|Yes| R8[_load_tile: Loop over matched observations]
+
+        R8 --> R9{Resolve File Logic}
+        R9 -->|Any COLOR channel requested| R10[Use _COLOR.JP2]
+        R9 -->|Only RED requested| R11[Use _RED.JP2]
+        R10 -->|Color file missing on disk| R11
+
+        R10 --> R12[_load_from_jp2]
+        R11 --> R12
+
+        R12 --> R13[Rasterio Check Overlap]
+        R13 --> R14[reproject_band: Transform from Equirectangular to Geographic Mars CRS]
+        R14 --> R15[Radiometric Calibration: I/F = DN * SCALING_FACTOR + OFFSET]
+        R15 --> R16[Clip values between 0.0 and 1.0, mask nodata with 0.0]
+
+        R16 --> R17[Stack requested bands into Tensor]
+        R17 --> R18[merge_tiles: Mosaic overlapped observations using first-non-zero-wins]
+
+        R18 --> R19{Normalize == True?}
+        R19 -->|Yes| R20[Apply Z-Score normalization, preserve 0.0 nodata pixels]
+        R19 -->|No| R21[Skip Normalization]
+
+        R20 --> R22[Apply TorchGeo Transforms]
+        R21 --> R22
+
+        R22 --> R23([Yield Final Sample Dict: image, bounds, crs])
+    end
+    P7 -. Triggers .-> R1
