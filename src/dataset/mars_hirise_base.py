@@ -558,7 +558,7 @@ class MarsHiRISEBase(GeoDataset):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.index) if self.index else 0
+        return 0 if self.index is None else len(self.index)
 
     @abstractmethod
     def __getitem__(self, index: GeoSlice) -> Sample:
