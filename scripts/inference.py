@@ -22,12 +22,12 @@ This is what DepthFM uses for benchmark evaluation.
     --ensemble_size 10
 """
 
+import argparse
 import os
 import sys
-import argparse
 
-import torch
 import numpy as np
+import torch
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -66,10 +66,10 @@ def load_image(path: str, resolution: int = 512) -> torch.Tensor:
 
 @torch.no_grad()
 def predict_dtm(
-    model,
-    image_tensor: torch.Tensor,
-    num_steps: int = 1,
-    ensemble_size: int = 1,
+        model,
+        image_tensor: torch.Tensor,
+        num_steps: int = 1,
+        ensemble_size: int = 1,
 ) -> torch.Tensor:
     """
     Predict DTM from a single image using flow matching ODE solving.
