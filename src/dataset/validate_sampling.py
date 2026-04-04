@@ -203,14 +203,25 @@ def plot_strip_detail(dataset, sampler, out_dir: Path, strip_idx: int = 0) -> No
 
     eb = effective.bounds
 
+    valid_coords = np.array([(c[0], c[1]) for c in sampler._centers])
+
+    from scipy.spatial import cKDTree
+    tree = cKDTree(valid_coords) if len(valid_coords) > 0 else None
+
     valid, rejected = [], []
     for cy in np.arange(eb[1] + half_h, eb[3] - half_h + stride_h * 1e-6, stride_h):
         for cx in np.arange(eb[0] + half_w, eb[2] - half_w + stride_w * 1e-6, stride_w):
-            patch = shapely_box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
-            overlap = effective.intersection(patch).area / patch.area
+            # 2. Check if this generated grid point exists in the sampler's list
+            is_valid = False
+            if tree is not None:
+                # Query nearest neighbor distance
+                dist, _ = tree.query([cx, cy])
+                if dist < 1e-5:  # Tolerance for floating-point drift
+                    is_valid = True
 
-            if overlap > sampler.min_overlap:
+            # ----- No geometric math needed here! -----
+            if is_valid:
                 valid.append((cx, cy))
             else:
                 rejected.append((cx, cy))
