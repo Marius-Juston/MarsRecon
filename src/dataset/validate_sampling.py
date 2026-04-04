@@ -207,7 +207,10 @@ def plot_strip_detail(dataset, sampler, out_dir: Path, strip_idx: int = 0) -> No
     for cy in np.arange(eb[1] + half_h, eb[3] - half_h + stride_h * 1e-6, stride_h):
         for cx in np.arange(eb[0] + half_w, eb[2] - half_w + stride_w * 1e-6, stride_w):
             patch = shapely_box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
-            if effective.intersects(patch):
+
+            overlap = effective.intersection(patch).area / patch.area
+
+            if overlap > sampler.min_overlap:
                 valid.append((cx, cy))
             else:
                 rejected.append((cx, cy))
@@ -309,8 +312,10 @@ def plot_strip_detail(dataset, sampler, out_dir: Path, strip_idx: int = 0) -> No
 
     fig.suptitle("Single-strip detail — grid validation", fontsize=14, y=1.01)
     fig.tight_layout()
+    path = out_dir / "validate_strip_detail.pdf"
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     path = out_dir / "validate_strip_detail.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", path)
 
@@ -551,10 +556,12 @@ def plot_thumbnails(
         r, c = divmod(flat_i, cols)
         axes[r, c].set_visible(False)
 
-    fig.suptitle(f"Sample patch thumbnails  ({loaded}/{n_patches} loaded)", fontsize=13)
+    fig.suptitle(f"Sample patch thumbnails", fontsize=13)
     fig.tight_layout()
+    path = out_dir / "validate_thumbnails.pdf"
+    fig.savefig(path, dpi=600)
     path = out_dir / "validate_thumbnails.png"
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=600)
     plt.close(fig)
     logger.info("Saved %s", path)
 
@@ -755,13 +762,13 @@ def main() -> None:
     logger.info("Generating validation plots ...")
     logger.info("-" * 60)
 
-    plot_overview(dataset, sampler, out_dir)
+    # plot_overview(dataset, sampler, out_dir)
     plot_strip_detail(dataset, sampler, out_dir, strip_idx=args.strip_detail)
-    plot_histogram(dataset, sampler, out_dir, n_patches=args.n_hist_patches)
+    # plot_histogram(dataset, sampler, out_dir, n_patches=args.n_hist_patches)
     plot_thumbnails(dataset, sampler, out_dir, n_patches=args.n_thumbnails)
-    plot_calibration_comparison(
-        dataset, sampler, out_dir, n_patches=args.n_calib_patches
-    )
+    # plot_calibration_comparison(
+    #     dataset, sampler, out_dir, n_patches=args.n_calib_patches
+    # )
 
     elapsed = time.monotonic() - t0
     logger.info("=" * 60)
