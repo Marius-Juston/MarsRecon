@@ -497,6 +497,15 @@ wheels = [
 ]
 
 [[package]]
+name = "graphviz"
+version = "0.21"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/b3/3ac91e9be6b761a4b30d66ff165e54439dcd48b83f4e20d644867215f6ca/graphviz-0.21.tar.gz", hash = "sha256:20743e7183be82aaaa8ad6c93f8893c923bd6658a04c32ee115edb3c8a835f78", size = 200434, upload-time = "2025-06-15T09:35:05.824Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/4c/e0ce1ef95d4000ebc1c11801f9b944fa5910ecc15b5e351865763d8657f8/graphviz-0.21-py3-none-any.whl", hash = "sha256:54f33de9f4f911d7e84e4191749cac8cc5653f815b06738c54db9a15ab8b1e42", size = 47300, upload-time = "2025-06-15T09:35:04.433Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -881,6 +890,9 @@ dev = [
 experiment = [
     { name = "wandb" },
 ]
+viz = [
+    { name = "graphviz" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -889,6 +901,7 @@ requires-dist = [
     { name = "aioresponses", marker = "extra == 'dev'", specifier = ">=0.7" },
     { name = "diffusers", marker = "extra == 'depthfm'", specifier = ">=0.37.1" },
     { name = "einops", marker = "extra == 'depthfm'", specifier = ">=0.8.2" },
+    { name = "graphviz", marker = "extra == 'viz'", specifier = ">=0.21" },
     { name = "huggingface-hub", specifier = ">=1.8.0" },
     { name = "jsonargparse", extras = ["signatures"], marker = "extra == 'depthfm'", specifier = ">=4.47.0" },
     { name = "lightning", marker = "extra == 'depthfm'", specifier = ">=2.6.1" },
@@ -919,7 +932,7 @@ requires-dist = [
     { name = "wandb", marker = "extra == 'depthfm'", specifier = ">=0.25.1" },
     { name = "wandb", marker = "extra == 'experiment'", specifier = ">=0.19" },
 ]
-provides-extras = ["dev", "experiment", "depthfm"]
+provides-extras = ["dev", "experiment", "depthfm", "viz"]
 
 [[package]]
 name = "matplotlib"
