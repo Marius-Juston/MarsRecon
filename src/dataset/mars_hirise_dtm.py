@@ -1077,6 +1077,7 @@ def main(argv=None) -> None:  # pragma: no cover
     parser.add_argument(
         "-d", action=argparse.BooleanOptionalAction,
         help="Whether to generate 3D visualisation plots of the surface",
+        default=False
     )
 
     args = parser.parse_args(argv)
