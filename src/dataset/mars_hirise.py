@@ -746,13 +746,18 @@ def main(argv=None) -> None:  # pragma: no cover
         "-s", "--seed", type=int, default=42,
         help="seed",
     )
+    parser.add_argument(
+        "-g", "--global-coverage", action=argparse.BooleanOptionalAction,
+        help="Whether to plot global coverage",
+        default=False
+    )
 
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    normalization_path = "dataset_stats/dataset_stats.json"
+    normalization_path = "dataset_stats/image/dataset_stats.json"
 
     if args.olympus:
         dataset = MarsHiRISE(
@@ -775,6 +780,10 @@ def main(argv=None) -> None:  # pragma: no cover
 
     output_path = pathlib.Path("Figures")
     output_path.mkdir(parents=True, exist_ok=True)
+
+    if args.global_coverage:
+        dataset.plot_global_coverage(output_path / "global_coverage.pdf")
+        logger.info("saved global coverage fig")
 
     fig = dataset.plot_coverage()
     fig.savefig(output_path / "coverage.png", bbox_inches='tight')

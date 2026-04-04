@@ -608,8 +608,7 @@ class MarsHiRISEBase(GeoDataset):
             fname = self._INDEX_STEM + ext
             download_url(f"{index_url}/{fname}", str(self.root), fname)
 
-    def _load_index(self) -> None:
-        """Parse cumulative index and apply target / bbox filters."""
+    def _load_cum_index(self) -> pd.DataFrame:
         lbl_path = self.root / f"{self._INDEX_STEM}.LBL"
         if not lbl_path.exists():
             raise DatasetNotFoundError(self)
@@ -618,6 +617,12 @@ class MarsHiRISEBase(GeoDataset):
         data.load("all")
         df: pd.DataFrame = data[self._INDEX_TABLE_KEY]
         logger.info("Loaded cumulative index (%s): %d rows.", self._INDEX_STEM, len(df))
+
+        return df
+
+    def _load_index(self) -> None:
+        """Parse cumulative index and apply target / bbox filters."""
+        df = self._load_cum_index()
 
         # --- text filter ---
         if self.target is not None:
@@ -1133,3 +1138,132 @@ class MarsHiRISEBase(GeoDataset):
                 coverage[i_lat_lo:i_lat_hi, i_lon_lo:i_lon_hi] += 1
 
         return coverage, lon_edges, lat_edges
+
+    def plot_global_coverage(self,
+                             output_pdf: str | pathlib.Path,
+                             input_svg: str | pathlib.Path = "MarsTopography.svg",
+                             lat_bounds: tuple[float, float] = (-57.0, 57.0),
+                             target_id: str = "topopgraphy"  # Note: matching your snippet's spelling
+                             ) -> None:
+        """Injects dataset coordinates directly into an SVG and exports a vector PDF.
+
+        Handles SVGs where the map is embedded as a <def> and instantiated via a <use> tag.
+        """
+        import xml.etree.ElementTree as ET
+        import math
+        import cairosvg
+
+        # 1. Parse the SVG and register namespaces
+        # Keeping namespaces empty prevents ugly ns0: prefixes in the output
+        ET.register_namespace('', "http://www.w3.org/2000/svg")
+        ET.register_namespace('xlink', "http://www.w3.org/1999/xlink")
+        tree = ET.parse(input_svg)
+        root = tree.getroot()
+
+        # Build a parent map so we can easily inject nodes side-by-side
+        parent_map = {c: p for p in tree.iter() for c in p}
+
+        # 2. Locate the <use> node
+        use_node = tree.find(f".//*[@id='{target_id}']")
+        if use_node is None:
+            raise ValueError(f"Could not find an SVG node with id='{target_id}'")
+
+        # 3. Find the referenced definition
+        # It could be under 'href' (SVG 2) or 'xlink:href' (SVG 1.1)
+        href = use_node.attrib.get("{http://www.w3.org/1999/xlink}href") or use_node.attrib.get("href")
+        if not href or not href.startswith("#"):
+            raise ValueError(f"The node '{target_id}' does not have a valid href pointing to a def.")
+
+        source_id = href[1:]  # Strip the '#'
+        source_node = tree.find(f".//*[@id='{source_id}']")
+        if source_node is None:
+            raise ValueError(f"Could not find the referenced <image> node with id='{source_id}'")
+
+        # 4. Extract raw dimensions from the source definition
+        img_w = float(source_node.attrib['width'])
+        img_h = float(source_node.attrib['height'])
+
+        # Sometimes <use> elements have their own x/y offsets in addition to the transform
+        use_x = float(use_node.attrib.get('x', 0.0))
+        use_y = float(use_node.attrib.get('y', 0.0))
+
+        # 5. Setup Projection Math
+        min_lat, max_lat = lat_bounds
+
+        def lat_to_mercator(lat_deg: float) -> float:
+            lat_deg = max(min(lat_deg, 89.9), -89.9)
+            return math.log(math.tan(math.pi / 4.0 + math.radians(lat_deg) / 2.0))
+
+        merc_top = lat_to_mercator(max_lat)
+        merc_bottom = lat_to_mercator(min_lat)
+        merc_range = merc_top - merc_bottom
+
+        def get_svg_coords(lon: float, lat: float) -> tuple[float, float]:
+            """Map lon/lat to the raw image pixel coordinates."""
+            norm_x = (lon + 180.0) / 360.0
+            cx = use_x + (norm_x * img_w)
+
+            merc_y = lat_to_mercator(lat)
+            norm_y = (merc_top - merc_y) / merc_range
+            cy = use_y + (norm_y * img_h)
+
+            return cx, cy
+
+        # 6. Create SVG Groups
+        data_group = ET.Element('g', id="hirise_data_layers")
+
+        # CRITICAL STEP: Copy the transform matrix from the <use> node to our data group
+        # This forces the SVG renderer to align our dots with the scaled/moved image
+        if 'transform' in use_node.attrib:
+            data_group.set('transform', use_node.attrib['transform'])
+
+        # Note: Because the transform matrix scales everything down (e.g., ~0.47x),
+        # we need to increase the circle radius so they don't become microscopic.
+
+        # Use "fill-opacity" instead of "opacity" to prevent CairoSVG from rasterizing the vectors.
+        raw_group = ET.SubElement(data_group, 'g', id="layer_raw_index", fill="blue", stroke="black",
+                                  **{"fill-opacity": "0.7"})
+        filtered_group = ET.SubElement(data_group, 'g', id="layer_filtered_index", fill="red", stroke="black",
+                                       **{"stroke-width": "1.0"})
+
+        df = self._load_cum_index()
+
+        # 7. Inject the raw cumulative index
+        if df is not None and not df.empty:
+            raw_lons = ((df["MINIMUM_LONGITUDE"].astype(float) + 180.0) % 360.0) - 180.0
+            raw_lats = df["MINIMUM_LATITUDE"].astype(float)
+
+            for lon, lat in zip(raw_lons, raw_lats):
+                if not (min_lat <= lat <= max_lat):
+                    continue
+                cx, cy = get_svg_coords(lon, lat)
+                ET.SubElement(raw_group, 'circle', cx=f"{cx:.2f}", cy=f"{cy:.2f}", r="2.5")
+
+        # 8. Inject the precise filtered index points
+        if self.index is not None and not self.index.empty:
+            centroids = self.index.geometry.centroid
+            for lon, lat in zip(centroids.x, centroids.y):
+                if not (min_lat <= lat <= max_lat):
+                    continue
+                cx, cy = get_svg_coords(lon, lat)
+                ET.SubElement(filtered_group, 'circle', cx=f"{cx:.2f}", cy=f"{cy:.2f}", r="8")
+
+        # 9. Append the new elements right after the <use> node
+        parent = parent_map[use_node]
+        use_index = list(parent).index(use_node)
+        parent.insert(use_index + 1, data_group)
+
+        # 10. Save out to PDF
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if isinstance(output_pdf, str):
+            output_pdf = Path(output_pdf)
+
+        logger.info(f"Writing vectorized PDF to {output_pdf}")
+        svg_bytes = ET.tostring(root, encoding='utf-8', method='xml')
+
+        with open(output_pdf.with_suffix(".svg"), "wb") as f:
+            f.write(svg_bytes)
+
+        cairosvg.svg2pdf(bytestring=svg_bytes, write_to=str(output_pdf), dpi=600)
