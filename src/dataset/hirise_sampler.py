@@ -57,7 +57,7 @@ from shapely.geometry import box as shapely_box
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.samplers import GeoSampler, Units
 
-from dataset.mars_hirise_base import MARS_GEOGRAPHIC_CRS
+from dataset.mars_hirise_base import MARS_PROJECTED_CRS
 
 logger = logging.getLogger(__name__)
 
@@ -572,7 +572,7 @@ class HiRISEGeoSampler(GeoSampler):
 
     def _extract_pair_coordinates(self, axis: str) -> np.ndarray:
         """Extract the centroid coordinate along the split axis for each pair."""
-        projected = self.index.to_crs(MARS_GEOGRAPHIC_CRS)
+        projected = self.index.to_crs(MARS_PROJECTED_CRS)
         centroids = projected.geometry.centroid.to_crs(self.index.crs)
         if axis == "longitude":
             return centroids.x.to_numpy()

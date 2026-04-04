@@ -76,6 +76,14 @@ MARS_GEOGRAPHIC_CRS = CRS.from_proj4(
     "+proj=longlat +a=3396190 +b=3376200 +no_defs"
 )
 
+MARS_PROJECTED_CRS = CRS.from_proj4(
+    "+proj=eqc +lat_ts=0 +lon_0=0 +a=3396190 +b=3376200 +units=m +no_defs"
+)
+
+MARS_MERCATOR_CRS = CRS.from_proj4(
+    "+proj=merc +lon_0=0 +a=3396190 +b=3376200 +units=m +no_defs"
+)
+
 # ---------------------------------------------------------------------------
 # Shared constants
 # ---------------------------------------------------------------------------
@@ -1241,7 +1249,7 @@ class MarsHiRISEBase(GeoDataset):
 
         # 8. Inject the precise filtered index points
         if self.index is not None and not self.index.empty:
-            centroids = self.index.geometry.centroid
+            centroids = self.index.to_crs(MARS_MERCATOR_CRS).geometry.centroid.to_crs(MARS_GEOGRAPHIC_CRS)
             for lon, lat in zip(centroids.x, centroids.y):
                 if not (min_lat <= lat <= max_lat):
                     continue
