@@ -74,16 +74,16 @@ VALID_SPLIT_METHODS = frozenset({"geographic", "random"})
 # ---------------------------------------------------------------------------
 
 def _compute_split_assignments(
-    n_pairs: int,
-    pair_coords: np.ndarray | None,
-    *,
-    method: str,
-    train_fraction: float,
-    val_fraction: float,
-    test_fraction: float,
-    seed: int,
-    n_folds: int | None,
-    fold_idx: int,
+        n_pairs: int,
+        pair_coords: np.ndarray | None,
+        *,
+        method: str,
+        train_fraction: float,
+        val_fraction: float,
+        test_fraction: float,
+        seed: int,
+        n_folds: int | None,
+        fold_idx: int,
 ) -> dict[int, str]:
     """Assign each stereo-pair index to 'train', 'val', or 'test'.
 
@@ -133,14 +133,14 @@ def _compute_split_assignments(
 
 
 def _kfold_split(
-    n_pairs: int,
-    pair_coords: np.ndarray | None,
-    *,
-    method: str,
-    n_folds: int,
-    fold_idx: int,
-    val_fraction: float,
-    rng: np.random.Generator,
+        n_pairs: int,
+        pair_coords: np.ndarray | None,
+        *,
+        method: str,
+        n_folds: int,
+        fold_idx: int,
+        val_fraction: float,
+        rng: np.random.Generator,
 ) -> dict[int, str]:
     """K-fold cross-validation split.
 
@@ -181,7 +181,7 @@ def _kfold_split(
     n_val = max(1, int(round(n_non_test * val_fraction)))
 
     # Deterministic val selection: use a sub-permutation seeded by fold_idx
-    val_rng = np.random.default_rng(rng.integers(0, 2**31) + fold_idx)
+    val_rng = np.random.default_rng(rng.integers(0, 2 ** 31) + fold_idx)
     val_positions = set(
         val_rng.choice(non_test_positions, size=n_val, replace=False).tolist()
     )
@@ -203,20 +203,20 @@ def _kfold_split(
 # ---------------------------------------------------------------------------
 
 def _split_cache_key(
-    dataset_root: str,
-    dataset_target: str | None,
-    dataset_bbox: tuple | None,
-    method: str,
-    train_fraction: float,
-    val_fraction: float,
-    test_fraction: float,
-    seed: int,
-    n_folds: int | None,
-    fold_idx: int,
-    size: tuple[float, float],
-    stride: tuple[float, float],
-    min_overlap: float,
-    ortho_types: list[str] | None,
+        dataset_root: str,
+        dataset_target: str | None,
+        dataset_bbox: tuple | None,
+        method: str,
+        train_fraction: float,
+        val_fraction: float,
+        test_fraction: float,
+        seed: int,
+        n_folds: int | None,
+        fold_idx: int,
+        size: tuple[float, float],
+        stride: tuple[float, float],
+        min_overlap: float,
+        ortho_types: list[str] | None,
 ) -> str:
     """Compute a deterministic hash key for the split configuration."""
     key_parts = {
@@ -257,9 +257,9 @@ def _load_cached_split(cache_path: pathlib.Path) -> dict[int, str] | None:
 
 
 def _save_cached_split(
-    cache_path: pathlib.Path,
-    assignments: dict[int, str],
-    metadata: dict,
+        cache_path: pathlib.Path,
+        assignments: dict[int, str],
+        metadata: dict,
 ) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -474,9 +474,9 @@ class HiRISEGeoSampler(GeoSampler):
     # ------------------------------------------------------------------
 
     def _get_split_assignments(
-        self,
-        dataset: GeoDataset,
-        reuse_cache: bool,
+            self,
+            dataset: GeoDataset,
+            reuse_cache: bool,
     ) -> dict[int, str]:
         """Compute or load cached split assignments for all stereo pairs."""
 

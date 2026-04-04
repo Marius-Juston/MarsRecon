@@ -14,14 +14,11 @@ Usage:
         --num_workers 128
 """
 
+import argparse
 import os
 import sys
-import argparse
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
-import numpy as np
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,7 +104,7 @@ def main():
     processed = 0
     for batch in tqdm(loader, desc="Encoding"):
         images = batch["image"]  # (B, 3, H, W)
-        dtms = batch["dtm"]     # (B, 3, H, W)
+        dtms = batch["dtm"]  # (B, 3, H, W)
         confs = batch["confidence"]
         tile_ids = batch["tile_id"]
 
@@ -123,7 +120,7 @@ def main():
             torch.save(dtm_latents[i], os.path.join(args.output_dir, f"{tile_id}_dtm.pt"))
 
             # Downsample confidence to latent resolution and save
-            conf = confs[i:i+1]  # (1, 1, H, W)
+            conf = confs[i:i + 1]  # (1, 1, H, W)
             conf_small = torch.nn.functional.interpolate(
                 conf, size=image_latents.shape[-2:], mode="bilinear", align_corners=False
             )
