@@ -10,9 +10,6 @@ Provides:
 * :func:`convert_all` — Batch-convert all JP2 files under a root directory
   using a process pool.
 
-* :func:`geographic_split` — Split a spatial index GeoDataFrame into train /
-  test sets along a geographic axis to prevent spatial data leakage for crater
-  segmentation models.
 
 CLI usage::
 
@@ -550,79 +547,6 @@ def convert_all(
         counts["failed"],
     )
     return counts
-
-
-# ---------------------------------------------------------------------------
-# Geographic train / test split
-# ---------------------------------------------------------------------------
-
-
-def geographic_split(
-        index: gpd.GeoDataFrame,
-        test_fraction: float = 0.2,
-        split_axis: str = "longitude",
-        seed: int = 42,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """Split a spatial index into geographically separated train and test sets.
-
-    Assigns observations to blocks along the chosen axis, then randomly assigns
-    whole blocks to train or test.  This keeps geographically adjacent
-    observations on the same side of the split, preventing spatial data leakage
-    in crater segmentation models (a model should not see craters immediately
-    adjacent to its test craters during training).
-
-    Args:
-        index: The :attr:`~temp.MarsHiRISE.index` GeoDataFrame.
-        test_fraction: Fraction of observations to place in the test set.
-        split_axis: ``"longitude"`` (default) or ``"latitude"``.
-        seed: Random seed for reproducible block shuffling.
-
-    Returns:
-        ``(train_gdf, test_gdf)`` tuple of GeoDataFrames with the same schema
-        as *index*.
-
-    Example::
-
-        from preprocessing import geographic_split
-
-        dataset = MarsHiRISE(bbox=..., ...)
-        train_idx, test_idx = geographic_split(dataset.index, test_fraction=0.2)
-    """
-    # Project to a planar CRS before computing centroids to avoid the
-    # "Geometry is in a geographic CRS" UserWarning from geopandas.
-    projected = index.to_crs(MARS_PROJECTED_CRS)
-    centroids = projected.geometry.centroid.to_crs(index.crs)
-    coords: np.ndarray = (
-        centroids.x.to_numpy() if split_axis == "longitude"
-        else centroids.y.to_numpy()
-    )
-
-    # Divide the coordinate range into ~(1/test_fraction) equally-populated
-    # blocks, then assign a random subset of blocks to the test set.
-    n_blocks = max(5, int(round(1.0 / test_fraction)))
-    edges = np.percentile(coords, np.linspace(0.0, 100.0, n_blocks + 1))
-    # digitize assigns each point to a block 0 … n_blocks-1
-    block_ids = np.digitize(coords, edges[1:-1])
-
-    rng = np.random.default_rng(seed)
-    unique_blocks = np.unique(block_ids)
-    rng.shuffle(unique_blocks)
-
-    n_test_blocks = max(1, int(round(len(unique_blocks) * test_fraction)))
-    test_block_set = set(unique_blocks[:n_test_blocks].tolist())
-
-    test_mask = np.isin(block_ids, list(test_block_set))
-    train_gdf = index.iloc[~test_mask]
-    test_gdf = index.iloc[test_mask]
-
-    logger.info(
-        "Geographic split (%s axis): %d train, %d test observations.",
-        split_axis,
-        len(train_gdf),
-        len(test_gdf),
-    )
-    return train_gdf, test_gdf
-
 
 # ---------------------------------------------------------------------------
 # CLI entry point
