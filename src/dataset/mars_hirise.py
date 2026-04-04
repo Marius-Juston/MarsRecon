@@ -736,6 +736,7 @@ def main(argv=None) -> None:  # pragma: no cover
     parser.add_argument(
         "-ol", "--olympus", action=argparse.BooleanOptionalAction,
         help="Whether to use the 'Olympus' target",
+        default=False
     )
     parser.add_argument(
         "-l", "--length", type=int, default=-1,
