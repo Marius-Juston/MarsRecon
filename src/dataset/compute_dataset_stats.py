@@ -68,8 +68,8 @@ CHANNELS: list[str] = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
 DTM_CHANNELS: list[str] = ["RED"]
 N_HIST_BINS: int = 1024
 OUTPUT_DIR: pathlib.Path = pathlib.Path("dataset_stats")
-NPROCS: int = 4  # one per GPU
-WORKERS_PER_GPU: int = 64  # DataLoader workers per process
+NPROCS: int = torch.cuda.device_count()  # one per GPU
+WORKERS_PER_GPU: int = min(32, os.cpu_count() // NPROCS)  # DataLoader workers per process
 TEMP_STATS_PATH: str = "/tmp/hirise_stats_rank{rank}_{dtm}.pt"
 
 BBOX_TUPLE = (-150, 15, -90, 70)
@@ -201,10 +201,11 @@ def _worker_fn(rank: int, args: dict) -> None:
     size_tuple: tuple[float, float] = args["size_tuple"]
     dtm: bool = args["dtm"]
 
+    path = TEMP_STATS_PATH.format(rank=rank, dtm=str(int(dtm)))
+
     # ----------------------------------------------------------------
     # Build dataset and subset sampler for this rank
     # ----------------------------------------------------------------
-
     if dtm:
         dataset = MarsHiRISEDTM(
             bbox=BBOX_TUPLE,
@@ -223,16 +224,16 @@ def _worker_fn(rank: int, args: dict) -> None:
 
     subset_sampler = _CenterSubsetSampler(centers_slice, size_tuple)
 
-    loader = DataLoader(
-        dataset,
-        sampler=subset_sampler,
-        batch_size=1,
-        num_workers=WORKERS_PER_GPU,
-        multiprocessing_context="spawn",
-        prefetch_factor=4,
-        worker_init_fn=_set_gdal_single_thread,
-        persistent_workers=True,
-    )
+    loader_kwargs = {
+        "batch_size": 1,
+        "num_workers": WORKERS_PER_GPU,
+        "worker_init_fn": _set_gdal_single_thread,
+        "persistent_workers": WORKERS_PER_GPU > 0,
+    }
+    if WORKERS_PER_GPU > 0:
+        loader_kwargs["prefetch_factor"] = 4
+
+    loader = DataLoader(dataset, sampler=subset_sampler, **loader_kwargs)
 
     # ----------------------------------------------------------------
     # Accumulators (float64 for precision across large pixel counts)
@@ -288,9 +289,9 @@ def _worker_fn(rank: int, args: dict) -> None:
             ch_min[c] = torch.minimum(ch_min[c], valid.min())
             ch_max[c] = torch.maximum(ch_max[c], valid.max())
 
-            hist[c] += torch.histc(
-                valid.float(), bins=N_HIST_BINS, **HIST_RANGE[range_key]
-            ).to(torch.int64)
+            hist[c].add_(
+                torch.histc(valid.float(), bins=N_HIST_BINS, **HIST_RANGE[range_key]
+                            ).to(torch.int64))
 
             # 2. Update Patch-Centered Stats
             patch_mean = valid.mean()
@@ -326,9 +327,17 @@ def _worker_fn(rank: int, args: dict) -> None:
         "c_max": c_max.cpu(),
         "c_hist": c_hist.cpu(),
     }
-    path = TEMP_STATS_PATH.format(rank=rank, dtm=str(int(args["dtm"])))
-    torch.save(partial, path)
+
+    tmp_path = path + ".tmp"
+    torch.save(partial, tmp_path)
+    os.replace(tmp_path, path)
     print(f"[rank {rank}] done — saved partial stats to {path}", flush=True)
+
+    loader._iterator = None
+    del loader
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +419,7 @@ def _combine_welford(partials: list[dict]) -> dict:
                     combined["c_hist"][c] += p["c_hist"][c]
 
     return combined
+
 
 # ---------------------------------------------------------------------------
 # Save JSON + PNGs
@@ -586,6 +596,7 @@ def _save_stats(
     for c, ch_name in enumerate(channels):
         print(f"  {ch_name}: raw_std={std_vals[c]:.6f}, centered_std={c_std_vals[c]:.6f}")
 
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -603,7 +614,7 @@ def main(argv=None) -> None:
         description="Get statistics for the dataset"
     )
 
-    parser.add_argument("--dtm", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--dtm", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args(argv)
 
     output_dir = OUTPUT_DIR
@@ -650,7 +661,7 @@ def main(argv=None) -> None:
 
     # import random
     # random.shuffle(all_centers)
-    # patch = 500
+    # patch = 10
     # all_centers = all_centers[:patch * NPROCS]
 
     size_tuple = full_sampler.size
@@ -683,7 +694,11 @@ def main(argv=None) -> None:
     # Launch one worker per GPU
     # ----------------------------------------------------------------
     print(f"\nLaunching {NPROCS} GPU workers (each with {WORKERS_PER_GPU} DataLoader workers)…")
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
     mp.spawn(_worker_fn, args=(worker_args,), nprocs=NPROCS, join=True)
+
+    torch.cuda.synchronize()
 
     # ----------------------------------------------------------------
     # Load partial results and reduce
@@ -691,7 +706,7 @@ def main(argv=None) -> None:
     print("\nReducing partial statistics…")
     partials: list[dict] = []
     for r in range(NPROCS):
-        path = TEMP_STATS_PATH.format(rank=r, dtm=str(int(args["dtm"])))
+        path = TEMP_STATS_PATH.format(rank=r, dtm=str(int(args.dtm)))
         partials.append(torch.load(path, weights_only=False))
 
     combined = _combine_welford(partials)
@@ -703,9 +718,10 @@ def main(argv=None) -> None:
 
     # Cleanup
     for r in range(NPROCS):
-        path = TEMP_STATS_PATH.format(rank=r, dtm=str(int(args["dtm"])))
+        path = TEMP_STATS_PATH.format(rank=r, dtm=str(int(args.dtm)))
         os.remove(path)
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
