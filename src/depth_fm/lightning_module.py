@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from depth_fm.losses import CombinedLoss
 from depth_fm.metrics import compute_depth_metrics, MetricsAggregator
 from depth_fm.model import build_model
+from depth_fm.noise import q_sample
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +96,18 @@ class DepthFMLightningModule(L.LightningModule):
             t = torch.rand(batch_size, device=self.device)
         return t.clamp(1e-5, 1.0 - 1e-5)
 
-    def _noise_augment(self, z: torch.Tensor) -> torch.Tensor:
-        alpha = self.fm.get("noise_augmentation_alpha", 0.997)
-        if alpha >= 1.0:
-            return z
-        noise = torch.randn_like(z)
-        return math.sqrt(alpha) * z + math.sqrt(1.0 - alpha) * noise
+    def _get_x_source(self, z_img: torch.Tensor) -> torch.Tensor:
+        """
+        Apply cosine-schedule noise to the image latent to produce the ODE
+        starting distribution, matching the original DepthFM exactly.
+
+        Mirrors dfm.py:
+            if self.noising_step > 0:
+                x_source = q_sample(x_source, self.noising_step)
+        """
+        if self.model.noising_step > 0:
+            return q_sample(z_img, self.model.noising_step)
+        return z_img.clone()
 
     def _encode(self, pixels: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -124,14 +131,20 @@ class DepthFMLightningModule(L.LightningModule):
     def _predict_depth(
             self, z_img: torch.Tensor, num_steps: int = 1
     ) -> torch.Tensor:
-        """Multi-step Euler ODE solve from image latent to depth latent."""
-        z_t = z_img.clone()
+        """
+        Multi-step Euler ODE solve from image latent to depth latent.
+
+        Matches dfm.py exactly:
+          - ODE starts from q_sample(z_img, noising_step)  (noised source)
+          - Context (channel-concat) is the CLEAN z_img
+        """
+        x_source = self._get_x_source(z_img)   # q_sample noise on starting point
+        z_t = x_source
         dt = 1.0 / num_steps
         for step in range(num_steps):
             t_val = step * dt
             t = torch.full((z_t.shape[0],), t_val, device=self.device)
-            z_cond = self._noise_augment(z_img)
-            v = self.model.predict_velocity(z_t, t, z_cond)
+            v = self.model.predict_velocity(z_t, t, z_img)  # clean image as context
             z_t = z_t + dt * v
         return z_t
 
@@ -141,15 +154,14 @@ class DepthFMLightningModule(L.LightningModule):
     ) -> dict[float, torch.Tensor]:
         """Return decoded depth at intermediate ODE timesteps."""
         intermediates = {}
-        z_t = z_img.clone()
+        x_source = self._get_x_source(z_img)   # noised starting point
+        z_t = x_source
         dt = 1.0 / num_steps
-        # Record starting point
         intermediates[0.0] = self._decode(z_t)[:, 0].float().cpu().numpy()
         for step in range(num_steps):
             t_val = step * dt
             t = torch.full((z_t.shape[0],), t_val, device=self.device)
-            z_cond = self._noise_augment(z_img)
-            v = self.model.predict_velocity(z_t, t, z_cond)
+            v = self.model.predict_velocity(z_t, t, z_img)  # clean image as context
             z_t = z_t + dt * v
             t_after = (step + 1) * dt
             decoded = self._decode(z_t)[:, 0].float().cpu().numpy()
@@ -176,15 +188,21 @@ class DepthFMLightningModule(L.LightningModule):
         B = z_img.shape[0]
         t = self._sample_timesteps(B)
 
-        v_target = z_depth - z_img
+        # Apply cosine noise to get the source distribution — matches dfm.py:
+        #   x_source = q_sample(ims_z, self.noising_step)
+        # The velocity field maps x_source → z_depth, so the target and
+        # interpolation are both relative to the noised source, not clean z_img.
+        x_source = self._get_x_source(z_img)
+        v_target = z_depth - x_source
 
         sigma_min = self.fm.get("sigma_min", 1e-4)
         t_exp = t.view(-1, 1, 1, 1)
-        eps = torch.randn_like(z_img)
-        z_t = (1.0 - t_exp) * z_img + t_exp * z_depth + sigma_min * eps
+        eps = torch.randn_like(x_source)
+        z_t = (1.0 - t_exp) * x_source + t_exp * z_depth + sigma_min * eps
 
-        z_cond = self._noise_augment(z_img)
-        v_pred = self.model.predict_velocity(z_t, t, z_cond)
+        # Conditioning is the CLEAN image latent (channel-concat inside UNet),
+        # matching dfm.py: context = ims_z  (not the noised x_source)
+        v_pred = self.model.predict_velocity(z_t, t, z_img)
 
         # Pixel-space losses: project velocity → clean depth estimate (x₀ prediction)
         # x₀_pred = z_t + (1 − t) × v_pred  (rectified flow identity)
@@ -240,12 +258,13 @@ class DepthFMLightningModule(L.LightningModule):
         pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
         gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
 
-        # Velocity loss for logging
-        v_target = z_depth - z_img
+        # Velocity loss for logging — must match training_step
+        x_source = self._get_x_source(z_img)
+        v_target = z_depth - x_source
         t = self._sample_timesteps(z_img.shape[0])
         t_exp = t.view(-1, 1, 1, 1)
-        z_t = (1.0 - t_exp) * z_img + t_exp * z_depth
-        v_pred = self.model.predict_velocity(z_t, t, z_img)
+        z_t = (1.0 - t_exp) * x_source + t_exp * z_depth
+        v_pred = self.model.predict_velocity(z_t, t, z_img)  # clean z_img
         vel_loss = F.mse_loss(v_pred, v_target)
         self.log("val/loss", vel_loss, prog_bar=True, sync_dist=True)
 

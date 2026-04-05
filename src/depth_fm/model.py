@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _SCALE_FACTOR = 0.18215
 
 
-def load_sd21_backend(depthfm_checkpoint: str, vae_id: str, device: str = "cpu") -> Tuple[
+def load_sd21_backend(depthfm_checkpoint: str, vae_id: str, device: str = "cpu", use_checkpoint=True) -> Tuple[
     nn.Module, AutoencoderKL, int, torch.Tensor]:
     """
     Load the actual DepthFM model from the official checkpoint.
@@ -48,6 +48,7 @@ def load_sd21_backend(depthfm_checkpoint: str, vae_id: str, device: str = "cpu")
     noising_step = ckpt["noising_step"]
     empty_text_embed = torch.from_numpy(ckpt["empty_text_embedding"]).to(device=device)  # (1, seq_len, 1024)
     ldm_hparams = dict(ckpt["ldm_hparams"])  # copy to avoid mutation
+    ldm_hparams["use_checkpoint"] = use_checkpoint
 
     unet = UNetModel(**ldm_hparams)
     missing, unexpected = unet.load_state_dict(ckpt["state_dict"], strict=True)
@@ -136,6 +137,90 @@ class MarsDepthFM(nn.Module):
         latent_unscaled = latent / self.scale_factor
         return self.vae.decode(latent_unscaled).sample
 
+    # ------------------------------------------------------------------
+    # Inference API — mirrors DepthFM.forward() / predict_depth() exactly
+    # ------------------------------------------------------------------
+
+    def forward(
+            self,
+            ims: torch.Tensor,
+            num_steps: int = 2,
+            ensemble_size: int = 4,
+    ) -> torch.Tensor:
+        """
+        Full inference forward — mirrors DepthFM.forward() line-for-line.
+
+        Args:
+            ims: (1, 3, H, W) in [-1, 1]
+            num_steps: Euler ODE steps
+            ensemble_size: repeat image in batch; average depth at end
+
+        Returns:
+            depth: (1, 1, H, W) in [0, 1]
+        """
+        from depth_fm.noise import q_sample, per_sample_min_max_normalization
+
+        if ensemble_size > 1:
+            assert ims.shape[0] == 1, "Ensemble mode only supported with batch size 1"
+            ims = ims.repeat(ensemble_size, 1, 1, 1)
+
+        bs = ims.shape[0]
+        device = ims.device
+
+        # Encode image latent (mode, no sampling) — mirrors DepthFM.encode(sample_posterior=False)
+        ims_z = self.encode_to_latent(ims)
+
+        # Null text conditioning (cross-attention) — matches dfm.py repeat semantics
+        conditioning = self.empty_text_embed.to(device=device, dtype=ims_z.dtype).expand(bs, -1, -1)
+
+        # Clean image latent for channel-concat conditioning
+        context = ims_z
+
+        # Noise-augment the ODE starting point — matches dfm.py exactly:
+        #   if self.noising_step > 0: x_source = q_sample(x_source, self.noising_step)
+        x_source = ims_z.clone()
+        if self.noising_step > 0:
+            x_source = q_sample(x_source, self.noising_step)
+
+        # Euler ODE: x_source → depth_z  (equivalent to torchdiffeq Euler in dfm.py)
+        z_t = x_source
+        dt = 1.0 / num_steps
+        for step in range(num_steps):
+            t_val = step * dt
+            t = torch.full((bs,), t_val, device=device, dtype=z_t.dtype)
+            # UNet forward: channel-concat with context (clean image), cross-attn with conditioning
+            v = self.backbone(x=z_t, t=t, context=context, context_ca=conditioning)
+            z_t = z_t + dt * v
+
+        depth_z = z_t
+
+        # Decode + channel mean — matches dfm.py: depth.mean(dim=1, keepdim=True)
+        depth = self.decode_from_latent(depth_z)  # (E, 3, H, W)
+        depth = depth.mean(dim=1, keepdim=True)  # (E, 1, H, W)
+
+        if ensemble_size > 1:
+            depth = depth.mean(dim=0, keepdim=True)  # (1, 1, H, W)
+
+        # exp() then per-sample min-max normalize → [0, 1]  — matches dfm.py
+        depth = per_sample_min_max_normalization(depth.exp())
+
+        return depth
+
+    @torch.no_grad()
+    def predict_depth(
+            self,
+            ims: torch.Tensor,
+            num_steps: int = 2,
+            ensemble_size: int = 4,
+    ) -> torch.Tensor:
+        """
+        Public inference API — mirrors DepthFM.predict_depth() exactly.
+
+        Returns:
+            depth: (1, 1, H, W) in [0, 1]
+        """
+        return self.forward(ims, num_steps, ensemble_size)
+
     def predict_velocity(
             self,
             z_t: torch.Tensor,
@@ -190,6 +275,7 @@ def build_model(config) -> MarsDepthFM:
     backbone, vae, noising_step, empty_text_embed = load_sd21_backend(
         depthfm_checkpoint=config.model.depthfm_checkpoint,
         vae_id=config.model.vae_id,
+        use_checkpoint=config.model.use_checkpoint
     )
 
     model = MarsDepthFM(

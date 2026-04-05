@@ -10,7 +10,9 @@ model:
   gradient_checkpointing: true
 
   torch_compile: true
-  torch_compile_mode: "max-autotune"
+  torch_compile_mode: "default"
+  full_graph: true
+  use_checkpoint: false
 
 data:
   source: "hirise"
@@ -74,9 +76,9 @@ training:
 
   losses:
     velocity_weight: 1.0
-    normals_weight: 0.05
-    normals_start_step: 2000
-    grad_weight: 0.1         # multi-scale gradient loss (no extra install)
+    normals_weight: 100.0
+    normals_start_step: 1000
+    grad_weight: 10.0         # multi-scale gradient loss (no extra install)
     grad_start_step: 500
     grad_scales: [1, 2, 4]
     # Focal Frequency Loss (requires: pip install focal-frequency-loss)

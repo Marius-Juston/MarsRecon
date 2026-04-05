@@ -188,7 +188,8 @@ def run_single_training(
                 logger.warning("Failed to load Mega-Cache artifacts: %s", e)
 
         compile_mode = config.model.get("torch_compile_mode", "default")
-        module.model.backbone = torch.compile(module.model.backbone, mode=compile_mode)
+        full_graph = config.model.get("full_graph", False)
+        module.model.backbone = torch.compile(module.model.backbone, mode=compile_mode, fullgraph=full_graph)
         logger.info("torch.compile enabled on UNet backbone (mode=%s)", compile_mode)
 
     # Callbacks
