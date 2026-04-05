@@ -100,7 +100,8 @@ def build_dataloaders(config, split_seed: int = 42):
     )
 
     resolution = config.data.get("resolution", 512)
-    dtm_norm = config.data.get("dtm_normalization", "minmax")
+    dtm_norm = config.data.get("dtm_normalization", "relative")
+    stats_path = config.data.get("stats_path")
 
     loaders = {}
 
@@ -122,6 +123,7 @@ def build_dataloaders(config, split_seed: int = 42):
             dtm_normalization=dtm_norm,
             random_flip=is_train,
             brightness_jitter=config.data.get("brightness_jitter", 0.1) if is_train else 0.0,
+            stats_path=stats_path,
         )
 
         loaders[split] = DataLoader(
@@ -173,6 +175,22 @@ def run_single_training(
     # Move VAE to appropriate device
     module.model.vae = module.model.vae.to("cuda" if torch.cuda.is_available() else "cpu")
 
+    cache_path = Path(config.training.get("cache_dir", ".torch_compile_cache")) / "mega_cache.pt"
+
+    # torch.compile backbone for training speed (max-autotune triggers kernel auto-tuning)
+    if config.model.get("torch_compile", False):
+        if cache_path.exists():
+            logger.info("Loading torch.compile Mega-Cache artifacts from %s", cache_path)
+            try:
+                with open(cache_path, "rb") as f:
+                    torch.compiler.load_cache_artifacts(f.read())
+            except Exception as e:
+                logger.warning("Failed to load Mega-Cache artifacts: %s", e)
+
+        compile_mode = config.model.get("torch_compile_mode", "default")
+        module.model.backbone = torch.compile(module.model.backbone, mode=compile_mode)
+        logger.info("torch.compile enabled on UNet backbone (mode=%s)", compile_mode)
+
     # Callbacks
     callbacks = [
         EMACallback(),
@@ -208,12 +226,20 @@ def run_single_training(
         )
 
     # Trainer
+    _prec = config.training.mixed_precision
+    if _prec == "bf16":
+        precision = "bf16-mixed"
+    elif _prec in ("f16", "fp16"):
+        precision = "16-mixed"
+    else:
+        precision = "32-true"
+
     trainer = L.Trainer(
         max_steps=config.training.max_steps,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=config.training.num_gpus,
         strategy="ddp" if config.training.num_gpus > 1 else "auto",
-        precision="bf16-mixed" if config.training.mixed_precision == "bf16" else "32",
+        precision=precision,
         callbacks=callbacks,
         logger=wandb_logger,
         val_check_interval=config.training.val_every_steps,
@@ -268,6 +294,18 @@ def run_single_training(
     # Collect results
     test_summary = module._test_aggregator.summary()
     test_df = module._test_aggregator.per_sample_dataframe()
+
+    if config.model.get("torch_compile", False):
+        logger.info("Extracting torch.compile Mega-Cache artifacts...")
+        artifacts = torch.compiler.save_cache_artifacts()
+        if artifacts is not None:
+            artifact_bytes, cache_info = artifacts
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "wb") as f:
+                f.write(artifact_bytes)
+            logger.info("Mega-Cache saved successfully to %s. Info: %s", cache_path, cache_info)
+        else:
+            logger.info("No compiler artifacts found to save.")
 
     # Save per-sample test results
     test_df.to_csv(output_dir / "test_results.csv", index=False)
@@ -492,6 +530,8 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
 def main():
     import warnings
     warnings.filterwarnings("ignore", message=r".*isinstance(treespec, LeafSpec).*")
+    warnings.filterwarnings("ignore", message=r"Found \d+ module")
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
     parser = argparse.ArgumentParser(description="Train Mars DepthFM")
     parser.add_argument("--config", type=str, default="configs/train_hirise.yaml")

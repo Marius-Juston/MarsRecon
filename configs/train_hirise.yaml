@@ -9,6 +9,9 @@ model:
   freeze_encoder: false
   gradient_checkpointing: true
 
+  torch_compile: true
+  torch_compile_mode: "max-autotune"
+
 data:
   source: "hirise"
 
@@ -39,7 +42,8 @@ data:
   latent_dir: null
 
   resolution: 512
-  dtm_normalization: "log"
+  dtm_normalization: "relative"
+  stats_path: "dataset_stats/dtm/dataset_stats.json"
   random_flip: true
   brightness_jitter: 0.1
 
@@ -59,7 +63,7 @@ training:
   adam_beta2: 0.999
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
-  mixed_precision: "f16"
+  mixed_precision: "bf16"
 
   flow_matching:
     timestep_sampling: "logit_normal"
@@ -70,9 +74,15 @@ training:
 
   losses:
     velocity_weight: 1.0
-    normals_weight: 0.1
+    normals_weight: 0.05
     normals_start_step: 2000
-    use_confidence_weighting: false
+    grad_weight: 0.1         # multi-scale gradient loss (no extra install)
+    grad_start_step: 500
+    grad_scales: [1, 2, 4]
+    # Focal Frequency Loss (requires: pip install focal-frequency-loss)
+    freq_weight: 0.0
+    freq_start_step: 1000
+    freq_alpha: 1.0
 
   # Validation and checkpointing
   val_every_steps: 0.5

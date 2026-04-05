@@ -50,9 +50,15 @@ class DepthFMLightningModule(L.LightningModule):
         lc = config.training.losses
         self.loss_fn = CombinedLoss(
             velocity_weight=lc.velocity_weight,
-            normals_weight=lc.normals_weight,
-            normals_start_step=lc.normals_start_step,
+            normals_weight=lc.get("normals_weight", 0.1),
+            normals_start_step=lc.get("normals_start_step", 2000),
             use_confidence_weighting=lc.get("use_confidence_weighting", False),
+            freq_weight=lc.get("freq_weight", 0.0),
+            freq_start_step=lc.get("freq_start_step", 0),
+            freq_alpha=lc.get("freq_alpha", 1.0),
+            grad_weight=lc.get("grad_weight", 0.0),
+            grad_start_step=lc.get("grad_start_step", 0),
+            grad_scales=tuple(lc.get("grad_scales", [1, 2, 4])),
         )
 
         # Flow matching config
@@ -103,6 +109,16 @@ class DepthFMLightningModule(L.LightningModule):
         with torch.no_grad():
             return self.model.decode_from_latent(latent)
 
+    def _decode_pixel_loss(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode to pixel space WITH gradient tracking.
+
+        Used for pixel-space losses (FFL, gradient matching, normals) so that
+        gradients flow back through the frozen VAE decoder to the predicted
+        velocity.  The VAE parameters are frozen (requires_grad=False) so they
+        are never updated; only the backbone gradients accumulate.
+        """
+        return self.model.decode_from_latent(latent)
+
     @torch.no_grad()
     def _predict_depth(
             self, z_img: torch.Tensor, num_steps: int = 1
@@ -127,7 +143,7 @@ class DepthFMLightningModule(L.LightningModule):
         z_t = z_img.clone()
         dt = 1.0 / num_steps
         # Record starting point
-        intermediates[0.0] = self._decode(z_t)[:, 0].cpu().numpy()
+        intermediates[0.0] = self._decode(z_t)[:, 0].float().cpu().numpy()
         for step in range(num_steps):
             t_val = step * dt
             t = torch.full((z_t.shape[0],), t_val, device=self.device)
@@ -135,7 +151,7 @@ class DepthFMLightningModule(L.LightningModule):
             v = self.model.predict_velocity(z_t, t, z_cond)
             z_t = z_t + dt * v
             t_after = (step + 1) * dt
-            decoded = self._decode(z_t)[:, 0].cpu().numpy()
+            decoded = self._decode(z_t)[:, 0].float().cpu().numpy()
             intermediates[t_after] = decoded
         return intermediates
 
@@ -160,14 +176,14 @@ class DepthFMLightningModule(L.LightningModule):
         z_cond = self._noise_augment(z_img)
         v_pred = self.model.predict_velocity(z_t, t, z_cond)
 
-        # Normals loss: decode predicted depth for pixel-space comparison
+        # Pixel-space losses: project velocity → clean depth estimate (x₀ prediction)
+        # x₀_pred = z_t + (1 − t) × v_pred  (rectified flow identity)
         pred_pix = gt_pix = None
         step = self.global_step
-        lc = self.config.training.losses
-        if lc.normals_weight > 0 and step >= lc.normals_start_step:
-            z_pred = z_img + v_pred
-            pred_pix = self._decode(z_pred)
-            gt_pix = self._decode(z_depth)
+        if self.loss_fn.needs_pixel_decode(step):
+            z_pred_clean = z_t + (1.0 - t_exp) * v_pred
+            pred_pix = self._decode_pixel_loss(z_pred_clean)
+            gt_pix = self._decode_pixel_loss(z_depth)
 
         loss_dict = self.loss_fn(
             v_pred, v_target, pred_pix, gt_pix,
@@ -179,6 +195,8 @@ class DepthFMLightningModule(L.LightningModule):
         self.log("train/loss", loss_dict["total"], prog_bar=True, sync_dist=True)
         self.log("train/loss_velocity", loss_dict["velocity"], sync_dist=True)
         self.log("train/loss_normals", loss_dict["normals"], sync_dist=True)
+        self.log("train/loss_freq", loss_dict["freq"], sync_dist=True)
+        self.log("train/loss_grad", loss_dict["grad"], sync_dist=True)
         self.log("train/lr", self.optimizers().param_groups[0]["lr"], sync_dist=False)
 
         if self.val_history and batch_idx == 0:
@@ -201,8 +219,8 @@ class DepthFMLightningModule(L.LightningModule):
         z_pred = self._predict_depth(z_img, num_steps=1)
 
         # Decode to pixel space
-        pred_pix = self._decode(z_pred)[:, 0].cpu().numpy()
-        gt_pix = self._decode(z_depth)[:, 0].cpu().numpy()
+        pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
+        gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
 
         # Velocity loss for logging
         v_target = z_depth - z_img
@@ -262,7 +280,7 @@ class DepthFMLightningModule(L.LightningModule):
             import matplotlib.pyplot as plt
 
             # Take first sample
-            img_np = batch["image"][0].cpu().numpy()
+            img_np = batch["image"][0].float().cpu().numpy()
             if img_np.shape[0] == 3:
                 img_np = np.transpose(img_np, (1, 2, 0))
                 img_np = (img_np + 1) / 2  # [-1,1] → [0,1]
@@ -350,8 +368,8 @@ class DepthFMLightningModule(L.LightningModule):
         num_steps = self.config.training.get("test_euler_steps", 4)
         z_pred = self._predict_depth(z_img, num_steps=num_steps)
 
-        pred_pix = self._decode(z_pred)[:, 0].cpu().numpy()
-        gt_pix = self._decode(z_depth)[:, 0].cpu().numpy()
+        pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
+        gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
 
         for i in range(pred_pix.shape[0]):
             tile_id = batch.get("tile_id", [""])[i] if "tile_id" in batch else f"b{batch_idx}_s{i}"
@@ -424,8 +442,8 @@ class DepthFMLightningModule(L.LightningModule):
 
                 z_pred = self._predict_depth(z_img, num_steps=n_steps)
 
-                pred_pix = self._decode(z_pred)[:, 0].cpu().numpy()
-                gt_pix = self._decode(z_depth)[:, 0].cpu().numpy()
+                pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
+                gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
 
                 for i in range(pred_pix.shape[0]):
                     tile_id = (

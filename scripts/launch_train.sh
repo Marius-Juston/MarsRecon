@@ -15,12 +15,15 @@ echo "  Runs:     ${N_RUNS}"
 echo "  Seed:     ${SEED}"
 echo "═══════════════════════════════════════════════════════════════"
 
+export PYTHONPATH=src
 export OMP_NUM_THREADS=32
 export TOKENIZERS_PARALLELISM=false
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_DISABLE=1
+# Reduce memory fragmentation on large-VRAM cards (A6000 = 48 GB)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-PYTHUONPATH=src uv run -m src.depth_fm.train_lightning.py \
+uv run python -m depth_fm.train_lightning \
     --config "${CONFIG}" \
     --n_runs "${N_RUNS}" \
     --seed "${SEED}" \

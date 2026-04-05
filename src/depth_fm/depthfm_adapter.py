@@ -29,7 +29,8 @@ Usage with the HiRISE sampler::
         base_dataset=base,
         sampler=sampler,
         resolution=512,
-        dtm_normalization="minmax",
+        dtm_normalization="relative",
+        stats_path="dataset_stats/dtm/dataset_stats.json",
     )
 
     # Standard PyTorch DataLoader
@@ -38,8 +39,10 @@ Usage with the HiRISE sampler::
 
 from __future__ import annotations
 
+import json
 import logging
 import random
+from pathlib import Path
 from typing import Literal
 
 import torch
@@ -48,55 +51,131 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+# Hardcoded fallback quantiles derived from dataset_stats/dtm/dataset_stats.json
+# (Olympus Mons region, 52 k patches)
+_DEFAULT_ELEV_P02 = -4396.57
+_DEFAULT_ELEV_P98 = 20757.66
+_DEFAULT_IMG_P02 = 0.0502  # average of left_red / right_red p02
+_DEFAULT_IMG_P98 = 0.2450  # average of left_red / right_red p98
+# Scale factor for relative-topography mode: 98th-percentile of patch-centred
+# elevation distribution (metres).  98 % of patches stay within [-1, 1] before
+# clamping while physical slope magnitudes remain consistent across the dataset.
+_DEFAULT_ELEV_SCALE = 26.74  # centered_p98[elevation] from Olympus stats
 
-def _normalize_dtm(
-        elevation: torch.Tensor,
-        method: Literal["minmax", "log"] = "minmax",
-) -> torch.Tensor:
-    """Normalise a (1, H, W) elevation tensor to [-1, 1].
 
-    Args:
-        elevation: Raw elevation in metres; NaN = nodata.
-        method: ``"minmax"`` (per-tile linear) or ``"log"`` (log-transform).
+def _load_quantiles(
+        stats_path: str | None,
+) -> tuple[float, float, float, float, float]:
+    """Load elevation and image p02/p98, plus elevation scale, from dataset_stats JSON.
 
     Returns:
-        (1, H, W) tensor in [-1, 1] with NaN filled to 0.
+        (elev_p02, elev_p98, img_p02, img_p98, elev_scale)
+    """
+    if stats_path is None:
+        return (
+            _DEFAULT_ELEV_P02, _DEFAULT_ELEV_P98,
+            _DEFAULT_IMG_P02, _DEFAULT_IMG_P98,
+            _DEFAULT_ELEV_SCALE,
+        )
+
+    path = Path(stats_path)
+    if not path.exists():
+        logger.warning("Stats file not found: %s — using hardcoded defaults", stats_path)
+        return (
+            _DEFAULT_ELEV_P02, _DEFAULT_ELEV_P98,
+            _DEFAULT_IMG_P02, _DEFAULT_IMG_P98,
+            _DEFAULT_ELEV_SCALE,
+        )
+
+    with open(path) as f:
+        stats = json.load(f)
+
+    channels = stats["channels"]  # ["elevation", "left_red", "right_red"]
+    p02 = stats["p02"]
+    p98 = stats["p98"]
+    centered_p98 = stats["centered_p98"]
+
+    elev_idx = channels.index("elevation")
+    left_idx = channels.index("left_red") if "left_red" in channels else None
+    right_idx = channels.index("right_red") if "right_red" in channels else None
+
+    elev_p02 = p02[elev_idx]
+    elev_p98 = p98[elev_idx]
+    # Symmetric scale: use centered_p98 so 98 % of patch relief lands in [-1, 1]
+    elev_scale = centered_p98[elev_idx]
+
+    if left_idx is not None and right_idx is not None:
+        img_p02 = (p02[left_idx] + p02[right_idx]) / 2.0
+        img_p98 = (p98[left_idx] + p98[right_idx]) / 2.0
+    elif left_idx is not None:
+        img_p02, img_p98 = p02[left_idx], p98[left_idx]
+    elif right_idx is not None:
+        img_p02, img_p98 = p02[right_idx], p98[right_idx]
+    else:
+        img_p02, img_p98 = _DEFAULT_IMG_P02, _DEFAULT_IMG_P98
+
+    return elev_p02, elev_p98, img_p02, img_p98, elev_scale
+
+
+def _normalize_dtm_relative(
+        elevation: torch.Tensor,
+        scale_factor: float,
+) -> torch.Tensor:
+    """Normalise elevation via local centering + fixed global scale.
+
+    This produces "relative topography": the absolute Martian altitude (datum)
+    is subtracted per-patch (unlearnable from orthorectified overhead imagery),
+    while a fixed physical scale maps consistent slope magnitudes to the same
+    latent values everywhere in the dataset.
+
+    Args:
+        elevation: Raw elevation in metres; NaN = nodata.  Shape (1, H, W).
+        scale_factor: Half the expected relief range in metres.  Values in
+            ``[-scale_factor, +scale_factor]`` map to ``[-1, 1]``.  Use the
+            dataset ``centered_p98`` for the elevation channel so that 98 % of
+            real patches land within range before clamping.
+
+    Returns:
+        (1, H, W) tensor in [-1, 1]; nodata pixels filled with 0.
     """
     valid = torch.isfinite(elevation)
     if not valid.any():
         return torch.zeros_like(elevation)
 
-    vals = elevation[valid]
+    # 1. Remove absolute altitude — the network cannot infer this from texture
+    patch_mean = elevation[valid].mean()
+    centered = elevation - patch_mean
 
-    if method == "log":
-        shift = vals.min()
-        elev_shifted = torch.where(valid, elevation - shift + 1.0, torch.ones_like(elevation))
-        elev_log = torch.log(elev_shifted)
-        lmin = elev_log[valid].min()
-        lmax = elev_log[valid].max()
-        if lmax - lmin < 1e-8:
-            return torch.zeros_like(elevation)
-        normed = 2.0 * (elev_log - lmin) / (lmax - lmin) - 1.0
-    else:  # minmax
-        vmin, vmax = vals.min(), vals.max()
-        if vmax - vmin < 1e-8:
-            return torch.zeros_like(elevation)
-        normed = 2.0 * (elevation - vmin) / (vmax - vmin) - 1.0
+    # 2. Fixed physical scale: a 10 m ridge always produces the same latent delta
+    normed = centered / scale_factor
 
+    # 3. Clamp extreme outliers (craters, scarps) without distorting the core
+    normed = torch.clamp(normed, -1.0, 1.0)
     normed = torch.where(valid, normed, torch.zeros_like(normed))
     return normed
 
 
-def _normalize_ortho(ortho: torch.Tensor) -> torch.Tensor:
-    """Normalise an orthoimage from I/F [0, 1] to [-1, 1].
+def _normalize_ortho(
+        ortho: torch.Tensor,
+        p02: float,
+        p98: float,
+) -> torch.Tensor:
+    """Normalise an orthoimage using global dataset quantiles to [-1, 1].
+
+    Applies the same linear formula as the paper:
+        ĩ = ((i − p02) / (p98 − p02) − 0.5) × 2
 
     Args:
-        ortho: (C, H, W) in [0, 1] (I/F reflectance).
+        ortho: (C, H, W) in I/F reflectance [0, 1].
+        p02: Dataset-level 2nd-percentile reflectance.
+        p98: Dataset-level 98th-percentile reflectance.
 
     Returns:
-        (C, H, W) in [-1, 1].
+        (C, H, W) in [-1, 1], clamped.
     """
-    return ortho * 2.0 - 1.0
+    range_ = p98 - p02
+    normed = ((ortho - p02) / range_ - 0.5) * 2.0
+    return torch.clamp(normed, -1.0, 1.0)
 
 
 def _to_3ch(tensor: torch.Tensor) -> torch.Tensor:
@@ -127,9 +206,13 @@ class DepthFMHiRISEAdapter(Dataset):
         base_dataset: An initialised ``MarsHiRISEDTM`` instance.
         sampler: A TorchGeo geo-sampler that yields GeoSlice indices.
         resolution: Output spatial resolution in pixels (square crop).
-        dtm_normalization: ``"minmax"`` or ``"log"``.
+        dtm_normalization: ``"relative"`` (default) — local centering + fixed
+            physical scale derived from ``centered_p98`` in the stats file.
+            ``"log"`` / ``"linear"`` — global quantile modes (kept for reference).
         random_flip: Apply random horizontal/vertical flips.
         brightness_jitter: Max relative brightness perturbation on image only.
+        stats_path: Path to ``dataset_stats.json`` for normalization quantiles.
+            Falls back to hardcoded Olympus-region defaults if ``None``.
     """
 
     def __init__(
@@ -137,9 +220,10 @@ class DepthFMHiRISEAdapter(Dataset):
             base_dataset,
             sampler,
             resolution: int = 512,
-            dtm_normalization: Literal["minmax", "log"] = "minmax",
+            dtm_normalization: Literal["relative", "log", "linear"] = "relative",
             random_flip: bool = True,
             brightness_jitter: float = 0.1,
+            stats_path: str | None = None,
     ):
         super().__init__()
         self.base = base_dataset
@@ -148,6 +232,17 @@ class DepthFMHiRISEAdapter(Dataset):
         self.dtm_norm = dtm_normalization
         self.flip = random_flip
         self.bright_jitter = brightness_jitter
+
+        # Load global quantiles for normalization
+        (
+            self.elev_p02, self.elev_p98,
+            self.img_p02, self.img_p98,
+            self.elev_scale,
+        ) = _load_quantiles(stats_path)
+        logger.info(
+            "DepthFMHiRISEAdapter: elev scale=%.2f m, img p02=%.4f p98=%.4f (norm=%s)",
+            self.elev_scale, self.img_p02, self.img_p98, dtm_normalization,
+        )
 
         # Pre-materialise sampler indices for random access
         self._indices = list(sampler)
@@ -170,7 +265,7 @@ class DepthFMHiRISEAdapter(Dataset):
         if elevation.ndim == 4:
             elevation = elevation[0]  # remove batch dim from DataLoader
 
-        dtm = _normalize_dtm(elevation, method=self.dtm_norm)
+        dtm = _normalize_dtm_relative(elevation, scale_factor=self.elev_scale)
         dtm = _to_3ch(dtm)
         dtm = _resize(dtm, self.resolution)
 
@@ -204,7 +299,7 @@ class DepthFMHiRISEAdapter(Dataset):
         if ortho.ndim == 4:
             ortho = ortho[0]
 
-        image = _normalize_ortho(ortho)
+        image = _normalize_ortho(ortho, p02=self.img_p02, p98=self.img_p98)
         image = _to_3ch(image)
         image = _resize(image, self.resolution)
 
