@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 
 import lightning as L
 import numpy as np
@@ -159,6 +160,15 @@ class DepthFMLightningModule(L.LightningModule):
     # Training step
     # ------------------------------------------------------------------
 
+    # def on_train_batch_start(self, batch: Any, batch_idx: int) -> None:
+    #     """
+    #     Signals to the CUDAGraphs memory allocator that a new execution
+    #     step is beginning BEFORE the compiled model is invoked.
+    #     This perfectly protects the gradient checkpointing buffers.
+    #     """
+    #     if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+    #         torch.compiler.cudagraph_mark_step_begin()
+
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         z_img = self._encode(batch["image"])
         z_depth = self._encode(batch["dtm"])
@@ -207,6 +217,14 @@ class DepthFMLightningModule(L.LightningModule):
     # ------------------------------------------------------------------
     # Validation step
     # ------------------------------------------------------------------
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        checkpoint["ema_shadow"] = self._ema_shadow
+        checkpoint["ema_initialised"] = self._ema_initialised
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        self._ema_shadow = checkpoint.get("ema_shadow", {})
+        self._ema_initialised = checkpoint.get("ema_initialised", False)
 
     def on_validation_epoch_start(self) -> None:
         self._val_aggregator = MetricsAggregator()
@@ -467,6 +485,47 @@ class DepthFMLightningModule(L.LightningModule):
 
         self.train()
         return results
+
+    # ------------------------------------------------------------------
+    # DDP gradient contiguity fix
+    # ------------------------------------------------------------------
+
+    def on_train_start(self) -> None:
+        """Register backward hooks on the specific Conv2d weights that produce
+        channels_last gradients under torch.compile(mode='max-autotune').
+
+        Root cause: max-autotune selects Triton kernels for 1×1 Conv2d backward
+        that write weight gradients in channels_last layout, e.g.:
+          grad strides   = [960, 1, 960, 960]  (channels_last NHWC)
+          bucket strides = [960, 1, 1, 1]      (contiguous NCHW expected by DDP)
+        DDP falls back to a slower copy path and warns:
+          "Grad strides do not match bucket view strides."
+
+        Scope: only 1×1 Conv2d weights — the sole source of channels_last grads.
+        All other parameters (Linear, GroupNorm, 3×3 Conv) produce contiguous
+        gradients so registering hooks on them would be pure overhead.
+
+        Single-GPU training (strategy='auto') has no DDP reducer at all so this
+        is entirely a no-op in that case, but registering a handful of hooks is
+        still harmless.
+        """
+        _contiguous_hook = lambda g: g.contiguous() if not g.is_contiguous() else g
+
+        n_hooks = 0
+        for module in self.model.backbone.modules():
+            if (
+                isinstance(module, torch.nn.Conv2d)
+                and module.kernel_size == (1, 1)
+                and module.weight.requires_grad
+            ):
+                module.weight.register_hook(_contiguous_hook)
+                n_hooks += 1
+
+        logger.info(
+            "Registered contiguous-gradient hooks on %d 1×1 Conv2d weights"
+            " (DDP channels_last stride fix)",
+            n_hooks,
+        )
 
     # ------------------------------------------------------------------
     # Optimizer & scheduler

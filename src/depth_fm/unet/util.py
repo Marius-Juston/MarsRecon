@@ -35,9 +35,10 @@ def checkpoint(func: callable, inputs: Iterable[torch.Tensor], params: Iterable[
     Note: 'params' is kept in the signature for backwards compatibility with
     older calling code, but PyTorch 2.x handles parameter gradients natively.
     """
+    # FIXME checkpointing does not work with max-autotune, so is completely disabled
     if flag:
         # use_reentrant=False safely bridges gradient checkpointing with torch.compile()
-        return cp.checkpoint(func, *inputs, use_reentrant=False)
+        return cp.checkpoint(func, *inputs, use_reentrant=False, preserve_rng_state=True)
 
     return func(*inputs)
 

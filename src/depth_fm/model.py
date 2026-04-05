@@ -156,8 +156,6 @@ class MarsDepthFM(nn.Module):
         Returns:
             v_pred: (B, 4, h, w) — predicted velocity
         """
-        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
 
         B = z_t.size(0)
 
