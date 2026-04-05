@@ -67,6 +67,7 @@ def load_model(ckpt_path: str, device: str):
         depthfm_checkpoint=ckpt_path,
         vae_id="runwayml/stable-diffusion-v1-5",
         device=device,
+        use_checkpoint=False,   # inference: no gradient checkpointing (matches original)
     )
     model = MarsDepthFM(
         backbone=backbone,

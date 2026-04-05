@@ -60,15 +60,17 @@ class FlowMatchingVelocityLoss(nn.Module):
         sq_error = (v_pred.float() - v_target.float()).pow(2)
 
         if self.use_confidence and confidence is not None:
-            if confidence.shape[-2:] != v_pred.shape[-2:]:
-                confidence = F.interpolate(
-                    confidence,
-                    size=v_pred.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            weight = confidence.clamp(0.1, 1.0)
-            sq_error = sq_error * weight
+            # Nearest neighbor interpolation ensures binary masks remain sharp
+            mask = F.interpolate(
+                confidence.float(),
+                size=v_pred.shape[-2:],
+                mode="nearest",
+            )
+            sq_error = sq_error * mask
+
+            # Normalize strictly by the active area to maintain gradient scale
+            active_elements = mask.sum() * v_pred.shape[1]
+            return sq_error.sum() / (active_elements + 1e-8)
 
         return sq_error.mean()
 
@@ -107,6 +109,7 @@ class SurfaceNormalsLoss(nn.Module):
             self,
             pred_depth: torch.Tensor,
             gt_depth: torch.Tensor,
+            confidence: torch.Tensor = None,
     ) -> torch.Tensor:
         if pred_depth.shape[1] == 3:
             pred_depth = pred_depth[:, :1]
@@ -117,7 +120,18 @@ class SurfaceNormalsLoss(nn.Module):
         gt_normals = self._compute_normals(gt_depth)
 
         cos_sim = (pred_normals * gt_normals).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
-        return (1.0 - cos_sim).mean().clamp(min=1e-6)
+        loss = 1.0 - cos_sim
+
+        if confidence is not None:
+            # Erode the mask by 1 pixel (radius of 3x3 Sobel) to prevent
+            # artificial gradients at the boundary of nodata regions.
+            # Min pooling achieved via inverted max pooling.
+            eroded_mask = -F.max_pool2d(-confidence.float(), kernel_size=3, stride=1, padding=1)
+
+            loss = loss * eroded_mask
+            return loss.sum() / (eroded_mask.sum() + 1e-8)
+
+        return loss.mean().clamp(min=1e-6)
 
 
 class MultiScaleGradientLoss(nn.Module):
@@ -150,33 +164,41 @@ class MultiScaleGradientLoss(nn.Module):
             self,
             pred_depth: torch.Tensor,
             gt_depth: torch.Tensor,
+            confidence: torch.Tensor = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            pred_depth: (B, 1, H, W) or (B, 3, H, W)
-            gt_depth:   (B, 1, H, W) or (B, 3, H, W)
-        Returns:
-            scalar loss
-        """
         if pred_depth.shape[1] == 3:
             pred_depth = pred_depth[:, :1]
         if gt_depth.shape[1] == 3:
             gt_depth = gt_depth[:, :1]
 
-        total = torch.tensor(0.0, device=pred_depth.device)
+        total_loss = torch.tensor(0.0, device=pred_depth.device)
+
         for s in self.scales:
             if s > 1:
                 p = F.avg_pool2d(pred_depth, kernel_size=s, stride=s)
                 g = F.avg_pool2d(gt_depth, kernel_size=s, stride=s)
+                m = F.avg_pool2d(confidence.float(), kernel_size=s, stride=s) if confidence is not None else None
             else:
-                p, g = pred_depth, gt_depth
+                p, g, m = pred_depth, gt_depth, (confidence.float() if confidence is not None else None)
 
             dy_p, dx_p = self._gradients(p)
             dy_g, dx_g = self._gradients(g)
 
-            total = total + (dy_p - dy_g).abs().mean() + (dx_p - dx_g).abs().mean()
+            err_y = (dy_p - dy_g).abs()
+            err_x = (dx_p - dx_g).abs()
 
-        return total / len(self.scales)
+            if m is not None:
+                # Gradient is only valid if both pixels involved in the difference are valid
+                m_dy = m[:, :, 1:, :] * m[:, :, :-1, :]
+                m_dx = m[:, :, :, 1:] * m[:, :, :, :-1]
+
+                loss_y = (err_y * m_dy).sum() / (m_dy.sum() + 1e-8)
+                loss_x = (err_x * m_dx).sum() / (m_dx.sum() + 1e-8)
+                total_loss = total_loss + loss_y + loss_x
+            else:
+                total_loss = total_loss + err_y.mean() + err_x.mean()
+
+        return total_loss / len(self.scales)
 
 
 class FocalFrequencyLoss(nn.Module):
@@ -202,7 +224,19 @@ class FocalFrequencyLoss(nn.Module):
             )
         self._ffl = _FFL(loss_weight=loss_weight, alpha=alpha)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            pred: torch.Tensor,
+            target: torch.Tensor,
+            confidence: torch.Tensor = None
+    ) -> torch.Tensor:
+
+        if confidence is not None:
+            # GT Injection: Replace predicted masked regions with GT to ensure
+            # zero discrepancy in the Fourier domain for invalid regions, preventing
+            # the Gibbs phenomenon (ringing artifacts) at mask boundaries.
+            pred = pred * confidence + target * (1.0 - confidence)
+
         return self._ffl(pred, target)
 
 
@@ -243,6 +277,10 @@ class CombinedLoss(nn.Module):
         self.freq_start = freq_start_step
         self.grad_weight = grad_weight
         self.grad_start = grad_start_step
+        self.use_confidence_weighting = use_confidence_weighting
+
+        if self.use_confidence_weighting:
+            logging.info("Using confidence weighting to improve nodata region filtering")
 
         if freq_weight > 0:
             if not _HAS_FFL:
@@ -286,7 +324,9 @@ class CombinedLoss(nn.Module):
         Returns:
             dict with "total", "velocity", "normals", "freq", "grad" losses
         """
-        l_vel = self.velocity_loss(v_pred, v_target, confidence)
+        active_conf = confidence if self.use_confidence_weighting else None
+
+        l_vel = self.velocity_loss(v_pred, v_target, active_conf)
 
         loss_dict = {
             "velocity": l_vel,
@@ -299,7 +339,7 @@ class CombinedLoss(nn.Module):
         has_pixels = pred_depth_pixels is not None and gt_depth_pixels is not None
 
         if self.norm_weight > 0 and global_step >= self.norm_start and has_pixels:
-            l_norm = self.normals_loss(pred_depth_pixels, gt_depth_pixels)
+            l_norm = self.normals_loss(pred_depth_pixels, gt_depth_pixels, active_conf)
             loss_dict["normals"] = l_norm
             total = total + self.norm_weight * l_norm
 
@@ -309,7 +349,7 @@ class CombinedLoss(nn.Module):
                 and global_step >= self.freq_start
                 and has_pixels
         ):
-            l_freq = self.ffl(pred_depth_pixels, gt_depth_pixels)
+            l_freq = self.ffl(pred_depth_pixels, gt_depth_pixels, active_conf)
             loss_dict["freq"] = l_freq
             total = total + self.freq_weight * l_freq
 
@@ -319,7 +359,7 @@ class CombinedLoss(nn.Module):
                 and global_step >= self.grad_start
                 and has_pixels
         ):
-            l_grad = self.grad_loss(pred_depth_pixels, gt_depth_pixels)
+            l_grad = self.grad_loss(pred_depth_pixels, gt_depth_pixels, active_conf)
             loss_dict["grad"] = l_grad
             total = total + self.grad_weight * l_grad
 

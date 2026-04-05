@@ -51,6 +51,70 @@ logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision('high')
 
+import torch
+from tqdm import tqdm
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@torch.no_grad()
+def compute_mask_statistics(dataloader, split_name="Dataset"):
+    """
+    Iterates through a DepthFM DataLoader to compute statistics on the confidence masks.
+    """
+    logger.info(f"Computing mask statistics for {split_name}...")
+
+    total_images = 0
+    fully_valid_images = 0
+    partially_masked_images = 0
+    empty_images = 0
+
+    total_valid_pixels = 0
+    total_pixels = 0
+
+    for batch in tqdm(dataloader, desc=f"Processing {split_name}"):
+        # Mask shape: (B, 1, H, W) where 1.0 is valid and 0.0 is nodata
+        mask = batch["confidence"]
+        B = mask.shape[0]
+        total_images += B
+
+        # Calculate the percentage of valid pixels per image in the batch
+        # .view(B, -1) flattens the spatial dimensions so we get (B, pixels)
+        per_image_mean = mask.view(B, -1).mean(dim=1)
+
+        # Categorize the images
+        fully_valid_images += (per_image_mean == 1.0).sum().item()
+        empty_images += (per_image_mean == 0.0).sum().item()
+        partially_masked_images += ((per_image_mean > 0.0) & (per_image_mean < 1.0)).sum().item()
+
+        # Aggregate global pixel counts
+        total_valid_pixels += mask.sum().item()
+        total_pixels += mask.numel()
+
+    # Compute final percentages
+    pct_fully_valid = (fully_valid_images / total_images) * 100 if total_images > 0 else 0
+    pct_partial = (partially_masked_images / total_images) * 100 if total_images > 0 else 0
+    pct_empty = (empty_images / total_images) * 100 if total_images > 0 else 0
+    global_valid_pct = (total_valid_pixels / total_pixels) * 100 if total_pixels > 0 else 0
+
+    logger.info("-" * 50)
+    logger.info(f"STATISTICS FOR: {split_name.upper()}")
+    logger.info("-" * 50)
+    logger.info(f"Total Images: {total_images}")
+    logger.info(f"  - 100% Valid Data (No Nodata):  {fully_valid_images} ({pct_fully_valid:.2f}%)")
+    logger.info(f"  - Partially Masked (Has Nodata): {partially_masked_images} ({pct_partial:.2f}%)")
+    logger.info(f"  - 100% Nodata (Completely Empty): {empty_images} ({pct_empty:.2f}%)")
+    logger.info(f"Global Valid Pixel Percentage:    {global_valid_pct:.2f}%")
+    logger.info("-" * 50)
+
+    return {
+        "total": total_images,
+        "fully_valid": fully_valid_images,
+        "partial": partially_masked_images,
+        "empty": empty_images,
+        "global_valid_pct": global_valid_pct
+    }
 
 # ---------------------------------------------------------------------------
 # Data module
@@ -543,6 +607,10 @@ def main():
     parser.add_argument("--fold_idx", type=int, default=0,
                         help="Which fold to use as test (0 to n_folds-1)")
     parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--analyze_masks_only", action="store_true",
+                        help="Run dataset mask statistics and exit without training")
+
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
@@ -559,6 +627,17 @@ def main():
     if args.n_folds is not None:
         config.data.n_folds = args.n_folds
         config.data.fold_idx = args.fold_idx
+
+    if args.analyze_masks_only:
+        logger.info("Executing isolated data profiling routine...")
+        L.seed_everything(args.seed, workers=True)
+        loaders = build_dataloaders(config, split_seed=args.seed)
+
+        for split_name, loader in loaders.items():
+            compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
+
+        logger.info("Data profiling complete. Exiting pipeline.")
+        return
 
     if args.n_runs > 1:
         run_multi_seed_experiment(config, n_runs=args.n_runs, base_seed=args.seed)

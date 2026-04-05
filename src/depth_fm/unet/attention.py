@@ -118,25 +118,20 @@ class CrossAttention(nn.Module):
         is_self_attention = context is None
         n_tokens = x.shape[1]
 
-        context = default(context, x)
         q = self.to_q(x)
+        context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
 
-        # Reshape to (Batch, Heads, SeqLen, Dim) -> Required for optimal FlashAttention dispatch
-        q = rearrange(q, "b n (h d) -> b h n d", h=self.heads)
-        k = rearrange(k, "b n (h d) -> b h n d", h=self.heads)
-        v = rearrange(v, "b n (h d) -> b h n d", h=self.heads)
+        # Use (b h) n d layout to match original exactly (same SDPA kernel path)
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=self.heads), (q, k, v))
 
-        scale = None
-        if rescale_attention and is_self_attention:
-            # Replicates the original repo's manual rescale logic when strictly requested
-            scale = (math.log(n_tokens) / math.log(n_tokens * 4) / self.dim_head) ** 0.5
+        scale = (math.log(n_tokens) / math.log(n_tokens * 4) / self.dim_head) ** 0.5 \
+            if (rescale_attention and is_self_attention) else None
 
         out = F.scaled_dot_product_attention(q, k, v, scale=scale)
 
-        # Recombine heads
-        out = rearrange(out, "b h n d -> b n (h d)")
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=self.heads)
         return self.to_out(out)
 
 

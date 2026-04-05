@@ -55,7 +55,7 @@ training:
   num_gpus: 4
   max_steps: 50000
 
-  learning_rate: 3.0e-5
+  learning_rate: 3.0e-4
   weight_decay: 0.01
   lr_scheduler: "cosine"
   lr_warmup_steps: 1000
@@ -76,9 +76,9 @@ training:
 
   losses:
     velocity_weight: 1.0
-    normals_weight: 100.0
+    normals_weight: 1000.0
     normals_start_step: 1000
-    grad_weight: 10.0         # multi-scale gradient loss (no extra install)
+    grad_weight: 100.0         # multi-scale gradient loss (no extra install)
     grad_start_step: 500
     grad_scales: [1, 2, 4]
     # Focal Frequency Loss (requires: pip install focal-frequency-loss)
@@ -86,12 +86,15 @@ training:
     freq_start_step: 1000
     freq_alpha: 1.0
 
+    use_confidence_weighting: true
+
   # Validation and checkpointing
   val_every_steps: 0.5
   save_every_steps: 500
   log_every_steps: 50
   num_val_samples: 8
-  flow_vis_every_steps: 1000
+  flow_vis_every_steps: 2
+  train_vis_every_steps: 500
 
   # Test: use more Euler steps for best quality
   test_euler_steps: 4

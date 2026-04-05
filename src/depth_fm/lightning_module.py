@@ -204,6 +204,23 @@ class DepthFMLightningModule(L.LightningModule):
         # matching dfm.py: context = ims_z  (not the noised x_source)
         v_pred = self.model.predict_velocity(z_t, t, z_img)
 
+        # --- Velocity prediction diagnostics (detached, free) ---
+        with torch.no_grad():
+            v_pred_f      = v_pred.detach().float()
+            v_target_f    = v_target.float()
+            v_pred_norm   = v_pred_f.norm(dim=1).mean()
+            v_target_norm = v_target_f.norm(dim=1).mean()
+            v_diff_norm   = (v_pred_f - v_target_f).norm(dim=1).mean()
+            v_rel_error   = v_diff_norm / (v_target_norm + 1e-8)
+            t_mean        = t.float().mean()
+            t_std         = t.float().std()
+
+        self.log("train/v_pred_norm",   v_pred_norm,   sync_dist=True)
+        self.log("train/v_target_norm", v_target_norm, sync_dist=True)
+        self.log("train/v_rel_error",   v_rel_error,   sync_dist=True)
+        self.log("train/t_mean",        t_mean,        sync_dist=False)
+        self.log("train/t_std",         t_std,         sync_dist=False)
+
         # Pixel-space losses: project velocity → clean depth estimate (x₀ prediction)
         # x₀_pred = z_t + (1 − t) × v_pred  (rectified flow identity)
         pred_pix = gt_pix = None
@@ -211,7 +228,7 @@ class DepthFMLightningModule(L.LightningModule):
         if self.loss_fn.needs_pixel_decode(step):
             z_pred_clean = z_t + (1.0 - t_exp) * v_pred
             pred_pix = self._decode_pixel_loss(z_pred_clean)
-            gt_pix = self._decode_pixel_loss(z_depth)
+            gt_pix = self._decode(z_depth)   # GT never needs gradients
 
         loss_dict = self.loss_fn(
             v_pred, v_target, pred_pix, gt_pix,
@@ -229,6 +246,11 @@ class DepthFMLightningModule(L.LightningModule):
 
         if self.val_history and batch_idx == 0:
             self.val_history["train/loss"].append(loss_dict["total"].item())
+
+        # Periodic training-time velocity triptych
+        vis_every = self.config.training.get("train_vis_every_steps", 500)
+        if step % vis_every == 0 and step > 0 and self.logger and hasattr(self.logger, "experiment"):
+            self._log_training_visuals(z_img, v_target, v_pred, step)
 
         return loss_dict["total"]
 
@@ -258,6 +280,11 @@ class DepthFMLightningModule(L.LightningModule):
         pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
         gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
 
+        if "confidence" in batch:
+            conf_mask = batch["confidence"][:, 0].float().cpu().numpy()
+        else:
+            conf_mask = np.ones_like(gt_pix)
+
         # Velocity loss for logging — must match training_step
         x_source = self._get_x_source(z_img)
         v_target = z_depth - x_source
@@ -276,7 +303,8 @@ class DepthFMLightningModule(L.LightningModule):
 
         # Flow evolution plot (first batch only, first sample)
         if batch_idx == 0 and self.logger and hasattr(self.logger, "experiment"):
-            self._log_validation_visuals(batch, z_img, z_depth, pred_pix, gt_pix)
+            self._log_validation_visuals(batch, z_img, z_depth, pred_pix, gt_pix, conf_mask)
+
 
     def on_validation_epoch_end(self) -> None:
         summary = self._val_aggregator.summary()
@@ -302,7 +330,7 @@ class DepthFMLightningModule(L.LightningModule):
             logger.info("Worst 5 val patches by RMSE: %s",
                         ", ".join(f"{tid}={v:.2f}m" for tid, v in worst))
 
-    def _log_validation_visuals(self, batch, z_img, z_depth, pred_pix, gt_pix):
+    def _log_validation_visuals(self, batch, z_img, z_depth, pred_pix, gt_pix, conf_mask):
         """Log visualisation figures to wandb/tensorboard."""
         try:
             from depth_fm.visualization import (
@@ -372,6 +400,66 @@ class DepthFMLightningModule(L.LightningModule):
 
         except Exception as e:
             logger.warning("Visual logging failed: %s", e)
+
+    def _log_training_visuals(
+            self,
+            z_img: torch.Tensor,
+            v_target: torch.Tensor,
+            v_pred: torch.Tensor,
+            step: int,
+    ) -> None:
+        """Log a training-time triptych: decoded input | v_target magnitude | v_pred magnitude.
+
+        All ops are no-grad; failures are silenced so training is never interrupted.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.gridspec as gridspec
+            import numpy as np
+
+            with torch.no_grad():
+                # Decode input image from latent (first sample only)
+                img_pix = self._decode(z_img[:1])   # (1, 3, H, W) in [-1, 1]
+                img_np = img_pix[0].float().cpu().numpy()
+                img_np = np.transpose(img_np, (1, 2, 0))
+                img_np = np.clip((img_np + 1.0) / 2.0, 0.0, 1.0)
+
+                # Per-pixel L2 velocity magnitude in latent space (h, w)
+                vt_mag = v_target[:1].float().norm(dim=1)[0].cpu().numpy()
+                vp_mag = v_pred.detach()[:1].float().norm(dim=1)[0].cpu().numpy()
+
+                def _norm01(arr):
+                    lo, hi = arr.min(), arr.max()
+                    return (arr - lo) / (hi - lo + 1e-8)
+
+                vt_disp = _norm01(vt_mag)
+                vp_disp = _norm01(vp_mag)
+
+            fig = plt.figure(figsize=(12, 4))
+            gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.05)
+
+            ax0 = fig.add_subplot(gs[0, 0])
+            ax0.imshow(img_np)
+            ax0.set_title(f"Input image (step {step})", fontsize=9)
+            ax0.axis("off")
+
+            ax1 = fig.add_subplot(gs[0, 1])
+            im1 = ax1.imshow(vt_disp, cmap="viridis", vmin=0, vmax=1)
+            ax1.set_title("v_target ||·||₂", fontsize=9)
+            ax1.axis("off")
+            plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+            ax2 = fig.add_subplot(gs[0, 2])
+            im2 = ax2.imshow(vp_disp, cmap="viridis", vmin=0, vmax=1)
+            ax2.set_title("v_pred ||·||₂", fontsize=9)
+            ax2.axis("off")
+            plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+            self._log_figure("train/velocity_triptych", fig, step)
+            plt.close(fig)
+
+        except Exception as e:
+            logger.warning("Training visual logging failed: %s", e)
 
     def _log_figure(self, tag: str, fig, step: int):
         """Log a matplotlib figure to the active logger."""
@@ -547,6 +635,21 @@ class DepthFMLightningModule(L.LightningModule):
         )
 
     # ------------------------------------------------------------------
+    # Gradient norm logging
+    # ------------------------------------------------------------------
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Log backbone gradient norm before clipping (after backward pass)."""
+        total_norm_sq = 0.0
+        num_params = 0
+        for p in self.model.backbone.parameters():
+            if p.grad is not None:
+                total_norm_sq += p.grad.detach().float().norm().item() ** 2
+                num_params += 1
+        if num_params > 0:
+            self.log("train/grad_norm", total_norm_sq ** 0.5, prog_bar=False, sync_dist=False)
+
+    # ------------------------------------------------------------------
     # Optimizer & scheduler
     # ------------------------------------------------------------------
 
@@ -562,10 +665,26 @@ class DepthFMLightningModule(L.LightningModule):
             weight_decay=tc.weight_decay,
         )
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        warmup_steps = tc.lr_warmup_steps
+        cosine_steps = tc.max_steps - warmup_steps
+
+        # Phase 1: linear ramp from lr/warmup_steps → lr over warmup_steps steps
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            T_max=tc.max_steps - tc.lr_warmup_steps,
+            start_factor=1.0 / max(warmup_steps, 1),
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        # Phase 2: cosine decay from lr → lr*0.01 over remaining steps
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(cosine_steps, 1),
             eta_min=tc.learning_rate * 0.01,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps],
         )
 
         return {

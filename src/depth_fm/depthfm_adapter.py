@@ -265,6 +265,9 @@ class DepthFMHiRISEAdapter(Dataset):
         if elevation.ndim == 4:
             elevation = elevation[0]  # remove batch dim from DataLoader
 
+        valid_mask = torch.isfinite(elevation).float()
+
+
         dtm = _normalize_dtm_relative(elevation, scale_factor=self.elev_scale)
         dtm = _to_3ch(dtm)
         dtm = _resize(dtm, self.resolution)
@@ -320,4 +323,5 @@ class DepthFMHiRISEAdapter(Dataset):
         return {
             "image": image,  # (3, H, W) in [-1, 1]
             "dtm": dtm,  # (3, H, W) in [-1, 1]
+            "confidence": valid_mask,
         }
