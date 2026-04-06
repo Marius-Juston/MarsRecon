@@ -173,9 +173,23 @@ def _normalize_ortho(
     Returns:
         (C, H, W) in [-1, 1], clamped.
     """
-    range_ = p98 - p02
-    normed = ((ortho - p02) / range_ - 0.5) * 2.0
-    return torch.clamp(normed, -1.0, 1.0)
+    # range_ = p98 - p02
+    # normed = ((ortho - p02) / range_ - 0.5) * 2.0
+    # return torch.clamp(normed, -1.0, 1.0)
+
+    # Instead of using self.img_p02 and self.img_p98 from the global JSON
+    valid_pixels = ortho[ortho > 0.0]  # Ignore pure black nodata
+    if len(valid_pixels) > 0:
+        local_p02 = torch.quantile(valid_pixels, 0.02)
+        local_p98 = torch.quantile(valid_pixels, 0.98)
+
+        # Avoid divide-by-zero if the patch is perfectly uniform
+        if local_p98 > local_p02:
+            ortho = ((ortho - local_p02) / (local_p98 - local_p02) - 0.5) * 2.0
+        else:
+            ortho = torch.zeros_like(ortho)  # Fallback
+
+    return torch.clamp(ortho, -1.0, 1.0)
 
 
 def _to_3ch(tensor: torch.Tensor) -> torch.Tensor:
@@ -185,13 +199,17 @@ def _to_3ch(tensor: torch.Tensor) -> torch.Tensor:
     return tensor[:3]
 
 
-def _resize(tensor: torch.Tensor, size: int) -> torch.Tensor:
-    """Resize (C, H, W) to (C, size, size) with bilinear interpolation."""
+def _resize(tensor: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Tensor:
+    """Resize (C, H, W) to (C, size, size)."""
     if tensor.shape[-2] == size and tensor.shape[-1] == size:
         return tensor
+
+    kwargs = {"mode": mode}
+    if mode != "nearest-exact":
+        kwargs["align_corners"] = False
+
     return F.interpolate(
-        tensor.unsqueeze(0), size=(size, size),
-        mode="bilinear", align_corners=False,
+        tensor.unsqueeze(0), size=(size, size), **kwargs
     ).squeeze(0)
 
 
@@ -255,22 +273,40 @@ class DepthFMHiRISEAdapter(Dataset):
         return len(self._indices)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        geo_slice = self._indices[idx]
+        while True:
+            geo_slice = self._indices[idx]
 
-        # Load from the base MarsHiRISEDTM dataset
-        sample = self.base[geo_slice]
+            # Load from the base MarsHiRISEDTM dataset
+            sample = self.base[geo_slice]
 
-        # ── Elevation → normalised 3-channel DTM ──
-        elevation = sample["elevation"]  # (1, H, W) float32, NaN = nodata
-        if elevation.ndim == 4:
-            elevation = elevation[0]  # remove batch dim from DataLoader
+            # ── Elevation → normalised 3-channel DTM ──
+            elevation = sample["elevation"]  # (1, H, W) float32, NaN = nodata
+            if elevation.ndim == 4:
+                elevation = elevation[0]  # remove batch dim from DataLoader
 
-        valid_mask = torch.isfinite(elevation).float()
+            # Check for NaN or zero regions, which imply masked regions (0 works because x - E[x] will never be exactly 0)
+            valid_mask = torch.logical_and(torch.isfinite(elevation), elevation != 0.0).float()
 
+            if self.flip:
+                valid_ratio = valid_mask.mean().item()
+
+                if valid_ratio >= 0.85:  # If more than 15% of the patch is missing data
+
+                    # 2. Reject if the actual elevation is too flat (e.g., standard deviation < 1 meter)
+                    # This stops the model from wasting compute learning how to predict flat plains
+                    std = torch.std(elevation[valid_mask.bool()])
+                    if std >= 1.0:
+                        logger.info("Actual elevation is too flat, standard deviation < 1 meter, actual std, %0.3f",
+                                    std)
+                        break
+
+                # Failed filter: silently pick a new random index and loop again
+                idx = random.randint(0, len(self._indices) - 1)
+            else:
+                break
 
         dtm = _normalize_dtm_relative(elevation, scale_factor=self.elev_scale)
         dtm = _to_3ch(dtm)
-        dtm = _resize(dtm, self.resolution)
 
         # ── Orthoimage → normalised 3-channel image ──
         # Stereo augmentation: randomly pick left or right
@@ -304,16 +340,21 @@ class DepthFMHiRISEAdapter(Dataset):
 
         image = _normalize_ortho(ortho, p02=self.img_p02, p98=self.img_p98)
         image = _to_3ch(image)
+
+        dtm = _resize(dtm, self.resolution)
         image = _resize(image, self.resolution)
+        valid_mask = _resize(valid_mask, self.resolution, mode='nearest-exact')
 
         # ── Synchronised augmentation ──
         if self.flip:
             if random.random() > 0.5:
                 image = torch.flip(image, [-1])  # horizontal
                 dtm = torch.flip(dtm, [-1])
+                valid_mask = torch.flip(valid_mask, [-1])
             if random.random() > 0.5:
                 image = torch.flip(image, [-2])  # vertical
                 dtm = torch.flip(dtm, [-2])
+                valid_mask = torch.flip(valid_mask, [-2])
 
         # Brightness jitter on image only (simulates illumination variation)
         if self.bright_jitter > 0:

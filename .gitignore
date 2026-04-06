@@ -6,6 +6,7 @@ data/
 
 *.ckpt
 
+papers/
 Figures*/
 validation/
 reports/Lectures/
