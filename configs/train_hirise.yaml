@@ -9,10 +9,10 @@ model:
   freeze_encoder: false
   gradient_checkpointing: true
 
-  torch_compile: true
+  torch_compile: false
   torch_compile_mode: "default"
   full_graph: true
-  use_checkpoint: false
+  use_checkpoint: true
 
 data:
   source: "hirise"
@@ -50,12 +50,12 @@ data:
   brightness_jitter: 0.1
 
 training:
-  per_gpu_batch_size: 2
-  gradient_accumulation_steps: 4
+  per_gpu_batch_size: 4
+  gradient_accumulation_steps: 8
   num_gpus: 4
   max_steps: 50000
 
-  learning_rate: 3.0e-4
+  learning_rate: 6.0e-4
   weight_decay: 0.01
   lr_scheduler: "cosine"
   lr_warmup_steps: 1000
@@ -93,7 +93,7 @@ training:
   save_every_steps: 500
   log_every_steps: 50
   num_val_samples: 8
-  flow_vis_every_steps: 2
+  flow_vis_every_steps: 1
   train_vis_every_steps: 500
 
   # Test: use more Euler steps for best quality
