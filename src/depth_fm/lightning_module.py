@@ -390,7 +390,7 @@ class DepthFMLightningModule(L.LightningModule):
             plt.close(fig)
 
             # Flow evolution (every N val epochs to save compute)
-            if step > 0 and step % (self.config.training.get("flow_vis_every_steps", 10000)) == 0:
+            if step > 0 and self.current_epoch % (self.config.training.get("flow_vis_every_steps", 2)) == 0:
                 intermediates = self._predict_flow_intermediates(z_img[:1], num_steps=4)
                 # Convert single-sample intermediates
                 single_intermediates = {t: v[0] for t, v in intermediates.items()}
