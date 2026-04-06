@@ -249,7 +249,8 @@ class DepthFMLightningModule(L.LightningModule):
 
         # Periodic training-time velocity triptych
         vis_every = self.config.training.get("train_vis_every_steps", 500)
-        if step % vis_every == 0 and step > 0 and self.logger and hasattr(self.logger, "experiment"):
+        show_vis = self.config.training.get("show_train_vis", False)
+        if show_vis and step % vis_every == 0 and step > 0 and self.logger and hasattr(self.logger, "experiment"):
             self._log_training_visuals(z_img, v_target, v_pred, step)
 
         return loss_dict["total"]

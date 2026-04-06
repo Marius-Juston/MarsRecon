@@ -54,6 +54,7 @@ training:
   gradient_accumulation_steps: 8
   num_gpus: 4
   max_steps: 50000
+  show_train_vis: false
 
   learning_rate: 6.0e-4
   weight_decay: 0.01
@@ -77,9 +78,9 @@ training:
   losses:
     velocity_weight: 1.0
     normals_weight: 1000.0
-    normals_start_step: 1000
+    normals_start_step: 250
     grad_weight: 100.0         # multi-scale gradient loss (no extra install)
-    grad_start_step: 500
+    grad_start_step: 250
     grad_scales: [1, 2, 4]
     # Focal Frequency Loss (requires: pip install focal-frequency-loss)
     freq_weight: 0.0
