@@ -46,6 +46,7 @@ from depth_fm.visualization import (
     plot_convergence_curves,
     plot_multi_run_summary_table,
 )
+from lightning.pytorch.plugins.io import AsyncCheckpointIO
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,66 @@ def compute_mask_statistics(dataloader, split_name="Dataset"):
         "empty": empty_images,
         "global_valid_pct": global_valid_pct
     }
+
+
+@torch.no_grad()
+def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 16):
+    """
+    Extracts random samples from the dataloader and plots a 4x8 paired grid
+    (16 Orthos and 16 corresponding DTMs). Uses exact [-1, 1] -> [0, 1] normalization.
+    """
+    logger.info(f"Generating paired thumbnail grid for {num_samples} random samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    images, dtms = [], []
+
+    # Collect exactly `num_samples` from the dataloader
+    for batch in dataloader:
+        B = batch["image"].shape[0]
+        for i in range(B):
+            images.append(batch["image"][i].cpu().numpy())
+            dtms.append(batch["dtm"][i].cpu().numpy())
+            if len(images) == num_samples:
+                break
+        if len(images) == num_samples:
+            break
+
+    # Setup a 4x8 grid. Each pair takes 2 columns (Ortho | DTM)
+    fig, axes = plt.subplots(4, 8, figsize=(20, 10))
+    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+
+    for idx in range(num_samples):
+        row = idx // 4
+        col_base = (idx % 4) * 2
+
+        ax_img = axes[row, col_base]
+        ax_dtm = axes[row, col_base + 1]
+
+        # Standard (x + 1) / 2 normalization for [-1, 1] data
+        # Transpose from (C, H, W) to (H, W, C) for matplotlib
+        img_np = (np.transpose(images[idx], (1, 2, 0)) + 1.0) / 2.0
+        dtm_np = (np.transpose(dtms[idx], (1, 2, 0)) + 1.0) / 2.0
+
+        # Clip to strictly [0, 1] to suppress matplotlib float-rounding warnings
+        img_np = np.clip(img_np, 0.0, 1.0)
+        dtm_np = np.clip(dtm_np, 0.0, 1.0)
+
+        # Plot Orthoimage
+        ax_img.imshow(img_np)
+        ax_img.axis("off")
+        if row == 0:
+            ax_img.set_title("Ortho Input")
+
+        # Plot Normalized DTM
+        ax_dtm.imshow(dtm_np)
+        ax_dtm.axis("off")
+        if row == 0:
+            ax_dtm.set_title("DTM Target")
+
+    save_path = output_dir / "dataset_thumbnails.png"
+    fig.savefig(save_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    logger.info(f"Thumbnails successfully saved to: {save_path}")
 
 # ---------------------------------------------------------------------------
 # Data module
@@ -227,8 +288,27 @@ def run_single_training(
     """
     L.seed_everything(seed, workers=True)
 
-    output_dir = Path(output_dir) / f"run_{run_idx}"
+    # 1. Strict Directory Isolation (Handles Multi-run AND K-fold)
+    n_folds = config.data.get("n_folds")
+    fold_idx = config.data.get("fold_idx", 0)
+
+    if n_folds is not None:
+        output_dir = Path(output_dir) / f"fold_{fold_idx}" / f"run_{run_idx}"
+    else:
+        output_dir = Path(output_dir) / f"run_{run_idx}"
+
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_path = output_dir / "test_summary.json"
+    if summary_path.exists():
+        logger.info(f"Run {run_idx} at {output_dir} is already complete. Skipping.")
+        # Load the saved results to pass back to run_multi_seed_experiment
+        with open(summary_path, "r") as f:
+            test_summary = json.load(f)
+
+        # Note: To fully satisfy your existing multi-run plotting, you may
+        # also need to load and return the saved test_df.csv and val_history here.
+        return {"test_summary": test_summary, "output_dir": output_dir, "skipped": True}
 
     # Build data
     loaders = build_dataloaders(config, split_seed=seed)
@@ -256,18 +336,32 @@ def run_single_training(
         module.model.backbone = torch.compile(module.model.backbone, mode=compile_mode, fullgraph=full_graph)
         logger.info("torch.compile enabled on UNet backbone (mode=%s)", compile_mode)
 
+    # Callback 1: The "Best" Checkpoints (Epoch/Validation based)
+    # Only triggers when validation runs. Saves the top 3 models.
+    best_checkpoint = ModelCheckpoint(
+        dirpath=str(output_dir / "checkpoints"),
+        filename="depthfm-best-{step}-{val/rmse_mean:.4f}",
+        monitor="val/rmse_mean",
+        mode="min",
+        save_top_k=3,
+        save_last=False,
+    )
+
+    # Callback 2: The "Recovery" Checkpoint (Strictly Step-based)
+    # Overwrites a single 'last.ckpt' every 500 steps, regardless of validation.
+    recovery_checkpoint = ModelCheckpoint(
+        dirpath=str(output_dir / "checkpoints"),
+        filename="last",  # Will always save as 'last.ckpt'
+        every_n_train_steps=config.training.save_every_steps,  # e.g., 500
+        save_top_k=1,  # Keep only the single most recent
+    )
+
     # Callbacks
     callbacks = [
         EMACallback(),
         LearningRateMonitor(logging_interval="step"),
-        ModelCheckpoint(
-            dirpath=str(output_dir / "checkpoints"),
-            filename="depthfm-{step}-{val/rmse_mean:.4f}",
-            monitor="val/rmse_mean",
-            mode="min",
-            save_top_k=3,
-            every_n_train_steps=config.training.save_every_steps,
-        ),
+        best_checkpoint,
+        recovery_checkpoint
     ]
 
     if config.training.get("early_stopping_patience"):
@@ -312,11 +406,19 @@ def run_single_training(
         gradient_clip_val=config.training.max_grad_norm,
         accumulate_grad_batches=config.training.gradient_accumulation_steps,
         enable_progress_bar=True,
+        plugins=[AsyncCheckpointIO()],  # Offloads disk writes to a background thread
         default_root_dir=str(output_dir),
     )
 
-    # Train
-    trainer.fit(module, loaders["train"], loaders["val"])
+    # 5. The Resumption Execution Execution
+    last_ckpt_path = output_dir / "checkpoints" / "last.ckpt"
+
+    if last_ckpt_path.exists():
+        logger.info(f"*** Resuming run {run_idx} gracefully from {last_ckpt_path} ***")
+        trainer.fit(module, loaders["train"], loaders["val"], ckpt_path=str(last_ckpt_path))
+    else:
+        logger.info(f"*** Starting fresh training for run {run_idx} ***")
+        trainer.fit(module, loaders["train"], loaders["val"])
 
     # Test (with EMA weights via callback)
     trainer.test(module, loaders["test"])
@@ -610,6 +712,8 @@ def main():
 
     parser.add_argument("--analyze_masks_only", action="store_true",
                         help="Run dataset mask statistics and exit without training")
+    parser.add_argument("--view_thumbnails", action="store_true",
+                        help="Save a 4x4 grid of random dataset input images and exit")
 
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -628,15 +732,21 @@ def main():
         config.data.n_folds = args.n_folds
         config.data.fold_idx = args.fold_idx
 
-    if args.analyze_masks_only:
-        logger.info("Executing isolated data profiling routine...")
+    if args.analyze_masks_only or args.view_thumbnails:
+        logger.info("Executing isolated data inspection routine...")
         L.seed_everything(args.seed, workers=True)
         loaders = build_dataloaders(config, split_seed=args.seed)
+        output_path = Path(config.training.output_dir) / "inspection"
 
-        for split_name, loader in loaders.items():
-            compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
+        if args.analyze_masks_only:
+            for split_name, loader in loaders.items():
+                compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
 
-        logger.info("Data profiling complete. Exiting pipeline.")
+        if args.view_thumbnails:
+            # We pull from the 'train' loader because shuffle=True naturally provides random samples
+            generate_thumbnail_grids(loaders["train"], output_dir=output_path, num_samples=16)
+
+        logger.info("Data inspection complete. Exiting pipeline without training.")
         return
 
     if args.n_runs > 1:
