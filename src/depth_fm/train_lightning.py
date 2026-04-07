@@ -358,11 +358,16 @@ def run_single_training(
 
     # Callbacks
     callbacks = [
-        EMACallback(),
         LearningRateMonitor(logging_interval="step"),
         best_checkpoint,
         recovery_checkpoint
     ]
+
+    if config.training.get("use_ema", True):
+        logger.info("EMA is ENABLED.")
+        callbacks.append(EMACallback())
+    else:
+        logger.info("EMA is DISABLED. Evaluating active training weights.")
 
     if config.training.get("early_stopping_patience"):
         callbacks.append(
