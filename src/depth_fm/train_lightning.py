@@ -317,7 +317,7 @@ def run_single_training(
     module = DepthFMLightningModule(config)
 
     # Move VAE to appropriate device
-    module.model.vae = module.model.vae.to("cuda" if torch.cuda.is_available() else "cpu")
+    # module.model.vae = module.model.vae.to("cuda" if torch.cuda.is_available() else "cpu")
 
     cache_path = Path(config.training.get("cache_dir", ".torch_compile_cache")) / "mega_cache.pt"
 
