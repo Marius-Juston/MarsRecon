@@ -11,8 +11,8 @@ Implements the DepthFM flow matching training loop with:
 
 from __future__ import annotations
 
+import gc
 import logging
-import math
 from typing import Any
 
 import lightning as L
@@ -138,7 +138,7 @@ class DepthFMLightningModule(L.LightningModule):
           - ODE starts from q_sample(z_img, noising_step)  (noised source)
           - Context (channel-concat) is the CLEAN z_img
         """
-        x_source = self._get_x_source(z_img)   # q_sample noise on starting point
+        x_source = self._get_x_source(z_img)  # q_sample noise on starting point
         z_t = x_source
         dt = 1.0 / num_steps
         for step in range(num_steps):
@@ -154,7 +154,7 @@ class DepthFMLightningModule(L.LightningModule):
     ) -> dict[float, torch.Tensor]:
         """Return decoded depth at intermediate ODE timesteps."""
         intermediates = {}
-        x_source = self._get_x_source(z_img)   # noised starting point
+        x_source = self._get_x_source(z_img)  # noised starting point
         z_t = x_source
         dt = 1.0 / num_steps
         intermediates[0.0] = self._decode(z_t)[:, 0].float().cpu().numpy()
@@ -206,20 +206,20 @@ class DepthFMLightningModule(L.LightningModule):
 
         # --- Velocity prediction diagnostics (detached, free) ---
         with torch.no_grad():
-            v_pred_f      = v_pred.detach().float()
-            v_target_f    = v_target.float()
-            v_pred_norm   = v_pred_f.norm(dim=1).mean()
+            v_pred_f = v_pred.detach().float()
+            v_target_f = v_target.float()
+            v_pred_norm = v_pred_f.norm(dim=1).mean()
             v_target_norm = v_target_f.norm(dim=1).mean()
-            v_diff_norm   = (v_pred_f - v_target_f).norm(dim=1).mean()
-            v_rel_error   = v_diff_norm / (v_target_norm + 1e-8)
-            t_mean        = t.float().mean()
-            t_std         = t.float().std()
+            v_diff_norm = (v_pred_f - v_target_f).norm(dim=1).mean()
+            v_rel_error = v_diff_norm / (v_target_norm + 1e-8)
+            t_mean = t.float().mean()
+            t_std = t.float().std()
 
-        self.log("train/v_pred_norm",   v_pred_norm,   sync_dist=True)
+        self.log("train/v_pred_norm", v_pred_norm, sync_dist=True)
         self.log("train/v_target_norm", v_target_norm, sync_dist=True)
-        self.log("train/v_rel_error",   v_rel_error,   sync_dist=True)
-        self.log("train/t_mean",        t_mean,        sync_dist=False)
-        self.log("train/t_std",         t_std,         sync_dist=False)
+        self.log("train/v_rel_error", v_rel_error, sync_dist=True)
+        self.log("train/t_mean", t_mean, sync_dist=False)
+        self.log("train/t_std", t_std, sync_dist=False)
 
         # Pixel-space losses: project velocity → clean depth estimate (x₀ prediction)
         # x₀_pred = z_t + (1 − t) × v_pred  (rectified flow identity)
@@ -228,7 +228,7 @@ class DepthFMLightningModule(L.LightningModule):
         if self.loss_fn.needs_pixel_decode(step):
             z_pred_clean = z_t + (1.0 - t_exp) * v_pred
             pred_pix = self._decode_pixel_loss(z_pred_clean)
-            gt_pix = self._decode(z_depth)   # GT never needs gradients
+            gt_pix = self._decode(z_depth)  # GT never needs gradients
 
         loss_dict = self.loss_fn(
             v_pred, v_target, pred_pix, gt_pix,
@@ -250,8 +250,9 @@ class DepthFMLightningModule(L.LightningModule):
         # Periodic training-time velocity triptych
         vis_every = self.config.training.get("train_vis_every_steps", 500)
         show_vis = self.config.training.get("show_train_vis", False)
-        if show_vis and step % vis_every == 0 and step > 0 and self.logger and hasattr(self.logger, "experiment"):
-            self._log_training_visuals(z_img, v_target, v_pred, step)
+        if self.global_rank == 0:
+            if show_vis and step % vis_every == 0 and step > 0 and self.logger and hasattr(self.logger, "experiment"):
+                self._log_training_visuals(z_img, v_target, v_pred, step)
 
         return loss_dict["total"]
 
@@ -264,7 +265,8 @@ class DepthFMLightningModule(L.LightningModule):
         checkpoint["ema_initialised"] = self._ema_initialised
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        self._ema_shadow = checkpoint.get("ema_shadow", {})
+        loaded_shadow = checkpoint.get("ema_shadow", {})
+        self._ema_shadow = {k: v.to(self.device) for k, v in loaded_shadow.items()}
         self._ema_initialised = checkpoint.get("ema_initialised", False)
 
     def on_validation_epoch_start(self) -> None:
@@ -275,16 +277,22 @@ class DepthFMLightningModule(L.LightningModule):
         z_depth = self._encode(batch["dtm"])
 
         # 1-step Euler prediction
-        z_pred = self._predict_depth(z_img, num_steps=1)
+        z_pred = self._predict_depth(z_img, num_steps=self.config.get("test_euler_steps", 4))
 
-        # Decode to pixel space
+        # Decode predictions and the ground truth latent to pixel space
         pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
-        gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
+        gt_decoded = self._decode(z_depth)[:, 0].float().cpu().numpy()
+
+        # Get the ACTUAL raw DTM from the dataloader for true metric comparison
+        gt_raw = batch["dtm"][:, 0].float().cpu().numpy()
+
+        vae_reconstruction_error = float(np.abs(gt_decoded - gt_raw).mean())
+        self.log("val/vae_reconstruction_error", vae_reconstruction_error, sync_dist=True)
 
         if "confidence" in batch:
             conf_mask = batch["confidence"][:, 0].float().cpu().numpy()
         else:
-            conf_mask = np.ones_like(gt_pix)
+            conf_mask = np.ones_like(gt_raw)
 
         # Velocity loss for logging — must match training_step
         x_source = self._get_x_source(z_img)
@@ -299,13 +307,13 @@ class DepthFMLightningModule(L.LightningModule):
         # Per-sample metrics
         for i in range(pred_pix.shape[0]):
             tile_id = batch.get("tile_id", [""])[i] if "tile_id" in batch else f"b{batch_idx}_s{i}"
-            metrics = compute_depth_metrics(pred_pix[i], gt_pix[i], align=True)
+            metrics = compute_depth_metrics(pred_pix[i], gt_raw[i], align=True)
             self._val_aggregator.add(metrics, tile_id)
 
-        # Flow evolution plot (first batch only, first sample)
-        if batch_idx == 0 and self.logger and hasattr(self.logger, "experiment"):
-            self._log_validation_visuals(batch, z_img, z_depth, pred_pix, gt_pix, conf_mask)
-
+        if self.global_rank == 0:
+            # Flow evolution plot (first batch only, first sample)
+            if batch_idx == 0 and self.logger and hasattr(self.logger, "experiment"):
+                self._log_validation_visuals(batch, z_img, z_depth, pred_pix, gt_raw, conf_mask)
 
     def on_validation_epoch_end(self) -> None:
         summary = self._val_aggregator.summary()
@@ -333,6 +341,9 @@ class DepthFMLightningModule(L.LightningModule):
 
     def _log_validation_visuals(self, batch, z_img, z_depth, pred_pix, gt_pix, conf_mask):
         """Log visualisation figures to wandb/tensorboard."""
+        if self.global_rank != 0:
+            return
+
         try:
             from depth_fm.visualization import (
                 plot_prediction_triptych,
@@ -413,6 +424,9 @@ class DepthFMLightningModule(L.LightningModule):
 
         All ops are no-grad; failures are silenced so training is never interrupted.
         """
+        if self.global_rank != 0:
+            return
+
         try:
             import matplotlib.pyplot as plt
             import matplotlib.gridspec as gridspec
@@ -420,7 +434,7 @@ class DepthFMLightningModule(L.LightningModule):
 
             with torch.no_grad():
                 # Decode input image from latent (first sample only)
-                img_pix = self._decode(z_img[:1])   # (1, 3, H, W) in [-1, 1]
+                img_pix = self._decode(z_img[:1])  # (1, 3, H, W) in [-1, 1]
                 img_np = img_pix[0].float().cpu().numpy()
                 img_np = np.transpose(img_np, (1, 2, 0))
                 img_np = np.clip((img_np + 1.0) / 2.0, 0.0, 1.0)
@@ -568,19 +582,21 @@ class DepthFMLightningModule(L.LightningModule):
 
                 z_pred = self._predict_depth(z_img, num_steps=n_steps)
 
-                pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
-                gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
+                if self.trainer.world_size > 1:
+                    z_pred = self.all_gather(z_pred).view(-1, *z_pred.shape[1:])
+                    z_depth_gathered = self.all_gather(z_depth).view(-1, *z_depth.shape[1:])
+                    # Also gather tile_ids if you are using them (requires string gathering or indices)
+                else:
+                    z_depth_gathered = z_depth
 
-                for i in range(pred_pix.shape[0]):
-                    tile_id = (
-                        batch["tile_id"][i]
-                        if "tile_id" in batch
-                        else f"b{batch_idx}_s{i}"
-                    )
-                    metrics = compute_depth_metrics(
-                        pred_pix[i], gt_pix[i], align=True
-                    )
-                    agg.add(metrics, tile_id)
+                if self.global_rank == 0:
+                    pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
+                    gt_pix = self._decode(z_depth_gathered)[:, 0].float().cpu().numpy()
+
+                    for i in range(pred_pix.shape[0]):
+                        tile_id = f"b{batch_idx}_s{i}"  # Simplified for gathered data
+                        metrics = compute_depth_metrics(pred_pix[i], gt_pix[i], align=True)
+                        agg.add(metrics, tile_id)
 
             results[n_steps] = agg.summary()
 
@@ -622,9 +638,9 @@ class DepthFMLightningModule(L.LightningModule):
         n_hooks = 0
         for module in self.model.backbone.modules():
             if (
-                isinstance(module, torch.nn.Conv2d)
-                and module.kernel_size == (1, 1)
-                and module.weight.requires_grad
+                    isinstance(module, torch.nn.Conv2d)
+                    and module.kernel_size == (1, 1)
+                    and module.weight.requires_grad
             ):
                 module.weight.register_hook(_contiguous_hook)
                 n_hooks += 1
@@ -711,6 +727,9 @@ class DepthFMLightningModule(L.LightningModule):
 
         for n, p in self.model.backbone.named_parameters():
             if p.requires_grad and n in self._ema_shadow:
+                if self._ema_shadow[n].device != p.device:
+                    self._ema_shadow[n] = self._ema_shadow[n].to(p.device)
+
                 self._ema_shadow[n].mul_(self._ema_decay).add_(
                     p.data, alpha=1.0 - self._ema_decay
                 )
@@ -727,6 +746,7 @@ class DepthFMLightningModule(L.LightningModule):
             if n in self._ema_backup:
                 p.data.copy_(self._ema_backup[n])
         self._ema_backup = {}
+        gc.collect()
 
 
 class EMACallback(L.Callback):
