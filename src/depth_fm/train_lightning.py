@@ -411,80 +411,84 @@ def run_single_training(
         gradient_clip_val=config.training.max_grad_norm,
         accumulate_grad_batches=config.training.gradient_accumulation_steps,
         enable_progress_bar=True,
-        plugins=[AsyncCheckpointIO()],  # Offloads disk writes to a background thread
+        # plugins=[AsyncCheckpointIO()],  # Offloads disk writes to a background thread
         default_root_dir=str(output_dir),
     )
 
     # 5. The Resumption Execution Execution
     last_ckpt_path = output_dir / "checkpoints" / "last.ckpt"
 
-    if last_ckpt_path.exists():
-        logger.info(f"*** Resuming run {run_idx} gracefully from {last_ckpt_path} ***")
-        trainer.fit(module, loaders["train"], loaders["val"], ckpt_path=str(last_ckpt_path))
-    else:
-        logger.info(f"*** Starting fresh training for run {run_idx} ***")
-        trainer.fit(module, loaders["train"], loaders["val"])
+
+    if config.training.enable:
+        if last_ckpt_path.exists():
+            logger.info(f"*** Resuming run {run_idx} gracefully from {last_ckpt_path} ***")
+            trainer.fit(module, loaders["train"], loaders["val"], ckpt_path=str(last_ckpt_path), weights_only=False)
+        else:
+            logger.info(f"*** Starting fresh training for run {run_idx} ***")
+            trainer.fit(module, loaders["train"], loaders["val"])
 
     # Test (with EMA weights via callback)
-    trainer.test(module, loaders["test"])
+    trainer.test(module, loaders["test"], ckpt_path=None if config.training.get("enable", True) else str(last_ckpt_path), weights_only=False)
 
     # Timestep ablation: evaluate at [1, 2, 4, 8, 10, 20] Euler steps
     logger.info("Running timestep ablation...")
-    if module._ema_initialised:
+    if config.training.get("use_ema", True)and module._ema_initialised:
         module.load_ema_weights()
     timestep_results = module.run_timestep_ablation(
         loaders["test"],
         step_counts=[1, 2, 4, 8, 10, 20],
         max_batches=config.training.get("ablation_max_batches"),
     )
-    if module._ema_initialised:
+    if config.training.get("use_ema", True) and module._ema_initialised:
         module.restore_training_weights()
 
-    # Save timestep ablation results
-    with open(output_dir / "timestep_ablation.json", "w") as f:
-        json.dump(
-            {str(k): v for k, v in timestep_results.items()},
-            f, indent=2,
+    if trainer.is_global_zero:
+        # Save timestep ablation results
+        with open(output_dir / "timestep_ablation.json", "w") as f:
+            json.dump(
+                {str(k): v for k, v in timestep_results.items()},
+                f, indent=2,
+            )
+
+        # Generate timestep ablation figure
+        from depth_fm.visualization import plot_timestep_ablation
+        set_neurips_style()
+        fig_dir = output_dir / "figures"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        fig = plot_timestep_ablation(
+            step_counts=sorted(timestep_results.keys()),
+            metrics_per_step=timestep_results,
+            primary_metric="rmse",
+            secondary_metrics=["delta_1", "normal_angular_error"],
+            title="Mars DTM: inference quality vs Euler steps",
+            save_path=fig_dir / "timestep_ablation.pdf",
         )
-
-    # Generate timestep ablation figure
-    from depth_fm.visualization import plot_timestep_ablation
-    set_neurips_style()
-    fig_dir = output_dir / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
-
-    fig = plot_timestep_ablation(
-        step_counts=sorted(timestep_results.keys()),
-        metrics_per_step=timestep_results,
-        primary_metric="rmse",
-        secondary_metrics=["delta_1", "normal_angular_error"],
-        title="Mars DTM: inference quality vs Euler steps",
-        save_path=fig_dir / "timestep_ablation.pdf",
-    )
-    plt.close(fig)
+        plt.close(fig)
 
     # Collect results
     test_summary = module._test_aggregator.summary()
     test_df = module._test_aggregator.per_sample_dataframe()
 
-    if config.model.get("torch_compile", False):
-        logger.info("Extracting torch.compile Mega-Cache artifacts...")
-        artifacts = torch.compiler.save_cache_artifacts()
-        if artifacts is not None:
-            artifact_bytes, cache_info = artifacts
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(cache_path, "wb") as f:
-                f.write(artifact_bytes)
-            logger.info("Mega-Cache saved successfully to %s. Info: %s", cache_path, cache_info)
-        else:
-            logger.info("No compiler artifacts found to save.")
+    if trainer.is_global_zero:
+        if config.model.get("torch_compile", False):
+            logger.info("Extracting torch.compile Mega-Cache artifacts...")
+            artifacts = torch.compiler.save_cache_artifacts()
+            if artifacts is not None:
+                artifact_bytes, cache_info = artifacts
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "wb") as f:
+                    f.write(artifact_bytes)
+                logger.info("Mega-Cache saved successfully to %s. Info: %s", cache_path, cache_info)
+            else:
+                logger.info("No compiler artifacts found to save.")
 
-    # Save per-sample test results
-    test_df.to_csv(output_dir / "test_results.csv", index=False)
+        # Save per-sample test results
+        test_df.to_csv(output_dir / "test_results.csv", index=False)
 
-    # Save test summary
-    with open(output_dir / "test_summary.json", "w") as f:
-        json.dump(test_summary, f, indent=2)
+        # Save test summary
+        with open(output_dir / "test_summary.json", "w") as f:
+            json.dump(test_summary, f, indent=2)
 
     return {
         "test_summary": test_summary,
@@ -520,88 +524,93 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
         )
         all_results.append(result)
 
-    # ── Generate publication figures ──
-    set_neurips_style()
+    import os
+    is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
 
-    logger.info("Generating publication figures...")
+    if is_global_zero:
 
-    # 1. Convergence curves with error bands
-    fig = plot_convergence_curves(
-        [r["val_history"] for r in all_results],
-        metric_key="val/rmse",
-        title="Validation RMSE convergence",
-        save_path=fig_dir / "convergence_rmse.pdf",
-    )
-    plt.close(fig)
+        # ── Generate publication figures ──
+        set_neurips_style()
 
-    fig = plot_convergence_curves(
-        [r["val_history"] for r in all_results],
-        metric_key="val/delta_1",
-        title="Validation δ₁ convergence",
-        save_path=fig_dir / "convergence_delta1.pdf",
-    )
-    plt.close(fig)
+        logger.info("Generating publication figures...")
 
-    # 2. Multi-run summary bar chart with error bars
-    fig = plot_multi_run_summary_table(
-        [r["test_summary"] for r in all_results],
-        metrics_to_show=["rmse", "abs_rel", "delta_1", "normal_angular_error", "slope_rmse"],
-        title=f"Test results ({n_runs} runs)",
-        save_path=fig_dir / "multi_run_summary.pdf",
-    )
-    plt.close(fig)
-
-    # 3. Metric distributions from the best run
-    best_run = min(all_results, key=lambda r: r["test_summary"].get("rmse", {}).get("mean", 1e9))
-    best_df = best_run["test_df"]
-
-    fig = plot_metric_distributions(
-        best_df,
-        metrics_to_plot=["rmse", "abs_rel", "delta_1", "normal_angular_error"],
-        title="Test metric distributions (best run)",
-        save_path=fig_dir / "metric_distributions.pdf",
-    )
-    plt.close(fig)
-
-    # 4. Worst and best patches from the best run
-    _generate_patch_analysis(best_run, fig_dir, config)
-
-    # 5. Timestep ablation (averaged across runs if available)
-    if all("timestep_ablation" in r for r in all_results):
-        from depth_fm.visualization import plot_timestep_ablation
-
-        # Average metrics across runs for each step count
-        first_ablation = all_results[0]["timestep_ablation"]
-        step_counts = sorted(first_ablation.keys())
-
-        averaged_ablation = {}
-        for s in step_counts:
-            merged = {}
-            for metric_name in first_ablation[s]:
-                run_means = [
-                    r["timestep_ablation"][s][metric_name]["mean"]
-                    for r in all_results if s in r["timestep_ablation"]
-                ]
-                merged[metric_name] = {
-                    "mean": float(np.mean(run_means)),
-                    "std": float(np.std(run_means)),
-                }
-            averaged_ablation[s] = merged
-
-        fig = plot_timestep_ablation(
-            step_counts=step_counts,
-            metrics_per_step=averaged_ablation,
-            primary_metric="rmse",
-            secondary_metrics=["delta_1", "normal_angular_error"],
-            title=f"Inference quality vs Euler steps ({n_runs}-run avg)",
-            save_path=fig_dir / "timestep_ablation_averaged.pdf",
+        # 1. Convergence curves with error bands
+        fig = plot_convergence_curves(
+            [r["val_history"] for r in all_results],
+            metric_key="val/rmse",
+            title="Validation RMSE convergence",
+            save_path=fig_dir / "convergence_rmse.pdf",
         )
         plt.close(fig)
 
-    # 6. Final summary to console and file
-    _print_final_summary(all_results, output_root)
+        fig = plot_convergence_curves(
+            [r["val_history"] for r in all_results],
+            metric_key="val/delta_1",
+            title="Validation δ₁ convergence",
+            save_path=fig_dir / "convergence_delta1.pdf",
+        )
+        plt.close(fig)
 
-    logger.info("All figures saved to %s", fig_dir)
+        # 2. Multi-run summary bar chart with error bars
+        fig = plot_multi_run_summary_table(
+            [r["test_summary"] for r in all_results],
+            metrics_to_show=["rmse", "abs_rel", "delta_1", "normal_angular_error", "slope_rmse"],
+            title=f"Test results ({n_runs} runs)",
+            save_path=fig_dir / "multi_run_summary.pdf",
+        )
+        plt.close(fig)
+
+        # 3. Metric distributions from the best run
+        best_run = min(all_results, key=lambda r: r["test_summary"].get("rmse", {}).get("mean", 1e9))
+        best_df = best_run["test_df"]
+
+        fig = plot_metric_distributions(
+            best_df,
+            metrics_to_plot=["rmse", "abs_rel", "delta_1", "normal_angular_error"],
+            title="Test metric distributions (best run)",
+            save_path=fig_dir / "metric_distributions.pdf",
+        )
+        plt.close(fig)
+
+        # 4. Worst and best patches from the best run
+        _generate_patch_analysis(best_run, fig_dir, config)
+
+        # 5. Timestep ablation (averaged across runs if available)
+        if all("timestep_ablation" in r for r in all_results):
+            from depth_fm.visualization import plot_timestep_ablation
+
+            # Average metrics across runs for each step count
+            first_ablation = all_results[0]["timestep_ablation"]
+            step_counts = sorted(first_ablation.keys())
+
+            averaged_ablation = {}
+            for s in step_counts:
+                merged = {}
+                for metric_name in first_ablation[s]:
+                    run_means = [
+                        r["timestep_ablation"][s][metric_name]["mean"]
+                        for r in all_results if s in r["timestep_ablation"]
+                    ]
+                    merged[metric_name] = {
+                        "mean": float(np.mean(run_means)),
+                        "std": float(np.std(run_means)),
+                    }
+                averaged_ablation[s] = merged
+
+            fig = plot_timestep_ablation(
+                step_counts=step_counts,
+                metrics_per_step=averaged_ablation,
+                primary_metric="rmse",
+                secondary_metrics=["delta_1", "normal_angular_error"],
+                title=f"Inference quality vs Euler steps ({n_runs}-run avg)",
+                save_path=fig_dir / "timestep_ablation_averaged.pdf",
+            )
+            plt.close(fig)
+
+        # 6. Final summary to console and file
+        _print_final_summary(all_results, output_root)
+
+        logger.info("All figures saved to %s", fig_dir)
 
 
 def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
@@ -737,21 +746,25 @@ def main():
         config.data.n_folds = args.n_folds
         config.data.fold_idx = args.fold_idx
 
+    import os
+    is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
+
     if args.analyze_masks_only or args.view_thumbnails:
-        logger.info("Executing isolated data inspection routine...")
-        L.seed_everything(args.seed, workers=True)
-        loaders = build_dataloaders(config, split_seed=args.seed)
-        output_path = Path(config.training.output_dir) / "inspection"
+        if is_global_zero:
+            logger.info("Executing isolated data inspection routine...")
+            L.seed_everything(args.seed, workers=True)
+            loaders = build_dataloaders(config, split_seed=args.seed)
+            output_path = Path(config.training.output_dir) / "inspection"
 
-        if args.analyze_masks_only:
-            for split_name, loader in loaders.items():
-                compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
+            if args.analyze_masks_only:
+                for split_name, loader in loaders.items():
+                    compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
 
-        if args.view_thumbnails:
-            # We pull from the 'train' loader because shuffle=True naturally provides random samples
-            generate_thumbnail_grids(loaders["train"], output_dir=output_path, num_samples=16)
+            if args.view_thumbnails:
+                # We pull from the 'train' loader because shuffle=True naturally provides random samples
+                generate_thumbnail_grids(loaders["train"], output_dir=output_path, num_samples=16)
 
-        logger.info("Data inspection complete. Exiting pipeline without training.")
+            logger.info("Data inspection complete. Exiting pipeline without training.")
         return
 
     if args.n_runs > 1:
@@ -759,17 +772,19 @@ def main():
     else:
         result = run_single_training(config, run_idx=0, seed=args.seed,
                                      output_dir=config.training.output_dir)
-        # Generate single-run figures
-        fig_dir = Path(config.training.output_dir) / "run_0" / "figures"
-        fig_dir.mkdir(parents=True, exist_ok=True)
 
-        set_neurips_style()
-        df = result["test_df"]
-        fig = plot_metric_distributions(df, save_path=fig_dir / "metrics.pdf")
-        plt.close(fig)
+        if is_global_zero:
+            # Generate single-run figures
+            fig_dir = Path(config.training.output_dir) / "run_0" / "figures"
+            fig_dir.mkdir(parents=True, exist_ok=True)
 
-        _generate_patch_analysis(result, fig_dir, config)
-        _print_final_summary([result], Path(config.training.output_dir))
+            set_neurips_style()
+            df = result["test_df"]
+            fig = plot_metric_distributions(df, save_path=fig_dir / "metrics.pdf")
+            plt.close(fig)
+
+            _generate_patch_analysis(result, fig_dir, config)
+            _print_final_summary([result], Path(config.training.output_dir))
 
 
 if __name__ == "__main__":
