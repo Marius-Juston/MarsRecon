@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
-import random
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -53,10 +53,10 @@ logger = logging.getLogger(__name__)
 
 # Hardcoded fallback quantiles derived from dataset_stats/dtm/dataset_stats.json
 # (Olympus Mons region, 52 k patches)
-_DEFAULT_ELEV_P02 = -4396.57
-_DEFAULT_ELEV_P98 = 20757.66
-_DEFAULT_IMG_P02 = 0.0502  # average of left_red / right_red p02
-_DEFAULT_IMG_P98 = 0.2450  # average of left_red / right_red p98
+_DEFAULT_ELEV_P02 = -4396.5664071121255
+_DEFAULT_ELEV_P98 = 20757.65899590482
+_DEFAULT_IMG_P02 = 0.049661101862306406  # average of left_red / right_red p02
+_DEFAULT_IMG_P98 = 0.24805250879347127  # average of left_red / right_red p98
 # Scale factor for relative-topography mode: 98th-percentile of patch-centred
 # elevation distribution (metres).  98 % of patches stay within [-1, 1] before
 # clamping while physical slope magnitudes remain consistent across the dataset.
@@ -117,8 +117,91 @@ def _load_quantiles(
     return elev_p02, elev_p98, img_p02, img_p98, elev_scale
 
 
+def _normalize_dtm_per_patch(
+        elevation: torch.Tensor,
+        valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Dynamic per-patch normalization to stretch sub-meter craters to [-1, 1]."""
+    valid = valid_mask.bool()
+    if not valid.any():
+        return torch.zeros_like(elevation)
+
+    valid_pixels = elevation[valid]
+    patch_min = valid_pixels.min()
+    patch_max = valid_pixels.max()
+    relief = patch_max - patch_min
+
+    if relief < 1e-4:  # Prevent division by zero on flat patches
+        return torch.zeros_like(elevation)
+
+    normed = ((elevation - patch_min) / relief) * 2.0 - 1.0
+    return torch.where(valid, normed, torch.zeros_like(normed))
+
+
+def _safe_resize(tensor: torch.Tensor, size: int, is_mask: bool = False, has_nans: bool = False) -> torch.Tensor:
+    """Resizes tensors safely using PyTorch, avoiding NaN poisoning."""
+    if tensor.shape[-2] == size and tensor.shape[-1] == size:
+        return tensor
+
+    # Masks MUST use nearest neighbor so edges aren't blurred
+    if is_mask:
+        return F.interpolate(tensor.unsqueeze(0), size=(size, size), mode='nearest-exact').squeeze(0)
+
+    # If it's a DTM with NaNs, temporarily swap NaNs for 0 to prevent bilinear poisoning
+    if has_nans:
+        valid = ~torch.isnan(tensor)
+        safe_tensor = tensor.clone()
+        safe_tensor[~valid] = 0.0
+
+        resized_tensor = F.interpolate(safe_tensor.unsqueeze(0), size=(size, size), mode='bilinear',
+                                       align_corners=False).squeeze(0)
+        resized_valid = F.interpolate(valid.float().unsqueeze(0), size=(size, size), mode='nearest-exact').squeeze(
+            0).bool()
+
+        resized_tensor[~resized_valid] = float('nan')
+        return resized_tensor
+
+    # Standard orthoimage resizing
+    return F.interpolate(tensor.unsqueeze(0), size=(size, size), mode='bilinear', align_corners=False).squeeze(0)
+
+
+def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.15) -> bool:
+    """
+    Detects artificial TIN (Triangular Irregular Network) interpolation in DTMs.
+    TINs have perfectly planar facets, meaning their second derivative (Laplacian) is exactly 0.
+    """
+    # Safely ensure elevation is 4D (1, 1, H, W) for the conv2d operation
+    elev_4d = elevation.view(1, 1, elevation.shape[-2], elevation.shape[-1])
+
+    # 3x3 Laplacian kernel
+    kernel = torch.tensor([[[[0.0, 1.0, 0.0],
+                             [1.0, -4.0, 1.0],
+                             [0.0, 1.0, 0.0]]]], device=elevation.device)
+
+    # Calculate 2nd derivative
+    laplacian = torch.nn.functional.conv2d(elev_4d, kernel, padding=1)
+
+    # Flatten both tensors to 1D to guarantee the boolean indexing never throws a dimension error
+    lap_flat = laplacian.view(-1)
+    mask_flat = valid_mask.view(-1).bool()
+
+    # Mask out edges and invalid regions
+    valid_laplacian = lap_flat[mask_flat]
+
+    if len(valid_laplacian) == 0:
+        return True
+
+    # Count how many pixels have a Laplacian of EXACTLY zero (perfectly flat plane)
+    # We use 1e-4 to account for float32 precision limits
+    zero_curvature_ratio = (valid_laplacian.abs() < 1e-2).float().mean().item()
+
+    # If more than 'threshold' (e.g., 40%) of the valid patch is perfectly planar, reject it
+    return zero_curvature_ratio > threshold
+
+
 def _normalize_dtm_relative(
         elevation: torch.Tensor,
+        valid: torch.Tensor,
         scale_factor: float,
 ) -> torch.Tensor:
     """Normalise elevation via local centering + fixed global scale.
@@ -138,20 +221,37 @@ def _normalize_dtm_relative(
     Returns:
         (1, H, W) tensor in [-1, 1]; nodata pixels filled with 0.
     """
-    valid = torch.isfinite(elevation)
-    if not valid.any():
+    bool_valid = valid == 1
+    if not bool_valid.any():
         return torch.zeros_like(elevation)
 
     # 1. Remove absolute altitude — the network cannot infer this from texture
-    patch_mean = elevation[valid].mean()
+    patch_mean = elevation[bool_valid].mean()
     centered = elevation - patch_mean
 
+    # 2. Dynamic Local Scale
+    # Find the maximum absolute deviation from the mean in THIS specific patch
+    local_max = centered[bool_valid].abs().max()
+
+    # Avoid divide-by-zero if the patch is somehow perfectly flat
+    if local_max < 1e-4:
+        local_scale = scale_factor
+    else:
+        local_scale = local_max
+
     # 2. Fixed physical scale: a 10 m ridge always produces the same latent delta
-    normed = centered / scale_factor
+    normed = centered / local_scale
+
+    # clipped = normed[bool_valid].abs() > 1.0
+    #
+    # if clipped.sum() > 10:
+    #     vals = (normed[bool_valid].abs() < 1).sum().item()
+    #     b = clipped.sum().item()
+    #     raise RuntimeError(f"Values out of range, they had to be slipped {b} vs {vals} ratio {b / vals}")
 
     # 3. Clamp extreme outliers (craters, scarps) without distorting the core
     normed = torch.clamp(normed, -1.0, 1.0)
-    normed = torch.where(valid, normed, torch.zeros_like(normed))
+    normed = torch.where(bool_valid, normed, torch.zeros_like(normed))
     return normed
 
 
@@ -213,6 +313,43 @@ def _resize(tensor: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Te
     ).squeeze(0)
 
 
+def compute_topographic_residual(elevation: torch.Tensor, valid_mask: torch.Tensor) -> float:
+    """
+    Fits a 2D plane to the elevation data and returns the RMS residual.
+    This removes macroscopic slopes and isolates true topographic roughness.
+    """
+    if elevation.ndim > 2:
+        elevation = elevation.squeeze()
+        valid_mask = valid_mask.squeeze()
+
+    H, W = elevation.shape
+
+    # Create normalized grid coordinates [-1, 1] for numerical stability
+    y = torch.linspace(-1, 1, H, dtype=elevation.dtype, device=elevation.device)
+    x = torch.linspace(-1, 1, W, dtype=elevation.dtype, device=elevation.device)
+    Y, X = torch.meshgrid(y, x, indexing='ij')
+
+    valid_bool = valid_mask.bool()
+    if not valid_bool.any():
+        return 0.0
+
+    X_v = X[valid_bool].unsqueeze(1)  # (N, 1)
+    Y_v = Y[valid_bool].unsqueeze(1)  # (N, 1)
+    Z_v = elevation[valid_bool].unsqueeze(1)  # (N, 1)
+
+    # Design matrix A: [X, Y, 1]
+    A = torch.cat([X_v, Y_v, torch.ones_like(X_v)], dim=1)  # (N, 3)
+
+    # Solve Least Squares: A * w = Z
+    w = torch.linalg.lstsq(A, Z_v).solution
+
+    # Calculate RMS of the residual (distance from actual elevation to the fitted plane)
+    Z_pred = A @ w
+    residual_rms = torch.sqrt(torch.mean((Z_v - Z_pred) ** 2)).item()
+
+    return residual_rms
+
+
 class DepthFMHiRISEAdapter(Dataset):
     """Adapter that converts MarsHiRISEDTM samples into DepthFM training pairs.
 
@@ -240,16 +377,22 @@ class DepthFMHiRISEAdapter(Dataset):
             resolution: int = 512,
             dtm_normalization: Literal["relative", "log", "linear"] = "relative",
             random_flip: bool = True,
+            random_jitter: bool = False,
             brightness_jitter: float = 0.1,
             stats_path: str | None = None,
+            max_retries: int = 10
     ):
         super().__init__()
+        self.max_retries = max_retries
+        self.random_jitter = random_jitter
         self.base = base_dataset
         self.sampler = sampler
         self.resolution = resolution
         self.dtm_norm = dtm_normalization
         self.flip = random_flip
         self.bright_jitter = brightness_jitter
+
+        self.is_train = random_flip
 
         # Load global quantiles for normalization
         (
@@ -272,97 +415,178 @@ class DepthFMHiRISEAdapter(Dataset):
     def __len__(self) -> int:
         return len(self._indices)
 
+    def rand_idx(self) -> torch.int64:
+        return torch.randint(0, len(self._indices), (1,)).item()
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        while True:
+        for retries in range(getattr(self, 'max_retries', 10)):
             geo_slice = self._indices[idx]
 
             # Load from the base MarsHiRISEDTM dataset
-            sample = self.base[geo_slice]
+            try:
+                # Load from the base MarsHiRISEDTM dataset
+                sample = self.base[geo_slice]
+            except IndexError as e:
+                idx = self.rand_idx()
+                logger.exception("An error occurred while trying to retrieve a sample.")
+                continue
 
-            # ── Elevation → normalised 3-channel DTM ──
-            elevation = sample["elevation"]  # (1, H, W) float32, NaN = nodata
+            # ── 1. Load Elevation ──
+            elevation = sample["elevation"]  # (1, H, W)
             if elevation.ndim == 4:
-                elevation = elevation[0]  # remove batch dim from DataLoader
+                elevation = elevation[0]
 
-            # Check for NaN or zero regions, which imply masked regions (0 works because x - E[x] will never be exactly 0)
-            valid_mask = torch.logical_and(torch.isfinite(elevation), elevation != 0.0).float()
+            if elevation.shape[-1] == 0 or elevation.shape[-2] == 0:
+                idx = self.rand_idx()
+                continue
 
-            if self.flip:
-                valid_ratio = valid_mask.mean().item()
+            # ── 2. Select Orthoimage FIRST ──
+            left_key, right_key = "left_red", "right_red"
+            has_left = left_key in sample and sample[left_key] is not None
+            has_right = right_key in sample and sample[right_key] is not None
 
-                if valid_ratio >= 0.85:  # If more than 15% of the patch is missing data
-
-                    # 2. Reject if the actual elevation is too flat (e.g., standard deviation < 1 meter)
-                    # This stops the model from wasting compute learning how to predict flat plains
-                    std = torch.std(elevation[valid_mask.bool()])
-                    if std >= 1.0:
-                        logger.info("Actual elevation is too flat, standard deviation < 1 meter, actual std, %0.3f",
-                                    std)
-                        break
-
-                # Failed filter: silently pick a new random index and loop again
-                idx = random.randint(0, len(self._indices) - 1)
+            if has_left and has_right:
+                key = left_key if torch.rand(1).item() > 0.5 else right_key
+            elif has_left:
+                key = left_key
+            elif has_right:
+                key = right_key
             else:
-                break
+                key = None
 
-        dtm = _normalize_dtm_relative(elevation, scale_factor=self.elev_scale)
+            if key is not None:
+                ortho = sample[key]
+            else:
+                # Fallback: try IRB
+                for fallback_key in ("left_irb", "right_irb"):
+                    if fallback_key in sample and sample[fallback_key] is not None:
+                        ortho = sample[fallback_key]
+                        key = fallback_key
+                        break
+                else:
+                    logger.warning(f"No orthoimage found for sample {idx}, using zeros")
+                    ortho = torch.zeros(1, elevation.shape[-2], elevation.shape[-1])
+                    key = "dummy"
+
+            if ortho.ndim == 4:
+                ortho = ortho[0]
+
+            if ortho.shape[-1] == 0 or ortho.shape[-2] == 0:
+                idx = self.rand_idx()
+                continue
+
+            # ── 3. Extract MATCHING Metadata ──
+            meta_list = sample.get("meta", [])
+            meta_key = f"{key}_meta"
+
+            incidence, azimuth = 45.0, 270.0  # Safe defaults
+            if meta_list and meta_key in meta_list[0]:
+                incidence = meta_list[0][meta_key]["incidence_angle"]
+                azimuth = meta_list[0][meta_key]["solar_azimuth"]
+
+            # Convert spherical to cartesian vector
+            inc_rad = math.radians(incidence)
+            az_rad = math.radians(azimuth)
+            sun_x = math.sin(inc_rad) * math.cos(az_rad)
+            sun_y = math.sin(inc_rad) * math.sin(az_rad)
+            sun_z = math.cos(inc_rad)
+
+            sun_vector = torch.tensor([-sun_x, -sun_y, sun_z], dtype=torch.float32)
+
+            # ── 4. Resize and Mask ──
+            dtm_resized = _safe_resize(elevation, self.resolution, has_nans=True)
+            image_resized = _safe_resize(ortho, self.resolution)
+
+            ortho_valid = (image_resized != 0.0).any(dim=0, keepdim=True)
+            elev_valid = torch.isfinite(dtm_resized) & (dtm_resized != 0.0)
+            valid_mask_resized = (ortho_valid & elev_valid).float()
+
+            # ── 5. Filtering Logic ──
+            if True or getattr(self, 'is_train', False):
+                valid_ratio = valid_mask_resized.mean().item()
+
+                if valid_ratio >= 0.85:
+                    try:
+                        std = compute_topographic_residual(dtm_resized, valid_mask_resized)
+                        if std < 0.1:
+                            logger.info(f"Skipping flat patch, std: {std:.3f}")
+                            idx = self.rand_idx()
+                            continue
+
+                        # from depth_fm.depthfm_adapter import is_tin_artifact
+                        if is_tin_artifact(dtm_resized, valid_mask_resized, threshold=0.15):
+                            print("Skipping")
+                            logger.info("Skipping patch: Detected artificial TIN triangles.")
+                            idx = self.rand_idx()
+                            continue
+                    except Exception:
+                        logger.exception("An error occured while validating.")
+                        idx = self.rand_idx()
+                        continue
+
+                    break  # Passed all checks
+                else:
+                    idx = self.rand_idx()
+                    continue
+            else:
+                break  # Validation/Test always breaks immediately
+
+        else:
+            # ── Fallback if max_retries hit ──
+            logger.warning(f"Hit max_retries in DataLoader. Returning dummy patch.")
+            return {
+                "image": torch.zeros(3, self.resolution, self.resolution),
+                "dtm": torch.zeros(3, self.resolution, self.resolution),
+                "confidence": torch.zeros(1, self.resolution, self.resolution),
+                "sun_vector": torch.tensor([0.5, -0.5, 1.0], dtype=torch.float32)
+            }
+
+        # ── 6. Normalization ──
+        dtm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
         dtm = _to_3ch(dtm)
 
-        # ── Orthoimage → normalised 3-channel image ──
-        # Stereo augmentation: randomly pick left or right
-        left_key, right_key = "left_red", "right_red"
-        has_left = left_key in sample and sample[left_key] is not None
-        has_right = right_key in sample and sample[right_key] is not None
-
-        if has_left and has_right:
-            # Random stereo augmentation
-            key = random.choice([left_key, right_key])
-            ortho = sample[key]
-        elif has_left:
-            ortho = sample[left_key]
-        elif has_right:
-            ortho = sample[right_key]
-        else:
-            # Fallback: try IRB
-            for fallback_key in ("left_irb", "right_irb"):
-                if fallback_key in sample and sample[fallback_key] is not None:
-                    ortho = sample[fallback_key]
-                    break
-            else:
-                # No ortho available — create a dummy (training will skip)
-                logger.warning(
-                    "No orthoimage found for sample %d, using zeros", idx
-                )
-                ortho = torch.zeros(1, elevation.shape[-2], elevation.shape[-1])
-
-        if ortho.ndim == 4:
-            ortho = ortho[0]
-
-        image = _normalize_ortho(ortho, p02=self.img_p02, p98=self.img_p98)
+        image = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
         image = _to_3ch(image)
 
-        dtm = _resize(dtm, self.resolution)
-        image = _resize(image, self.resolution)
-        valid_mask = _resize(valid_mask, self.resolution, mode='nearest-exact')
-
-        # ── Synchronised augmentation ──
-        if self.flip:
-            if random.random() > 0.5:
-                image = torch.flip(image, [-1])  # horizontal
+        # ── 7. Synchronised Augmentation (INCLUDING SUN VECTOR) ──
+        if getattr(self, 'is_train', False) and getattr(self, 'flip', False):
+            if torch.rand(1).item() > 0.5:
+                image = torch.flip(image, [-1])
                 dtm = torch.flip(dtm, [-1])
-                valid_mask = torch.flip(valid_mask, [-1])
-            if random.random() > 0.5:
-                image = torch.flip(image, [-2])  # vertical
-                dtm = torch.flip(dtm, [-2])
-                valid_mask = torch.flip(valid_mask, [-2])
+                valid_mask_resized = torch.flip(valid_mask_resized, [-1])
+                sun_vector[0] = -sun_vector[0]  # Flip X axis
 
-        # Brightness jitter on image only (simulates illumination variation)
-        if self.bright_jitter > 0:
+            if torch.rand(1).item() > 0.5:
+                image = torch.flip(image, [-2])
+                dtm = torch.flip(dtm, [-2])
+                valid_mask_resized = torch.flip(valid_mask_resized, [-2])
+                sun_vector[1] = -sun_vector[1]  # Flip Y axis
+
+            # 90-degree rotations
+            k_rot = torch.randint(0, 4, (1,)).item()
+            if k_rot > 0:
+                image = torch.rot90(image, k=k_rot, dims=[-2, -1])
+                dtm = torch.rot90(dtm, k=k_rot, dims=[-2, -1])
+                valid_mask_resized = torch.rot90(valid_mask_resized, k=k_rot, dims=[-2, -1])
+
+                # Rotate sun vector in X-Y plane
+                sx, sy = sun_vector[0].clone(), sun_vector[1].clone()
+                if k_rot == 1:
+                    sun_vector[0], sun_vector[1] = -sy, sx
+                elif k_rot == 2:
+                    sun_vector[0], sun_vector[1] = -sx, -sy
+                elif k_rot == 3:
+                    sun_vector[0], sun_vector[1] = sy, -sx
+
+        # Brightness jitter on image only
+        if getattr(self, 'is_train', False) and getattr(self, 'bright_jitter', 0) > 0:
+            import random
             factor = 1.0 + random.uniform(-self.bright_jitter, self.bright_jitter)
             image = (image * factor).clamp(-1.0, 1.0)
 
         return {
-            "image": image,  # (3, H, W) in [-1, 1]
-            "dtm": dtm,  # (3, H, W) in [-1, 1]
-            "confidence": valid_mask,
+            "image": image,
+            "dtm": dtm,
+            "confidence": valid_mask_resized,
+            "sun_vector": sun_vector
         }

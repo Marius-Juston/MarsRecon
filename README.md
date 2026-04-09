@@ -110,6 +110,7 @@ Converting JP2 files to Cloud Optimised GeoTIFF dramatically speeds up random-wi
 
 ```bash
 uv run python -m src.preprocessing --root /scratch/mars_hirise --workers 4
+uv run python -m src.preprocessing --root /scratch/mars_hirise_dtm --workers 4
 ```
 
 The dataset transparently prefers `.tif` COG sidecars when they exist alongside `.JP2` files.

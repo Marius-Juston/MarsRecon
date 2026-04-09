@@ -46,7 +46,6 @@ from depth_fm.visualization import (
     plot_convergence_curves,
     plot_multi_run_summary_table,
 )
-from lightning.pytorch.plugins.io import AsyncCheckpointIO
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +55,173 @@ import torch
 from tqdm import tqdm
 import logging
 
-logger = logging.getLogger(__name__)
+
+@torch.no_grad()
+def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
+    """
+    Visualizes the internal physics of the Photoclinometric Loss.
+    Shows exactly what the network sees when it calculates normals and renders shadows.
+    Layout: [Real Ortho (Gray)] | [GT DTM] | [Surface Normals] | [Lambertian Render]
+    """
+    logger.info(f"Generating Loss Physics visualization for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    import torch.nn.functional as F
+
+    # Setup Sobel kernels exactly like the loss function
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device) / 8.0
+    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device) / 8.0
+    kx = sobel_x.view(1, 1, 3, 3)
+    ky = sobel_y.view(1, 1, 3, 3)
+
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+    plt.subplots_adjust(wspace=0.1, hspace=0.1)
+
+    count = 0
+    with tqdm(total=num_samples) as pbar:
+        for batch in dataloader:
+            if count >= num_samples: break
+
+            B = batch["image"].shape[0]
+            for i in range(B):
+                if count >= num_samples: break
+
+                # 1. Extract and format data
+                img = batch["image"][i:i + 1].to(device)  # (1, 3, H, W)
+                dtm = batch["dtm"][i:i + 1, :1].to(device)  # (1, 1, H, W)
+                mask = batch["confidence"][i:i + 1].to(device)  # (1, 1, H, W)
+
+                # Fallback if sun_vector is missing, otherwise grab it
+                if "sun_vector" in batch:
+                    sun_vec = batch["sun_vector"][i:i + 1].to(device)
+                else:
+                    sun_vec = torch.tensor([[0.5, -0.5, 1.0]], device=device)
+
+                # 2. Convert Ortho to Grayscale for Shading Comparison
+                if img.shape[1] == 3:
+                    ortho_gray = img.mean(dim=1, keepdim=True)
+                else:
+                    ortho_gray = img
+
+                B, C, H, W = dtm.shape
+                spatial_scale = max(H, W) / 2.0
+
+                # 3. Compute Normals (Exact math from the loss function)
+                padded_dtm = F.pad(dtm, (1, 1, 1, 1), mode='replicate')
+                dz_dx = F.conv2d(padded_dtm, kx) * spatial_scale
+                dz_dy = F.conv2d(padded_dtm, ky) * spatial_scale
+
+                n_x = -dz_dx
+                n_y = -dz_dy
+                n_z = torch.ones_like(n_x)
+
+                normals = torch.cat([n_x, n_y, n_z], dim=1)
+                normals = F.normalize(normals, p=2, dim=1)
+
+                # 4. Lambertian Rendering
+                l_dir = F.normalize(sun_vec, p=2, dim=1).view(1, 3, 1, 1)
+                render = torch.sum(normals * l_dir, dim=1, keepdim=True)
+                render = torch.clamp(render, min=0.0)
+
+                # ---------------------------------------------------------
+                # Convert to Numpy for plotting
+                # ---------------------------------------------------------
+                # Un-normalize [-1, 1] to [0, 1]
+                img_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                mask_np = mask[0, 0].cpu().numpy().astype(bool)
+
+                # Map normals from [-1, 1] to [0, 1] RGB space for visualization
+                normals_disp = (normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0
+
+                # Render is already [0, 1]
+                render_disp = render[0, 0].cpu().numpy()
+
+                # Apply mask so nodata regions render as blank white
+                img_disp[~mask_np] = np.nan
+                dtm_disp[~mask_np] = np.nan
+                normals_disp[~mask_np] = np.nan
+                render_disp[~mask_np] = np.nan
+
+                # Plotting
+                ax_ortho = axes[count, 0]
+                ax_dtm = axes[count, 1]
+                ax_normals = axes[count, 2]
+                ax_render = axes[count, 3]
+
+                ax_ortho.imshow(img_disp, cmap="gray")
+                ax_ortho.axis("off")
+
+                ax_dtm.imshow(dtm_disp, cmap="terrain")
+                ax_dtm.axis("off")
+
+                ax_normals.imshow(normals_disp)
+                ax_normals.axis("off")
+
+                ax_render.imshow(render_disp, cmap="gray")
+                ax_render.axis("off")
+
+                if count == 0:
+                    ax_ortho.set_title("Real Ortho (Gray)")
+                    ax_dtm.set_title("GT DTM")
+                    ax_normals.set_title("Calculated Surface Normals")
+                    ax_render.set_title("Lambertian Render (Shadows)")
+
+                count += 1
+                pbar.update()
+
+    save_path = output_dir / "loss_physics_inspection.png"
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor='white')
+    plt.close(fig)
+    logger.info(f"Loss physics visualization saved to: {save_path}")
+
+
+@torch.no_grad()
+def compute_topography_statistics(dataloader, split_name="Dataset"):
+    """
+    Evaluates dataset samples to see how many patches are essentially flat planes.
+    """
+    logger.info(f"Computing topography statistics for {split_name}...")
+
+    from depth_fm.depthfm_adapter import compute_topographic_residual
+
+    residuals = []
+    flat_stds = []
+
+    for batch in tqdm(dataloader, desc=f"Evaluating {split_name} roughness"):
+        dtms = batch["dtm"]  # Shape: (B, 3, H, W)
+        masks = batch["confidence"]  # Shape: (B, 1, H, W)
+
+        for i in range(dtms.shape[0]):
+            elevation_m = dtms[i, 0]
+            mask = masks[i, 0]
+
+            res = compute_topographic_residual(elevation_m, mask)
+            residuals.append(res)
+            res = torch.std(elevation_m[mask.bool()])
+            flat_stds.append(res)
+
+    for metric_name, residuals in zip(["TOPOGRAPHY", "FLATNESS"], [residuals, flat_stds]):
+        residuals = np.array(residuals)
+
+        logger.info("-" * 50)
+        logger.info(f"{metric_name} STATISTICS FOR: {split_name.upper()}")
+        logger.info("-" * 50)
+        logger.info(f"Total Patches Evaluated: {len(residuals)}")
+        logger.info(f"Mean Residual: {np.mean(residuals):.2f} meters")
+        logger.info(f"Median Residual: {np.median(residuals):.2f} meters")
+        logger.info(f"Max Residual: {np.max(residuals):.2f} meters")
+        logger.info("-" * 50)
+        logger.info("Rejection Rates based on Thresholds:")
+
+        n = 10
+        thresholds = np.logspace(-3, 0, n)
+        for t in thresholds:
+            rejected = np.sum(residuals < t)
+            pct = (rejected / len(residuals)) * 100
+            logger.info(f"  < {t:.3f}m (rejected): {rejected} patches ({pct:.1f}%)")
+        logger.info("-" * 50)
 
 
 @torch.no_grad()
@@ -119,67 +284,166 @@ def compute_mask_statistics(dataloader, split_name="Dataset"):
 
 
 @torch.no_grad()
-def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 16):
+def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3):
     """
-    Extracts random samples from the dataloader and plots a 4x8 paired grid
-    (16 Orthos and 16 corresponding DTMs). Uses exact [-1, 1] -> [0, 1] normalization.
+    Extracts random samples and plots them with both macro and micro views.
+    Layout: [Full Ortho] | [Full DTM] | [Full Detrended] | [Ortho Zoom] | [Slope Zoom] | [Detrended Zoom]
     """
-    logger.info(f"Generating paired thumbnail grid for {num_samples} random samples...")
+    logger.info(f"Generating high-detail mask-aware thumbnail grid for {num_samples} samples...")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    images, dtms = [], []
+    images, dtms, masks = [], [], []
 
-    # Collect exactly `num_samples` from the dataloader
     for batch in dataloader:
         B = batch["image"].shape[0]
         for i in range(B):
             images.append(batch["image"][i].cpu().numpy())
             dtms.append(batch["dtm"][i].cpu().numpy())
+            masks.append(batch["confidence"][i].cpu().numpy())
             if len(images) == num_samples:
                 break
         if len(images) == num_samples:
             break
 
-    # Setup a 4x8 grid. Each pair takes 2 columns (Ortho | DTM)
-    fig, axes = plt.subplots(4, 8, figsize=(20, 10))
-    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+    # Setup grid: 1 row per sample, 6 columns
+    fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
+    plt.subplots_adjust(wspace=0.1, hspace=0.1)
+
+    crop_size = 128
+
+    def detrend_and_stretch(z_data: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Helper to fit a plane, subtract it, and stretch to [0, 1] using only valid pixels."""
+        h, w = z_data.shape
+        y_grid, x_grid = np.mgrid[0:h, 0:w]
+
+        x_valid = x_grid[mask]
+        y_valid = y_grid[mask]
+        z_valid = z_data[mask]
+
+        if len(z_valid) >= 3:
+            A = np.c_[x_valid, y_valid, np.ones_like(x_valid)]
+            C, _, _, _ = np.linalg.lstsq(A, z_valid, rcond=None)
+
+            macro_plane = C[0] * x_grid + C[1] * y_grid + C[2]
+            detrended = z_data - macro_plane
+
+            valid_detrended = detrended[mask]
+            dp2, dp98 = np.percentile(valid_detrended, [2, 98])
+
+            if dp98 > dp2:
+                normed = np.clip((detrended - dp2) / (dp98 - dp2), 0.0, 1.0)
+            else:
+                normed = np.zeros_like(detrended)
+        else:
+            normed = np.zeros_like(z_data)
+
+        normed[~mask] = np.nan
+        return normed
 
     for idx in range(num_samples):
-        row = idx // 4
-        col_base = (idx % 4) * 2
+        ax_img_full = axes[idx, 0]
+        ax_dtm_full = axes[idx, 1]
+        ax_detrend_full = axes[idx, 2]
+        ax_img_crop = axes[idx, 3]
+        ax_grad_crop = axes[idx, 4]
+        ax_detrend_crop = axes[idx, 5]
 
-        ax_img = axes[row, col_base]
-        ax_dtm = axes[row, col_base + 1]
+        # Standard [-1, 1] -> [0, 1] normalization for full images
+        img_np = np.clip((np.transpose(images[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+        dtm_np = np.clip((np.transpose(dtms[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+        mask_np = masks[idx][0].astype(bool)
 
-        # Standard (x + 1) / 2 normalization for [-1, 1] data
-        # Transpose from (C, H, W) to (H, W, C) for matplotlib
-        img_np = (np.transpose(images[idx], (1, 2, 0)) + 1.0) / 2.0
-        dtm_np = (np.transpose(dtms[idx], (1, 2, 0)) + 1.0) / 2.0
+        # Apply mask to full images so Matplotlib renders nodata as empty space
+        img_np[~mask_np] = np.nan
+        dtm_np[~mask_np] = np.nan
 
-        # Clip to strictly [0, 1] to suppress matplotlib float-rounding warnings
-        img_np = np.clip(img_np, 0.0, 1.0)
-        dtm_np = np.clip(dtm_np, 0.0, 1.0)
+        # ---------------------------------------------------------
+        # FULL DETRENDED CALCULATION
+        # ---------------------------------------------------------
+        dtm_full_1ch = dtm_np[..., 0]
+        detrended_full_norm = detrend_and_stretch(dtm_full_1ch, mask_np)
 
-        # Plot Orthoimage
-        ax_img.imshow(img_np)
-        ax_img.axis("off")
-        if row == 0:
-            ax_img.set_title("Ortho Input")
+        # Calculate crop coordinates
+        H, W = img_np.shape[:2]
+        cy, cx = H // 2, W // 2
+        half_c = crop_size // 2
 
-        # Plot Normalized DTM
-        ax_dtm.imshow(dtm_np)
-        ax_dtm.axis("off")
-        if row == 0:
-            ax_dtm.set_title("DTM Target")
+        # Extract Crops
+        img_crop = img_np[cy - half_c:cy + half_c, cx - half_c:cx + half_c]
+        dtm_crop = dtm_full_1ch[cy - half_c:cy + half_c, cx - half_c:cx + half_c]
+        mask_crop = mask_np[cy - half_c:cy + half_c, cx - half_c:cx + half_c]
 
-    save_path = output_dir / "dataset_thumbnails.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=150)
+        # ---------------------------------------------------------
+        # MASKED GRADIENTS (Dynamic Slope Magnitude - CROP)
+        # ---------------------------------------------------------
+        dy, dx = np.gradient(dtm_crop)
+        slope_mag = np.sqrt(dx ** 2 + dy ** 2)
+
+        valid_slopes = slope_mag[mask_crop]
+
+        if len(valid_slopes) > 0:
+            p2, p98 = np.percentile(valid_slopes, [2, 98])
+            if p98 > p2:
+                slope_norm = np.clip((slope_mag - p2) / (p98 - p2), 0.0, 1.0)
+            else:
+                slope_norm = np.zeros_like(slope_mag)
+        else:
+            slope_norm = np.zeros_like(slope_mag)
+
+        slope_norm[~mask_crop] = np.nan
+
+        # ---------------------------------------------------------
+        # MASKED DETRENDED TOPOGRAPHY (CROP)
+        # ---------------------------------------------------------
+        detrended_crop_norm = detrend_and_stretch(dtm_crop, mask_crop)
+
+        # ---------------------------------------------------------
+        # Plotting
+        # ---------------------------------------------------------
+        ax_img_full.imshow(img_np)
+        ax_img_full.axis("off")
+
+        ax_dtm_full.imshow(dtm_full_1ch, cmap="terrain")
+        ax_dtm_full.axis("off")
+
+        ax_detrend_full.imshow(detrended_full_norm, cmap="terrain")
+        ax_detrend_full.axis("off")
+
+        ax_img_crop.imshow(img_crop)
+        ax_img_crop.axis("off")
+
+        ax_grad_crop.imshow(slope_norm, cmap="magma")
+        ax_grad_crop.axis("off")
+
+        ax_detrend_crop.imshow(detrended_crop_norm, cmap="terrain")
+        ax_detrend_crop.axis("off")
+
+        if idx == 0:
+            ax_img_full.set_title("Ortho (Full)")
+            ax_dtm_full.set_title("DTM (Full)")
+            ax_detrend_full.set_title("Detrended (Full)")
+            ax_img_crop.set_title(f"Ortho Zoom ({crop_size}px)")
+            ax_grad_crop.set_title(f"Masked Slope ({crop_size}px)")
+            ax_detrend_crop.set_title(f"Masked Detrend ({crop_size}px)")
+
+    save_path = output_dir / "dataset_thumbnails_detailed.png"
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, transparent=False, facecolor='white')
     plt.close(fig)
-    logger.info(f"Thumbnails successfully saved to: {save_path}")
+    logger.info(f"Detailed thumbnails successfully saved to: {save_path}")
+
 
 # ---------------------------------------------------------------------------
 # Data module
 # ---------------------------------------------------------------------------
+
+def configure_worker_logger(worker_id):
+    """Forces the spawned PyTorch worker to actually print INFO logs."""
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"[Worker {worker_id}] %(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True  # Overrides any existing silent config
+    )
 
 def build_dataloaders(config, split_seed: int = 42):
     """Build train/val/test DataLoaders from MarsHiRISEDTM."""
@@ -204,6 +468,7 @@ def build_dataloaders(config, split_seed: int = 42):
         bbox=bbox_tuple,
         reuse_cache=hc.get("reuse_cache", True),
         target=hc.get("target"),
+        return_meta=True
     )
 
     split_fractions = tuple(config.data.get("split_fractions", [0.8, 0.1, 0.1]))
@@ -261,6 +526,7 @@ def build_dataloaders(config, split_seed: int = 42):
             drop_last=is_train,
             persistent_workers=True,
             multiprocessing_context="spawn",
+            worker_init_fn=configure_worker_logger
         )
 
         logger.info(
@@ -418,7 +684,6 @@ def run_single_training(
     # 5. The Resumption Execution Execution
     last_ckpt_path = output_dir / "checkpoints" / "last.ckpt"
 
-
     if config.training.enable:
         if last_ckpt_path.exists():
             logger.info(f"*** Resuming run {run_idx} gracefully from {last_ckpt_path} ***")
@@ -428,11 +693,12 @@ def run_single_training(
             trainer.fit(module, loaders["train"], loaders["val"])
 
     # Test (with EMA weights via callback)
-    trainer.test(module, loaders["test"], ckpt_path=None if config.training.get("enable", True) else str(last_ckpt_path), weights_only=False)
+    trainer.test(module, loaders["test"],
+                 ckpt_path=None if config.training.get("enable", True) else str(last_ckpt_path), weights_only=False)
 
     # Timestep ablation: evaluate at [1, 2, 4, 8, 10, 20] Euler steps
     logger.info("Running timestep ablation...")
-    if config.training.get("use_ema", True)and module._ema_initialised:
+    if config.training.get("use_ema", True) and module._ema_initialised:
         module.load_ema_weights()
     timestep_results = module.run_timestep_ablation(
         loaders["test"],
@@ -704,6 +970,8 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
     df.to_csv(output_dir / "all_runs_metrics.csv", index=False)
 
 
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -724,10 +992,14 @@ def main():
                         help="Which fold to use as test (0 to n_folds-1)")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--analyze_masks_only", action="store_true",
+    parser.add_argument("--analyze_topography", action="store_true",
+                        help="Run dataset mask statistics and exit without training")
+    parser.add_argument("--analyze_masks", action="store_true",
                         help="Run dataset mask statistics and exit without training")
     parser.add_argument("--view_thumbnails", action="store_true",
                         help="Save a 4x4 grid of random dataset input images and exit")
+    parser.add_argument("--view_loss_physics", action="store_true",
+                        help="Visualize the photoclinometric normals and shadow rendering")
 
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -749,20 +1021,28 @@ def main():
     import os
     is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
 
-    if args.analyze_masks_only or args.view_thumbnails:
+    config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type", "depthfm")
+
+    if args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
             L.seed_everything(args.seed, workers=True)
             loaders = build_dataloaders(config, split_seed=args.seed)
             output_path = Path(config.training.output_dir) / "inspection"
 
-            if args.analyze_masks_only:
+            if args.analyze_topography:
+                compute_topography_statistics(loaders["test"], split_name=f"Test Set")
+
+            if args.analyze_masks:
                 for split_name, loader in loaders.items():
                     compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
 
             if args.view_thumbnails:
                 # We pull from the 'train' loader because shuffle=True naturally provides random samples
-                generate_thumbnail_grids(loaders["train"], output_dir=output_path, num_samples=16)
+                generate_thumbnail_grids(loaders["val"], output_dir=output_path, num_samples=8)
+
+            if args.view_loss_physics:
+                visualize_loss_physics(loaders["train"], output_dir=output_path, num_samples=8)
 
             logger.info("Data inspection complete. Exiting pipeline without training.")
         return

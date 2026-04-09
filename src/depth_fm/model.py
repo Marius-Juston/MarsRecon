@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 from diffusers import AutoencoderKL
 
+from depth_fm.other_models import DebugUNet, ModulatedMicroFlowNet
+
 logger = logging.getLogger(__name__)
 
 # SD 1.5 VAE scale factor — hardcoded, matches the DepthFM paper
@@ -277,6 +279,14 @@ def build_model(config) -> MarsDepthFM:
         vae_id=config.model.vae_id,
         use_checkpoint=config.model.use_checkpoint
     )
+
+    model_type = config.model.get("model_type", "debug")
+
+    if model_type == "debug":
+        backbone = DebugUNet()
+
+    elif model_type == "modulated":
+        backbone = ModulatedMicroFlowNet()
 
     model = MarsDepthFM(
         backbone=backbone,

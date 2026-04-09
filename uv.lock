@@ -473,6 +473,19 @@ wheels = [
 ]
 
 [[package]]
+name = "focal-frequency-loss"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f3/a3/118923b1776a12a493b1934c9f0d3ce2b2eebce7fed2c0df108cd631e043/focal_frequency_loss-0.3.0.tar.gz", hash = "sha256:81a89576cfef5d1a745b02298ae29d06d5f5d5a9933752d3135e16ed840efe79", size = 6794, upload-time = "2021-10-22T16:38:59.716Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/ef/e176be409e46801ee17fd0a5285c31e91ad6e4ef11aa8e779e2c85e326d3/focal_frequency_loss-0.3.0-py3-none-any.whl", hash = "sha256:0cd7dcdbaebc23fe975982d5edaa1dde2c1bd566a09d29a123d6f17c56094910", size = 7671, upload-time = "2021-10-22T16:38:57.18Z" },
+]
+
+[[package]]
 name = "fonttools"
 version = "4.62.1"
 source = { registry = "https://pypi.org/simple" }
@@ -934,6 +947,7 @@ depthfm = [
     { name = "accelerate" },
     { name = "diffusers" },
     { name = "einops" },
+    { name = "focal-frequency-loss" },
     { name = "jsonargparse", extra = ["signatures"] },
     { name = "lightning" },
     { name = "matplotlib" },
@@ -977,6 +991,7 @@ requires-dist = [
     { name = "cairosvg", marker = "extra == 'viz'", specifier = ">=2.9.0" },
     { name = "diffusers", marker = "extra == 'depthfm'", specifier = ">=0.37.1" },
     { name = "einops", marker = "extra == 'depthfm'", specifier = ">=0.8.2" },
+    { name = "focal-frequency-loss", marker = "extra == 'depthfm'", specifier = ">=0.3.0" },
     { name = "graphviz", marker = "extra == 'viz'", specifier = ">=0.21" },
     { name = "huggingface-hub", specifier = ">=1.8.0" },
     { name = "jsonargparse", extras = ["signatures"], marker = "extra == 'depthfm'", specifier = ">=4.47.0" },

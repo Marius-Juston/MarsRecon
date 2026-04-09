@@ -29,6 +29,7 @@ depthfm = [
     "accelerate>=1.13.0",
     "diffusers>=0.37.1",
     "einops>=0.8.2",
+    "focal-frequency-loss>=0.3.0",
     "jsonargparse[signatures]>=4.47.0",
     "lightning>=2.6.1",
     "matplotlib>=3.10.8",

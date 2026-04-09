@@ -61,6 +61,8 @@ class DepthFMLightningModule(L.LightningModule):
             grad_weight=lc.get("grad_weight", 0.0),
             grad_start_step=lc.get("grad_start_step", 0),
             grad_scales=tuple(lc.get("grad_scales", [1, 2, 4])),
+            photo_weight=lc.get("photo_weight", 0.0),
+            photo_start_step=lc.get("photo_start_step", 2000),
         )
 
         # Flow matching config
@@ -183,7 +185,9 @@ class DepthFMLightningModule(L.LightningModule):
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         z_img = self._encode(batch["image"])
-        z_depth = self._encode(batch["dtm"])
+        z_depth_raw = self._encode(batch["dtm"])
+
+        z_depth = z_depth_raw*self.config.data.get("signal_boost", 1.0)
 
         B = z_img.shape[0]
         t = self._sample_timesteps(B)
@@ -209,11 +213,21 @@ class DepthFMLightningModule(L.LightningModule):
             v_pred_f = v_pred.detach().float()
             v_target_f = v_target.float()
             v_pred_norm = v_pred_f.norm(dim=1).mean()
+            v_pred_norm = v_pred_f.norm(dim=1).mean()
             v_target_norm = v_target_f.norm(dim=1).mean()
             v_diff_norm = (v_pred_f - v_target_f).norm(dim=1).mean()
             v_rel_error = v_diff_norm / (v_target_norm + 1e-8)
             t_mean = t.float().mean()
             t_std = t.float().std()
+
+        if self.global_step % 10 == 0:
+            a = z_depth_raw.std().item()
+            b = x_source.std().item()
+            c = b / a
+
+            self.log("train/z_depth_std", a, sync_dist=True)
+            self.log("train/noise_std", b, sync_dist=True)
+            self.log("train/ideal_ratio", c, sync_dist=True)
 
         self.log("train/v_pred_norm", v_pred_norm, sync_dist=True)
         self.log("train/v_target_norm", v_target_norm, sync_dist=True)
@@ -231,9 +245,14 @@ class DepthFMLightningModule(L.LightningModule):
             gt_pix = self._decode(z_depth)  # GT never needs gradients
 
         loss_dict = self.loss_fn(
-            v_pred, v_target, pred_pix, gt_pix,
+            v_pred=v_pred,
+            v_target=v_target,
+            pred_pix=pred_pix,
+            gt_pix=gt_pix,
             confidence=batch.get("confidence"),
             global_step=step,
+            real_ortho=batch["image"],
+            sun_vector=batch.get("sun_vector")
         )
 
         # Logging
@@ -273,15 +292,21 @@ class DepthFMLightningModule(L.LightningModule):
         self._val_aggregator = MetricsAggregator()
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
+        signal_boost = self.config.data.get("signal_boost", 1.0)
+
         z_img = self._encode(batch["image"])
-        z_depth = self._encode(batch["dtm"])
+        z_depth = self._encode(batch["dtm"]) * signal_boost
+
 
         # 1-step Euler prediction
         z_pred = self._predict_depth(z_img, num_steps=self.config.get("test_euler_steps", 4))
 
+        z_pred_unboosted = z_pred / signal_boost
+        z_depth_unboosted = z_depth / signal_boost
+
         # Decode predictions and the ground truth latent to pixel space
-        pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
-        gt_decoded = self._decode(z_depth)[:, 0].float().cpu().numpy()
+        pred_pix = self._decode(z_pred_unboosted)[:, 0].float().cpu().numpy()
+        gt_decoded = self._decode(z_depth_unboosted)[:, 0].float().cpu().numpy()
 
         # Get the ACTUAL raw DTM from the dataloader for true metric comparison
         gt_raw = batch["dtm"][:, 0].float().cpu().numpy()

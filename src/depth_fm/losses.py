@@ -30,6 +30,89 @@ except ImportError:
     _HAS_FFL = False
 
 
+class PhotoclinometricLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # REMOVED: self.light_dir = nn.Parameter(...)
+
+        sobel_x = torch.tensor([[-1., 0., 1.],
+                                [-2., 0., 2.],
+                                [-1., 0., 1.]]) / 8.0
+        sobel_y = torch.tensor([[-1., -2., -1.],
+                                [0., 0., 0.],
+                                [1., 2., 1.]]) / 8.0
+
+        self.register_buffer("kernel_x", sobel_x.view(1, 1, 3, 3))
+        self.register_buffer("kernel_y", sobel_y.view(1, 1, 3, 3))
+
+    def _get_surface_normals(self, depth: torch.Tensor) -> torch.Tensor:
+        """Calculates (Nx, Ny, Nz) unit normals from the depth map."""
+        B, C, H, W = depth.shape
+
+        # NEW: Spatial scaling factor.
+        # Maps the [-1, 1] normalized Z-axis back to physical proportions relative to the X/Y grid.
+        spatial_scale = max(H, W) / 2.0
+
+        padded = F.pad(depth, (1, 1, 1, 1), mode='replicate')
+
+        # Apply the scaling factor to the gradients
+        dz_dx = F.conv2d(padded, self.kernel_x) * spatial_scale
+        dz_dy = F.conv2d(padded, self.kernel_y) * spatial_scale
+
+        n_x = -dz_dx
+        n_y = -dz_dy
+        n_z = torch.ones_like(n_x)
+
+        normals = torch.cat([n_x, n_y, n_z], dim=1)
+        return F.normalize(normals, p=2, dim=1)
+
+    def forward(self, pred_depth: torch.Tensor, real_ortho: torch.Tensor, mask: torch.Tensor,
+                sun_vectors: torch.Tensor) -> torch.Tensor:
+        """
+        sun_vectors: (B, 3) tensor of precise light directions for this specific batch
+        """
+        if pred_depth.shape[1] == 3:
+            pred_depth = pred_depth[:, :1]
+
+        B = pred_depth.shape[0]
+
+        if real_ortho.shape[1] == 3:
+            ortho_gray = real_ortho.mean(dim=1, keepdim=True)
+        else:
+            ortho_gray = real_ortho
+
+        # 1. Calculate Normals
+        normals = self._get_surface_normals(pred_depth)
+
+        # 2. Normalize and reshape the Batch Sun Vectors
+        # Reshape from (B, 3) to (B, 3, 1, 1) so it broadcasts across the HxW spatial grid
+        l_dir = F.normalize(sun_vectors, p=2, dim=1).view(B, 3, 1, 1)
+
+        # 3. Lambertian Render (Dot product of Normals and Light)
+        render = torch.sum(normals * l_dir, dim=1, keepdim=True)
+        render = torch.clamp(render, min=0.0)
+
+        # 4. Masked Pearson Correlation
+        valid_mask = mask.bool()
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=pred_depth.device, requires_grad=True)
+
+        r_flat = render[valid_mask]
+        o_flat = ortho_gray[valid_mask]
+
+        r_centered = r_flat - r_flat.mean()
+        o_centered = o_flat - o_flat.mean()
+
+        cov = torch.sum(r_centered * o_centered)
+        var_r = torch.sum(r_centered ** 2)
+        var_o = torch.sum(o_centered ** 2)
+
+        denominator = torch.sqrt(var_r * var_o)
+        if denominator < 1e-6:
+            return torch.tensor(0.0, device=pred_depth.device, requires_grad=True)
+
+        return 1.0 - (cov / denominator)
+
 class FlowMatchingVelocityLoss(nn.Module):
     """
     Conditional flow matching velocity loss.
@@ -64,7 +147,7 @@ class FlowMatchingVelocityLoss(nn.Module):
             mask = F.interpolate(
                 confidence.float(),
                 size=v_pred.shape[-2:],
-                mode="nearest",
+                mode="area",
             )
             sq_error = sq_error * mask
 
@@ -97,10 +180,16 @@ class SurfaceNormalsLoss(nn.Module):
         self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
 
     def _compute_normals(self, depth: torch.Tensor) -> torch.Tensor:
+        # Extract dynamic image dimensions
+        B, C, H, W = depth.shape
+
+        # Calculate the exact norm to map pixel-space Sobel to [-1, 1] physical space
+        spatial_scale = max(H, W) / 2.0
+
         # Pad by replicating the edge pixels so gradients are 0 at the boundary
         padded_depth = F.pad(depth, (1, 1, 1, 1), mode='replicate')
-        dz_dx = F.conv2d(padded_depth, self.sobel_x, padding=0)
-        dz_dy = F.conv2d(padded_depth, self.sobel_y, padding=0)
+        dz_dx = F.conv2d(padded_depth, self.sobel_x, padding=0) * spatial_scale
+        dz_dy = F.conv2d(padded_depth, self.sobel_y, padding=0) * spatial_scale
         ones = torch.ones_like(dz_dx)
         normals = torch.cat([-dz_dx, -dz_dy, ones], dim=1)
         return F.normalize(normals, p=2, dim=1)
@@ -184,8 +273,8 @@ class MultiScaleGradientLoss(nn.Module):
             dy_p, dx_p = self._gradients(p)
             dy_g, dx_g = self._gradients(g)
 
-            err_y = (dy_p - dy_g).abs()
-            err_x = (dx_p - dx_g).abs()
+            err_y = (dy_p - dy_g).abs() / s
+            err_x = (dx_p - dx_g).abs() / s
 
             if m is not None:
                 # Gradient is only valid if both pixels involved in the difference are valid
@@ -265,8 +354,13 @@ class CombinedLoss(nn.Module):
             grad_weight: float = 0.0,
             grad_start_step: int = 0,
             grad_scales: tuple[int, ...] = (1, 2, 4),
+            photo_weight: float = 0.0,
+            photo_start_step: int = 2000
     ):
         super().__init__()
+        self.photo_start_step = photo_start_step
+        self.photo_weight = photo_weight
+        self.photo_loss = PhotoclinometricLoss()
         self.velocity_loss = FlowMatchingVelocityLoss(use_confidence_weighting)
         self.normals_loss = SurfaceNormalsLoss()
         self.grad_loss = MultiScaleGradientLoss(scales=grad_scales) if grad_weight > 0 else None
@@ -300,7 +394,8 @@ class CombinedLoss(nn.Module):
         return (
                 (self.norm_weight > 0 and global_step >= self.norm_start) or
                 (self.freq_weight > 0 and self.ffl is not None and global_step >= self.freq_start) or
-                (self.grad_weight > 0 and self.grad_loss is not None and global_step >= self.grad_start)
+                (self.grad_weight > 0 and self.grad_loss is not None and global_step >= self.grad_start) or
+                (self.photo_weight > 0 and self.photo_loss is not None and global_step >= self.photo_start_step)
         )
 
     def forward(
@@ -310,6 +405,8 @@ class CombinedLoss(nn.Module):
             pred_depth_pixels: torch.Tensor = None,
             gt_depth_pixels: torch.Tensor = None,
             confidence: torch.Tensor = None,
+            real_ortho: torch.Tensor | None = None,
+            sun_vector: torch.Tensor | None = None,
             global_step: int = 0,
     ) -> dict:
         """
@@ -333,6 +430,7 @@ class CombinedLoss(nn.Module):
             "normals": torch.tensor(0.0, device=l_vel.device),
             "freq": torch.tensor(0.0, device=l_vel.device),
             "grad": torch.tensor(0.0, device=l_vel.device),
+            "photo": torch.tensor(0.0, device=v_pred.device)
         }
 
         total = self.vel_weight * l_vel
@@ -362,6 +460,27 @@ class CombinedLoss(nn.Module):
             l_grad = self.grad_loss(pred_depth_pixels, gt_depth_pixels, active_conf)
             loss_dict["grad"] = l_grad
             total = total + self.grad_weight * l_grad
+
+        if (
+                self.photo_weight > 0
+                and self.photo_loss is not None
+                and global_step >= self.photo_start_step
+                and has_pixels
+        ):
+            if sun_vector is None:
+                # Default to pointing diagonally down
+                sun_vector = torch.tensor([[0.5, -0.5, 1.0]], device=pred_depth_pixels.device)
+                sun_vector = sun_vector.expand(pred_depth_pixels.shape[0], -1)
+
+            l_photo = self.photo_loss(
+                pred_depth=pred_depth_pixels,
+                real_ortho=real_ortho,
+                mask=confidence if confidence is not None else torch.ones_like(pred_depth_pixels[:, :1]),
+                sun_vectors=sun_vector
+            )
+
+            loss_dict["photo"] = l_photo
+            total = total + self.photo_weight * l_photo
 
         loss_dict["total"] = total
         return loss_dict
