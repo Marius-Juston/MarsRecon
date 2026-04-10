@@ -425,6 +425,8 @@ class CombinedLoss(nn.Module):
             real_ortho: torch.Tensor | None = None,
             sun_vector: torch.Tensor | None = None,
             global_step: int = 0,
+            ambient: torch.Tensor = None,
+            intensity: torch.Tensor = None,
     ) -> dict:
         """
         Args:
@@ -493,7 +495,9 @@ class CombinedLoss(nn.Module):
                 pred_depth=pred_depth_pixels,
                 real_ortho=real_ortho,
                 mask=confidence if confidence is not None else torch.ones_like(pred_depth_pixels[:, :1]),
-                sun_vectors=sun_vector
+                sun_vectors=sun_vector,
+                ambient=ambient,
+                intensity=intensity,
             )
 
             loss_dict["photo"] = l_photo

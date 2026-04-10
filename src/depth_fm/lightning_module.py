@@ -249,8 +249,8 @@ class DepthFMLightningModule(L.LightningModule):
         loss_dict = self.loss_fn(
             v_pred=v_pred,
             v_target=v_target,
-            pred_pix=pred_pix,
-            gt_pix=gt_pix,
+            pred_depth_pixels=pred_pix,
+            gt_depth_pixels=gt_pix,
             confidence=batch.get("confidence"),
             global_step=step,
             real_ortho=batch["image"],
