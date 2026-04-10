@@ -32,6 +32,7 @@ depthfm = [
     "focal-frequency-loss>=0.3.0",
     "jsonargparse[signatures]>=4.47.0",
     "lightning>=2.6.1",
+    "litdata>=0.2.61",
     "matplotlib>=3.10.8",
     "numpy>=2.4.4",
     "omegaconf>=2.3.0",
@@ -48,7 +49,6 @@ depthfm = [
     "tqdm>=4.67.3",
     "transformers>=5.5.0",
     "wandb>=0.25.1",
-    "webdataset>=1.0.2",
 ]
 viz = [
     "cairosvg>=2.9.0",
@@ -80,7 +80,7 @@ exclude_lines = [
 
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

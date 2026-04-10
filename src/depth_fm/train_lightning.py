@@ -3,10 +3,14 @@ Mars DepthFM Training — Lightning-based with multi-run evaluation.
 
 Features:
 - Uses MarsHiRISEDTM + HiRISEGeoSampler with train/val/test splits
+- LitData StreamingDataset for hyper-optimized I/O (primary)
+- DepthFMHiRISEAdapterCached fallback for first-time runs
 - Multiple independent training runs for statistical significance
 - Publication-quality figures with error bars
 - Patch-level error analysis identifying failure modes
 - All metrics logged to wandb with proper grouping
+
+Hardware target: 2×128-core Ryzen, 4×A6000, 1 TB RAM, NVMe storage.
 
 Usage:
     # Single run
@@ -20,6 +24,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -30,48 +35,60 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # GLOBAL GDAL/IO OPTIMIZATIONS (For 256-Core / NVMe setups)
 # ---------------------------------------------------------------------------
-# Force GDAL to be as fast and silent as possible, bypassing network checks
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
 os.environ["VSI_CACHE"] = "TRUE"
-# Give GDAL 500MB of cache per worker
 os.environ["VSI_CACHE_SIZE"] = "500000000"
-# Use up to 10% of RAM for GDAL caching
 os.environ["GDAL_CACHEMAX"] = "10%"
-# Keep up to 1024 file descriptors open in the background per worker
 os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
 
 import lightning as L
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
+import torch.fft
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import (
+    EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
-    EarlyStopping,
 )
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-import webdataset as wds
+from tqdm import tqdm
 
-from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_ols
+from depth_fm.depthfm_adapter import (
+    DepthFMHiRISEAdapterCached,
+    estimate_sun_vector_ols,
+)
 from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
 from depth_fm.visualization import (
-    set_neurips_style,
-    plot_metric_distributions,
     plot_convergence_curves,
+    plot_metric_distributions,
     plot_multi_run_summary_table,
+    set_neurips_style,
 )
 
 logger = logging.getLogger(__name__)
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 
-import torch
-from tqdm import tqdm
-import logging
-import torch.fft
-import numpy as np
-import matplotlib.pyplot as plt
-import torch.nn.functional as F
+# ---------------------------------------------------------------------------
+# Hardware-aware constants for 2×128-core Ryzen / 4×A6000 / 1 TB RAM
+# ---------------------------------------------------------------------------
+_TOTAL_CORES = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 256
+_NUM_GPUS_DEFAULT = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
+# Workers per GPU: leave headroom for the main process and OS.
+# 256 cores / 4 GPUs = 64 per GPU; cap at 48 to avoid memory pressure from
+# too many rasterio/GDAL file handles.
+_WORKERS_PER_GPU = min(48, max(4, (_TOTAL_CORES - 8) // max(_NUM_GPUS_DEFAULT, 1)))
+_VAL_WORKERS = min(8, _WORKERS_PER_GPU)
+
+
+# ---------------------------------------------------------------------------
+# Visualization helpers (unchanged from original)
+# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -89,34 +106,26 @@ def visualize_loss_components(dataloader, output_dir, num_samples=4):
     count = 0
     with tqdm(total=num_samples) as pbar:
         for batch in dataloader:
-            if count >= num_samples: break
+            if count >= num_samples:
+                break
 
             B = batch["image"].shape[0]
             for i in range(B):
-                if count >= num_samples: break
+                if count >= num_samples:
+                    break
 
-                img = batch["image"][i:i + 1]  # (1, 3, H, W)
-                dtm = batch["dtm"][i:i + 1, :1]  # (1, 1, H, W)
-                mask = batch["confidence"][i:i + 1]  # (1, 1, H, W)
+                img = batch["image"][i: i + 1]
+                dtm = batch["dtm"][i: i + 1, :1]
+                mask = batch["confidence"][i: i + 1]
 
-                # ---------------------------------------------------------
-                # 1. Multi-Scale Gradients (Simulating MultiScaleGradientLoss)
-                # ---------------------------------------------------------
                 def get_grad_mag(tensor, scale):
                     if scale > 1:
                         tensor = F.avg_pool2d(tensor, kernel_size=scale, stride=scale)
-
-                    # Calculate finite differences (exactly as in the loss function)
                     dy = tensor[:, :, 1:, :] - tensor[:, :, :-1, :]
                     dx = tensor[:, :, :, 1:] - tensor[:, :, :, :-1]
-
-                    # Pad back to shape for visualization
                     dy = F.pad(dy, (0, 0, 0, 1))
                     dx = F.pad(dx, (0, 1, 0, 0))
-
-                    # Magnitude
-                    mag = torch.sqrt(dx ** 2 + dy ** 2)
-                    return mag[0, 0].cpu().numpy()
+                    return torch.sqrt(dx ** 2 + dy ** 2)[0, 0].cpu().numpy()
 
                 grad_1x = get_grad_mag(dtm, scale=1)
                 grad_4x = get_grad_mag(dtm, scale=4)
@@ -134,59 +143,40 @@ def visualize_loss_components(dataloader, output_dir, num_samples=4):
 
                 # Log magnitude for visualization (add 1 to avoid log(0))
                 fft_mag = torch.log(torch.abs(fft_shift) + 1).cpu().numpy()
-
                 # ---------------------------------------------------------
                 # Prep for Plotting
                 # ---------------------------------------------------------
                 img_disp = np.clip((np.transpose(img[0].cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
                 dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
                 mask_np = mask[0, 0].cpu().numpy().astype(bool)
-
                 img_disp[~mask_np] = np.nan
                 dtm_disp[~mask_np] = np.nan
 
-                # Percentile stretches for gradients to handle outliers
                 p2, p98 = np.percentile(grad_1x, [2, 98])
                 grad_1x_disp = np.clip((grad_1x - p2) / (p98 - p2 + 1e-8), 0, 1)
-
                 p2, p98 = np.percentile(grad_4x, [2, 98])
                 grad_4x_disp = np.clip((grad_4x - p2) / (p98 - p2 + 1e-8), 0, 1)
 
-                # Plotting
-                ax_img = axes[count, 0]
-                ax_dtm = axes[count, 1]
-                ax_g1 = axes[count, 2]
-                ax_g4 = axes[count, 3]
-                ax_fft = axes[count, 4]
-
-                ax_img.imshow(img_disp)
-                ax_img.axis("off")
-
-                ax_dtm.imshow(dtm_disp, cmap="terrain")
-                ax_dtm.axis("off")
-
-                ax_g1.imshow(grad_1x_disp, cmap="magma")
-                ax_g1.axis("off")
-
-                ax_g4.imshow(grad_4x_disp, cmap="magma")
-                ax_g4.axis("off")
-
-                # Plasma is a great colormap for frequency domains
-                ax_fft.imshow(fft_mag, cmap="plasma")
-                ax_fft.axis("off")
-
+                axes[count, 0].imshow(img_disp)
+                axes[count, 1].imshow(dtm_disp, cmap="terrain")
+                axes[count, 2].imshow(grad_1x_disp, cmap="magma")
+                axes[count, 3].imshow(grad_4x_disp, cmap="magma")
+                axes[count, 4].imshow(fft_mag, cmap="plasma")
+                for ax in axes[count]:
+                    ax.axis("off")
                 if count == 0:
-                    ax_img.set_title("Ortho Input")
-                    ax_dtm.set_title("GT DTM")
-                    ax_g1.set_title("L_grad: 1x Scale Mag")
-                    ax_g4.set_title("L_grad: 4x Scale Mag")
-                    ax_fft.set_title("L_FFL: 2D FFT Spectrum")
+                    for ax, t in zip(
+                            axes[0],
+                            ["Ortho Input", "GT DTM", "L_grad: 1x Scale Mag", "L_grad: 4x Scale Mag",
+                             "L_FFL: 2D FFT Spectrum"],
+                    ):
+                        ax.set_title(t)
 
                 count += 1
                 pbar.update()
 
     save_path = output_dir / "loss_components_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor='white')
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
     plt.close(fig)
     logger.info(f"Loss components visualization saved to: {save_path}")
 
@@ -195,18 +185,14 @@ def visualize_loss_components(dataloader, output_dir, num_samples=4):
 def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
     """
     Visualizes the internal physics of the Photoclinometric Loss.
-    Shows exactly what the network sees when it calculates normals and renders shadows.
-    Layout: [Real Ortho (Gray)] | [GT DTM] | [Surface Normals] | [Lambertian Render]
+    Layout: [Real Ortho (Gray)] | [GT DTM] | [Surface Normals] | [Lambertian Render] | [Lambertian GT]
     """
     logger.info(f"Generating Loss Physics visualization for {num_samples} samples...")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    import torch.nn.functional as F
-
-    # Setup Sobel kernels exactly like the loss function
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device) / 8.0
-    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device) / 8.0
+    sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=device) / 8.0
+    sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=device) / 8.0
     kx = sobel_x.view(1, 1, 3, 3)
     ky = sobel_y.view(1, 1, 3, 3)
 
@@ -218,197 +204,129 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
     count = 0
     with tqdm(total=num_samples) as pbar:
         for batch in dataloader:
-            if count >= num_samples: break
-
+            if count >= num_samples:
+                break
             B = batch["image"].shape[0]
             for i in range(B):
-                if count >= num_samples: break
+                if count >= num_samples:
+                    break
 
-                # 1. Extract and format data
-                img = batch["image"][i:i + 1].to(device)  # (1, 3, H, W)
-                dtm = batch["dtm"][i:i + 1, :1].to(device)  # (1, 1, H, W)
-                mask = batch["confidence"][i:i + 1].to(device)  # (1, 1, H, W)
-
-                # Fallback if sun_vector is missing, otherwise grab it
-                sun_vec = batch["sun_vector"][i:i + 1].to(device)
-
-                intensity = batch["intensity"][i:i + 1].to(device)
-                ambient = batch["ambient"][i:i + 1].to(device)
+                img = batch["image"][i: i + 1].to(device)
+                dtm = batch["dtm"][i: i + 1, :1].to(device)
+                mask = batch["confidence"][i: i + 1].to(device)
+                sun_vec = batch["sun_vector"][i: i + 1].to(device)
+                intensity = batch["intensity"][i: i + 1].to(device)
+                ambient = batch["ambient"][i: i + 1].to(device)
 
                 sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
 
-                # 2. Convert Ortho to Grayscale for Shading Comparison
-                if img.shape[1] == 3:
-                    ortho_gray = img.mean(dim=1, keepdim=True)
-                else:
-                    ortho_gray = img
-
-                B, C, H, W = dtm.shape
+                ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
+                _, _, H, W = dtm.shape
                 spatial_scale = max(H, W) / 2.0
 
-                # 3. Compute Normals (Exact math from the loss function)
-                padded_dtm = F.pad(dtm, (1, 1, 1, 1), mode='replicate')
-                dz_dx = F.conv2d(padded_dtm, kx) * spatial_scale
-                dz_dy = F.conv2d(padded_dtm, ky) * spatial_scale
-
-                n_x = -dz_dx
-                n_y = -dz_dy
+                padded_dtm = F.pad(dtm, (1, 1, 1, 1), mode="replicate")
+                n_x = -F.conv2d(padded_dtm, kx) * spatial_scale
+                n_y = -F.conv2d(padded_dtm, ky) * spatial_scale
                 n_z = torch.ones_like(n_x)
+                normals = F.normalize(torch.cat([n_x, n_y, n_z], dim=1), p=2, dim=1)
 
-                normals = torch.cat([n_x, n_y, n_z], dim=1)
-                normals = F.normalize(normals, p=2, dim=1)
+                render_gt = torch.sum(normals * sun_vec_gt.view(1, 3, 1, 1), dim=1,
+                                      keepdim=True) * intensity_gt + ambient_gt
+                render = torch.sum(normals * sun_vec.view(1, 3, 1, 1), dim=1, keepdim=True) * intensity + ambient
 
-                # 4. Lambertian Rendering
-                l_dir_gt = sun_vec_gt.view(1, 3, 1, 1)
-                render_gt = torch.sum(normals * l_dir_gt, dim=1, keepdim=True)
-                render_gt = (render_gt * intensity_gt) + ambient_gt
-
-                l_dir = sun_vec.view(1, 3, 1, 1)
-                render = torch.sum(normals * l_dir, dim=1, keepdim=True)
-                render = (render * intensity) + ambient
-
-                # ---------------------------------------------------------
-                # Convert to Numpy for plotting
-                # ---------------------------------------------------------
-                # Un-normalize [-1, 1] to [0, 1]
                 img_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
                 dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
                 mask_np = mask[0, 0].cpu().numpy().astype(bool)
-
-                # Map normals from [-1, 1] to [0, 1] RGB space for visualization
                 normals_disp = (normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0
-
-                # Render is already [0, 1]
                 render_disp = render[0, 0].cpu().numpy()
                 render_disp_gt = render_gt[0, 0].cpu().numpy()
 
-                # Apply mask so nodata regions render as blank white
-                img_disp[~mask_np] = np.nan
-                dtm_disp[~mask_np] = np.nan
+                for arr in (img_disp, dtm_disp, render_disp, render_disp_gt):
+                    arr[~mask_np] = np.nan
                 normals_disp[~mask_np] = np.nan
-                render_disp[~mask_np] = np.nan
-                render_disp_gt[~mask_np] = np.nan
 
-                # Plotting
-                ax_ortho = axes[count, 0]
-                ax_dtm = axes[count, 1]
-                ax_normals = axes[count, 2]
-                ax_render = axes[count, 3]
-                ax_render_gt = axes[count, 4]
-
-                ax_ortho.imshow(img_disp, cmap="gray")
-                ax_ortho.axis("off")
-
-                ax_dtm.imshow(dtm_disp, cmap="terrain")
-                ax_dtm.axis("off")
-
-                ax_normals.imshow(normals_disp)
-                ax_normals.axis("off")
-
-                ax_render.imshow(render_disp, cmap="gray")
-                ax_render.axis("off")
-
-                ax_render_gt.imshow(render_disp_gt, cmap="gray")
-                ax_render_gt.axis("off")
-
+                axes[count, 0].imshow(img_disp, cmap="gray")
+                axes[count, 1].imshow(dtm_disp, cmap="terrain")
+                axes[count, 2].imshow(normals_disp)
+                axes[count, 3].imshow(render_disp, cmap="gray")
+                axes[count, 4].imshow(render_disp_gt, cmap="gray")
+                for ax in axes[count]:
+                    ax.axis("off")
                 if count == 0:
-                    ax_ortho.set_title("Real Ortho (Gray)")
-                    ax_dtm.set_title("GT DTM")
-                    ax_normals.set_title("Calculated Surface Normals")
-                    ax_render.set_title("Lambertian Render (Shadows)")
-                    ax_render_gt.set_title("Lambertian Render check (Shadows)")
-
+                    for ax, t in zip(
+                            axes[0],
+                            ["Real Ortho (Gray)", "GT DTM", "Calculated Surface Normals", "Lambertian Render (Shadows)",
+                             "Lambertian Render check (Shadows)"],
+                    ):
+                        ax.set_title(t)
                 count += 1
                 pbar.update()
 
     save_path = output_dir / "loss_physics_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor='white')
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
     plt.close(fig)
     logger.info(f"Loss physics visualization saved to: {save_path}")
 
 
 @torch.no_grad()
 def compute_topography_statistics(dataloader, split_name="Dataset"):
-    """
-    Evaluates dataset samples to see how many patches are essentially flat planes.
-    """
+    """Evaluates how many patches are essentially flat planes."""
     logger.info(f"Computing topography statistics for {split_name}...")
-
     from depth_fm.depthfm_adapter import compute_topographic_residual
 
     residuals = []
     flat_stds = []
 
     for batch in tqdm(dataloader, desc=f"Evaluating {split_name} roughness"):
-        dtms = batch["dtm"]  # Shape: (B, 3, H, W)
-        masks = batch["confidence"]  # Shape: (B, 1, H, W)
-
+        dtms = batch["dtm"]
+        masks = batch["confidence"]
         for i in range(dtms.shape[0]):
             elevation_m = dtms[i, 0]
             mask = masks[i, 0]
+            residuals.append(compute_topographic_residual(elevation_m, mask))
+            flat_stds.append(torch.std(elevation_m[mask.bool()]))
 
-            res = compute_topographic_residual(elevation_m, mask)
-            residuals.append(res)
-            res = torch.std(elevation_m[mask.bool()])
-            flat_stds.append(res)
-
-    for metric_name, residuals in zip(["TOPOGRAPHY", "FLATNESS"], [residuals, flat_stds]):
-        residuals = np.array(residuals)
-
+    for metric_name, vals in zip(["TOPOGRAPHY", "FLATNESS"], [residuals, flat_stds]):
+        vals = np.array(vals)
         logger.info("-" * 50)
         logger.info(f"{metric_name} STATISTICS FOR: {split_name.upper()}")
         logger.info("-" * 50)
-        logger.info(f"Total Patches Evaluated: {len(residuals)}")
-        logger.info(f"Mean Residual: {np.mean(residuals):.2f} meters")
-        logger.info(f"Median Residual: {np.median(residuals):.2f} meters")
-        logger.info(f"Max Residual: {np.max(residuals):.2f} meters")
+        logger.info(f"Total Patches Evaluated: {len(vals)}")
+        logger.info(f"Mean Residual: {np.mean(vals):.2f} meters")
+        logger.info(f"Median Residual: {np.median(vals):.2f} meters")
+        logger.info(f"Max Residual: {np.max(vals):.2f} meters")
         logger.info("-" * 50)
         logger.info("Rejection Rates based on Thresholds:")
-
-        n = 10
-        thresholds = np.logspace(-3, 0, n)
-        for t in thresholds:
-            rejected = np.sum(residuals < t)
-            pct = (rejected / len(residuals)) * 100
+        for t in np.logspace(-3, 0, 10):
+            rejected = np.sum(vals < t)
+            pct = (rejected / len(vals)) * 100
             logger.info(f"  < {t:.3f}m (rejected): {rejected} patches ({pct:.1f}%)")
         logger.info("-" * 50)
 
 
 @torch.no_grad()
 def compute_mask_statistics(dataloader, split_name="Dataset"):
-    """
-    Iterates through a DepthFM DataLoader to compute statistics on the confidence masks.
-    """
+    """Computes statistics on the confidence masks."""
     logger.info(f"Computing mask statistics for {split_name}...")
 
     total_images = 0
     fully_valid_images = 0
     partially_masked_images = 0
     empty_images = 0
-
     total_valid_pixels = 0
     total_pixels = 0
 
     for batch in tqdm(dataloader, desc=f"Processing {split_name}"):
-        # Mask shape: (B, 1, H, W) where 1.0 is valid and 0.0 is nodata
         mask = batch["confidence"]
         B = mask.shape[0]
         total_images += B
-
-        # Calculate the percentage of valid pixels per image in the batch
-        # .view(B, -1) flattens the spatial dimensions so we get (B, pixels)
         per_image_mean = mask.view(B, -1).mean(dim=1)
-
-        # Categorize the images
         fully_valid_images += (per_image_mean == 1.0).sum().item()
         empty_images += (per_image_mean == 0.0).sum().item()
         partially_masked_images += ((per_image_mean > 0.0) & (per_image_mean < 1.0)).sum().item()
-
-        # Aggregate global pixel counts
         total_valid_pixels += mask.sum().item()
         total_pixels += mask.numel()
 
-    # Compute final percentages
     pct_fully_valid = (fully_valid_images / total_images) * 100 if total_images > 0 else 0
     pct_partial = (partially_masked_images / total_images) * 100 if total_images > 0 else 0
     pct_empty = (empty_images / total_images) * 100 if total_images > 0 else 0
@@ -418,18 +336,17 @@ def compute_mask_statistics(dataloader, split_name="Dataset"):
     logger.info(f"STATISTICS FOR: {split_name.upper()}")
     logger.info("-" * 50)
     logger.info(f"Total Images: {total_images}")
-    logger.info(f"  - 100% Valid Data (No Nodata):  {fully_valid_images} ({pct_fully_valid:.2f}%)")
-    logger.info(f"  - Partially Masked (Has Nodata): {partially_masked_images} ({pct_partial:.2f}%)")
-    logger.info(f"  - 100% Nodata (Completely Empty): {empty_images} ({pct_empty:.2f}%)")
-    logger.info(f"Global Valid Pixel Percentage:    {global_valid_pct:.2f}%")
+    logger.info(f"  - 100%% Valid Data (No Nodata):  {fully_valid_images} ({pct_fully_valid:.2f}%%)")
+    logger.info(f"  - Partially Masked (Has Nodata): {partially_masked_images} ({pct_partial:.2f}%%)")
+    logger.info(f"  - 100%% Nodata (Completely Empty): {empty_images} ({pct_empty:.2f}%%)")
+    logger.info(f"Global Valid Pixel Percentage:    {global_valid_pct:.2f}%%")
     logger.info("-" * 50)
-
     return {
         "total": total_images,
         "fully_valid": fully_valid_images,
         "partial": partially_masked_images,
         "empty": empty_images,
-        "global_valid_pct": global_valid_pct
+        "global_valid_pct": global_valid_pct,
     }
 
 
@@ -456,162 +373,94 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
             if len(images) == num_samples:
                 break
 
-    # Setup grid: 1 row per sample, 6 columns
     fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
     plt.subplots_adjust(wspace=0.1, hspace=0.1)
-
     crop_size = 128
 
-    def detrend_and_stretch(z_data: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Helper to fit a plane, subtract it, and stretch to [0, 1] using only valid pixels."""
+    def detrend_and_stretch(z_data, mask):
         h, w = z_data.shape
         y_grid, x_grid = np.mgrid[0:h, 0:w]
-
-        x_valid = x_grid[mask]
-        y_valid = y_grid[mask]
-        z_valid = z_data[mask]
-
+        x_valid, y_valid, z_valid = x_grid[mask], y_grid[mask], z_data[mask]
         if len(z_valid) >= 3:
             A = np.c_[x_valid, y_valid, np.ones_like(x_valid)]
             C, _, _, _ = np.linalg.lstsq(A, z_valid, rcond=None)
-
-            macro_plane = C[0] * x_grid + C[1] * y_grid + C[2]
-            detrended = z_data - macro_plane
-
-            valid_detrended = detrended[mask]
-            dp2, dp98 = np.percentile(valid_detrended, [2, 98])
-
-            if dp98 > dp2:
-                normed = np.clip((detrended - dp2) / (dp98 - dp2), 0.0, 1.0)
-            else:
-                normed = np.zeros_like(detrended)
+            detrended = z_data - (C[0] * x_grid + C[1] * y_grid + C[2])
+            dp2, dp98 = np.percentile(detrended[mask], [2, 98])
+            normed = np.clip((detrended - dp2) / (dp98 - dp2), 0.0, 1.0) if dp98 > dp2 else np.zeros_like(detrended)
         else:
             normed = np.zeros_like(z_data)
-
         normed[~mask] = np.nan
         return normed
 
     for idx in tqdm(range(num_samples), desc="Generating thumbnails"):
-        ax_img_full = axes[idx, 0]
-        ax_dtm_full = axes[idx, 1]
-        ax_detrend_full = axes[idx, 2]
-        ax_img_crop = axes[idx, 3]
-        ax_grad_crop = axes[idx, 4]
-        ax_detrend_crop = axes[idx, 5]
-
-        # Standard [-1, 1] -> [0, 1] normalization for full images
         img_np = np.clip((np.transpose(images[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
         dtm_np = np.clip((np.transpose(dtms[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
         mask_np = masks[idx][0].astype(bool)
-
-        # Apply mask to full images so Matplotlib renders nodata as empty space
         img_np[~mask_np] = np.nan
         dtm_np[~mask_np] = np.nan
 
-        # ---------------------------------------------------------
-        # FULL DETRENDED CALCULATION
-        # ---------------------------------------------------------
         dtm_full_1ch = dtm_np[..., 0]
         detrended_full_norm = detrend_and_stretch(dtm_full_1ch, mask_np)
 
-        # Calculate crop coordinates
         H, W = img_np.shape[:2]
         cy, cx = H // 2, W // 2
         half_c = crop_size // 2
 
-        # Extract Crops
-        img_crop = img_np[cy - half_c:cy + half_c, cx - half_c:cx + half_c]
-        dtm_crop = dtm_full_1ch[cy - half_c:cy + half_c, cx - half_c:cx + half_c]
-        mask_crop = mask_np[cy - half_c:cy + half_c, cx - half_c:cx + half_c]
+        img_crop = img_np[cy - half_c: cy + half_c, cx - half_c: cx + half_c]
+        dtm_crop = dtm_full_1ch[cy - half_c: cy + half_c, cx - half_c: cx + half_c]
+        mask_crop = mask_np[cy - half_c: cy + half_c, cx - half_c: cx + half_c]
 
-        # ---------------------------------------------------------
-        # MASKED GRADIENTS (Dynamic Slope Magnitude - CROP)
-        # ---------------------------------------------------------
         dy, dx = np.gradient(dtm_crop)
         slope_mag = np.sqrt(dx ** 2 + dy ** 2)
-
         valid_slopes = slope_mag[mask_crop]
-
         if len(valid_slopes) > 0:
             p2, p98 = np.percentile(valid_slopes, [2, 98])
-            if p98 > p2:
-                slope_norm = np.clip((slope_mag - p2) / (p98 - p2), 0.0, 1.0)
-            else:
-                slope_norm = np.zeros_like(slope_mag)
+            slope_norm = np.clip((slope_mag - p2) / (p98 - p2), 0.0, 1.0) if p98 > p2 else np.zeros_like(slope_mag)
         else:
             slope_norm = np.zeros_like(slope_mag)
-
         slope_norm[~mask_crop] = np.nan
-
-        # ---------------------------------------------------------
-        # MASKED DETRENDED TOPOGRAPHY (CROP)
-        # ---------------------------------------------------------
         detrended_crop_norm = detrend_and_stretch(dtm_crop, mask_crop)
 
-        # ---------------------------------------------------------
-        # Plotting
-        # ---------------------------------------------------------
-        ax_img_full.imshow(img_np)
-        ax_img_full.axis("off")
-
-        ax_dtm_full.imshow(dtm_full_1ch, cmap="terrain")
-        ax_dtm_full.axis("off")
-
-        ax_detrend_full.imshow(detrended_full_norm, cmap="terrain")
-        ax_detrend_full.axis("off")
-
-        ax_img_crop.imshow(img_crop)
-        ax_img_crop.axis("off")
-
-        ax_grad_crop.imshow(slope_norm, cmap="magma")
-        ax_grad_crop.axis("off")
-
-        ax_detrend_crop.imshow(detrended_crop_norm, cmap="terrain")
-        ax_detrend_crop.axis("off")
-
+        axes[idx, 0].imshow(img_np)
+        axes[idx, 1].imshow(dtm_full_1ch, cmap="terrain")
+        axes[idx, 2].imshow(detrended_full_norm, cmap="terrain")
+        axes[idx, 3].imshow(img_crop)
+        axes[idx, 4].imshow(slope_norm, cmap="magma")
+        axes[idx, 5].imshow(detrended_crop_norm, cmap="terrain")
+        for ax in axes[idx]:
+            ax.axis("off")
         if idx == 0:
-            ax_img_full.set_title("Ortho (Full)")
-            ax_dtm_full.set_title("DTM (Full)")
-            ax_detrend_full.set_title("Detrended (Full)")
-            ax_img_crop.set_title(f"Ortho Zoom ({crop_size}px)")
-            ax_grad_crop.set_title(f"Masked Slope ({crop_size}px)")
-            ax_detrend_crop.set_title(f"Masked Detrend ({crop_size}px)")
+            for ax, t in zip(
+                    axes[0],
+                    ["Ortho (Full)", "DTM (Full)", "Detrended (Full)", f"Ortho Zoom ({crop_size}px)",
+                     f"Masked Slope ({crop_size}px)", f"Masked Detrend ({crop_size}px)"],
+            ):
+                ax.set_title(t)
 
     save_path = output_dir / "dataset_thumbnails_detailed.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, transparent=False, facecolor='white')
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, transparent=False, facecolor="white")
     plt.close(fig)
     logger.info(f"Detailed thumbnails successfully saved to: {save_path}")
 
 
 # ---------------------------------------------------------------------------
-# Data module
+# Data loading
 # ---------------------------------------------------------------------------
 
-def configure_worker_logger(worker_id):
-    """Forces the spawned PyTorch worker to actually print INFO logs."""
-    import logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f"[Worker {worker_id}] %(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        force=True  # Overrides any existing silent config
-    )
-
-
-import concurrent.futures
-
 
 def configure_worker_logger(worker_id):
     """Forces the spawned PyTorch worker to actually print INFO logs."""
     import logging
+
     logging.basicConfig(
         level=logging.INFO,
         format=f"[Worker {worker_id}] %(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        force=True
+        force=True,
     )
 
 
-def get_wds_cache_key(config) -> str:
-    """Generates a deterministic hash representing the exact WebDataset configuration."""
+def get_litdata_cache_key(config) -> str:
+    """Deterministic hash for LitData cache location (matches build_litdata.py)."""
     key_parts = {
         "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
         "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
@@ -622,97 +471,76 @@ def get_wds_cache_key(config) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def rename_wds_keys(sample):
-    """Maps decoded WDS .pth keys back to their core names."""
-    out = {}
-    for k, v in sample.items():
-        if k.endswith(".pth"):
-            out[k[:-4]] = v
-        elif k != "__key__":
-            out[k] = v
-    return out
+def _build_litdata_loaders(config, split_seed: int = 42) -> dict:
+    """Build DataLoaders from pre-optimized LitData cache.
+
+    Returns dict of {split: DataLoader} or raises FileNotFoundError.
+    """
+    from depth_fm.litdata_datamodule import MarsStreamingDataset
+
+    try:
+        from litdata import StreamingDataLoader
+    except ImportError:
+        raise FileNotFoundError("litdata package not installed")
+
+    hc = config.data.hirise
+    tc = config.training
+
+    cache_hash = get_litdata_cache_key(config)
+    litdata_root = Path(hc.root) / f"litdata_cache_{cache_hash}"
+
+    splits = ("train", "val", "test")
+    if not all((litdata_root / s / "_SUCCESS").exists() for s in splits):
+        raise FileNotFoundError(f"LitData cache incomplete at {litdata_root}")
+
+    brightness_jitter = config.data.get("brightness_jitter", 0.1)
+    num_workers = tc.get("num_workers", _WORKERS_PER_GPU)
+
+    loaders = {}
+    for split in splits:
+        is_train = split == "train"
+        dataset = MarsStreamingDataset(
+            input_dir=str(litdata_root / split),
+            is_train=is_train,
+            random_flip=is_train,
+            brightness_jitter=brightness_jitter if is_train else 0.0,
+            shuffle=is_train,
+            drop_last=is_train,
+            seed=split_seed,
+        )
+        loaders[split] = StreamingDataLoader(
+            dataset,
+            batch_size=tc.per_gpu_batch_size,
+            num_workers=num_workers if is_train else _VAL_WORKERS,
+            pin_memory=tc.pin_memory,
+            drop_last=is_train,
+            persistent_workers=True,
+        )
+        logger.info(
+            "LitData [%s]: batch_size=%d, workers=%d",
+            split,
+            tc.per_gpu_batch_size,
+            num_workers if is_train else _VAL_WORKERS,
+        )
+
+    return loaders
 
 
-def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
-    """Build train/val/test DataLoaders from MarsHiRISEDTM."""
+def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -> dict:
+    """Fallback: build DataLoaders from DepthFMHiRISEAdapterCached (live GDAL reads)."""
+    from dataset.hirise_sampler import HiRISEGeoSampler
+    from dataset.mars_hirise_dtm import MarsHiRISEDTM
+    from torchgeo.samplers import Units
 
     hc = config.data.hirise
     sc = config.data.sampler
-    splits = ("train", "val", "test")
-
-    # 1. Attempt WebDataset Initialization (Preferred for Speed)
-    use_wds_pref = config.data.get("use_wds", True)
-    wds_hash = get_wds_cache_key(config)
-    wds_root = Path(hc.root) / f"wds_cache_{wds_hash}"
-
-    wds_available = all((wds_root / split / "_SUCCESS").exists() for split in splits)
-
-    if use_wds_pref and wds_available:
-        logger.info(f"Valid WebDataset cache found at {wds_root}. Using WDS for FASTEST I/O.")
-
-        import glob
-
-        loaders = {}
-        for split in splits:
-            is_train = (split == "train")
-
-            # 1. Resolve the wildcard into a concrete list of file paths
-            url_pattern = str(wds_root / split / f"{split}-*.tar")
-            urls = sorted(glob.glob(url_pattern))
-
-            if not urls:
-                raise FileNotFoundError(f"No WebDataset shards found matching pattern: {url_pattern}")
-
-            pipeline = [
-                # 2. Pass the resolved list, not the string pattern
-                wds.SimpleShardList(urls),
-                wds.split_by_node,
-                wds.split_by_worker,
-                wds.tarfile_to_samples(),
-                wds.decode("torch"),
-                wds.map(rename_wds_keys),
-            ]
-
-            if is_train:
-                # WDS detshuffle shuffles shards once per epoch. Inner shuffle manages intra-shard variance.
-                pipeline.insert(1, wds.detshuffle())
-                pipeline.append(wds.shuffle(1000))
-
-            pipeline.append(wds.batched(config.training.per_gpu_batch_size, partial=False))
-
-            dataset = wds.DataPipeline(*pipeline)
-
-            loaders[split] = wds.WebLoader(
-                dataset,
-                batch_size=None,  # Batched in the WDS pipeline natively
-                shuffle=False,
-                num_workers=config.training.num_workers if is_train else 4,
-                pin_memory=config.training.pin_memory,
-                prefetch_factor=config.training.get("prefetch_factor", 4) if is_train else 2,
-                persistent_workers=True,
-                worker_init_fn=configure_worker_logger if is_train else None
-            )
-
-        return loaders
-
-    # 2. Fallback to Standard TorchGeo Dynamic DataLoader
-    if use_wds_pref:
-        logger.warning(f"WebDataset requested but cache is missing or incomplete at {wds_root}.")
-        logger.warning(
-            f"Falling back to STANDARD DataLoader. Consider running the extraction script for faster training.")
-    else:
-        logger.info("WebDataset disabled in config. Using STANDARD DataLoader.")
-
-    from dataset.mars_hirise_dtm import MarsHiRISEDTM
-    from dataset.hirise_sampler import HiRISEGeoSampler
-    from torchgeo.samplers import Units
+    tc = config.training
 
     bbox_tuple = tuple(hc.bbox) if hc.get("bbox") else None
     ortho_type = hc.get("ortho_type", "RED")
     if isinstance(ortho_type, str):
         ortho_type = [ortho_type]
 
-    # Initialize the base dataset once (this is fast and mostly metadata)
     base_dataset = MarsHiRISEDTM(
         root=hc.root,
         include_ortho=hc.get("include_ortho", True),
@@ -722,9 +550,8 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
         bbox=bbox_tuple,
         reuse_cache=hc.get("reuse_cache", True),
         target=hc.get("target"),
-        return_meta=True
+        return_meta=True,
     )
-
     base_dataset._raw_index = None
 
     split_fractions = tuple(config.data.get("split_fractions", [0.8, 0.1, 0.1]))
@@ -748,11 +575,10 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
     resolution = config.data.get("resolution", 512)
     dtm_norm = config.data.get("dtm_normalization", "relative")
     stats_path = config.data.get("stats_path")
+    num_workers = tc.get("num_workers", _WORKERS_PER_GPU)
 
-    # Helper function to build a single split
     def _build_split_loader(split: str):
-        is_train = (split == "train")
-
+        is_train = split == "train"
         sampler = HiRISEGeoSampler(
             base_dataset,
             split=split,
@@ -760,7 +586,6 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
             replacement=is_train,
             **common_sampler_kwargs,
         )
-
         adapter = DepthFMHiRISEAdapterCached(
             base_dataset=base_dataset,
             sampler=sampler,
@@ -770,23 +595,24 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
             brightness_jitter=config.data.get("brightness_jitter", 0.1) if is_train else 0.0,
             stats_path=stats_path,
         )
-
         loader = DataLoader(
             adapter,
-            batch_size=config.training.per_gpu_batch_size,
+            batch_size=tc.per_gpu_batch_size,
             shuffle=is_train,
-            num_workers=config.training.num_workers if is_train else 4,
-            pin_memory=config.training.pin_memory,
-            prefetch_factor=config.training.get("prefetch_factor", 4) if is_train else 2,
+            num_workers=num_workers if is_train else _VAL_WORKERS,
+            pin_memory=tc.pin_memory,
+            prefetch_factor=tc.get("prefetch_factor", 4) if is_train else 2,
             drop_last=is_train,
             persistent_workers=True,
             multiprocessing_context="fork",
-            worker_init_fn=configure_worker_logger
+            worker_init_fn=configure_worker_logger,
         )
-
         logger.info(
-            "DataLoader [%s] ready: %d samples, batch_size=%d",
-            split, len(adapter), config.training.per_gpu_batch_size,
+            "Cached DataLoader [%s]: %d samples, batch_size=%d, workers=%d",
+            split,
+            len(adapter),
+            tc.per_gpu_batch_size,
+            num_workers if is_train else _VAL_WORKERS,
         )
         return split, loader
 
@@ -794,41 +620,51 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
     splits = ("train", "val", "test")
 
     if parallel:
-        logger.info("Initializing train, val, and test dataloaders in parallel...")
-
-        # Use ThreadPoolExecutor to run the heavy manifest caching/loading concurrently
+        logger.info("Initializing cached dataloaders in parallel...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(splits)) as executor:
-            # Submit all three jobs
-            future_to_split = {
-                executor.submit(_build_split_loader, split): split
-                for split in splits
-            }
-
-            # Collect them as they finish
+            future_to_split = {executor.submit(_build_split_loader, s): s for s in splits}
             for future in concurrent.futures.as_completed(future_to_split):
                 split_name = future_to_split[future]
                 try:
                     _, loader = future.result()
                     loaders[split_name] = loader
                 except Exception as exc:
-                    logger.error(f"Failed to build DataLoader for split '{split_name}': {exc}")
-                    raise exc
+                    logger.error(f"Failed to build DataLoader for '{split_name}': {exc}")
+                    raise
     else:
-        logger.info("Initializing train, val, and test dataloaders sequentially...")
         for split in splits:
-            try:
-                _, loader = _build_split_loader(split)
-                loaders[split] = loader
-            except Exception as exc:
-                logger.error(f"Failed to build DataLoader for split '{split}': {exc}")
-                raise exc
+            _, loader = _build_split_loader(split)
+            loaders[split] = loader
 
     return loaders
+
+
+def build_dataloaders(config, split_seed: int = 42, parallel: bool = True) -> dict:
+    """Build train/val/test DataLoaders.
+
+    Priority:
+        1. LitData StreamingDataset (pre-optimized binary chunks, fastest)
+        2. DepthFMHiRISEAdapterCached (live GDAL reads, slower but always works)
+    """
+
+    # ── Try LitData first ──
+    try:
+        loaders = _build_litdata_loaders(config, split_seed=split_seed)
+        logger.info("Using LitData StreamingDataset for maximum I/O throughput.")
+        return loaders
+    except FileNotFoundError as e:
+        logger.info("LitData not available (%s). Falling back to cached GDAL loader.", e)
+    except Exception as e:
+        logger.warning("LitData failed unexpectedly (%s). Falling back to cached GDAL loader.", e)
+
+    # ── Fallback to cached adapter ──
+    return _build_cached_loaders(config, split_seed=split_seed, parallel=parallel)
 
 
 # ---------------------------------------------------------------------------
 # Single training run
 # ---------------------------------------------------------------------------
+
 
 def run_single_training(
         config,
@@ -836,14 +672,10 @@ def run_single_training(
         seed: int = 42,
         output_dir: str | Path = "outputs",
 ) -> dict:
-    """Execute a single training run and return test metrics.
-
-    Returns:
-        dict with keys: "test_summary", "val_history", "test_aggregator"
-    """
+    """Execute a single training run and return test metrics."""
     L.seed_everything(seed, workers=True)
 
-    # 1. Strict Directory Isolation (Handles Multi-run AND K-fold)
+    # Directory isolation for multi-run / K-fold
     n_folds = config.data.get("n_folds")
     fold_idx = config.data.get("fold_idx", 0)
 
@@ -854,15 +686,12 @@ def run_single_training(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Skip completed runs
     summary_path = output_dir / "test_summary.json"
     if summary_path.exists():
         logger.info(f"Run {run_idx} at {output_dir} is already complete. Skipping.")
-        # Load the saved results to pass back to run_multi_seed_experiment
         with open(summary_path, "r") as f:
             test_summary = json.load(f)
-
-        # Note: To fully satisfy your existing multi-run plotting, you may
-        # also need to load and return the saved test_df.csv and val_history here.
         return {"test_summary": test_summary, "output_dir": output_dir, "skipped": True}
 
     # Build data
@@ -871,12 +700,8 @@ def run_single_training(
     # Build model
     module = DepthFMLightningModule(config)
 
-    # Move VAE to appropriate device
-    # module.model.vae = module.model.vae.to("cuda" if torch.cuda.is_available() else "cpu")
-
+    # torch.compile
     cache_path = Path(config.training.get("cache_dir", ".torch_compile_cache")) / "mega_cache.pt"
-
-    # torch.compile backbone for training speed (max-autotune triggers kernel auto-tuning)
     if config.model.get("torch_compile", False):
         if cache_path.exists():
             logger.info("Loading torch.compile Mega-Cache artifacts from %s", cache_path)
@@ -891,8 +716,7 @@ def run_single_training(
         module.model.backbone = torch.compile(module.model.backbone, mode=compile_mode, fullgraph=full_graph)
         logger.info("torch.compile enabled on UNet backbone (mode=%s)", compile_mode)
 
-    # Callback 1: The "Best" Checkpoints (Epoch/Validation based)
-    # Only triggers when validation runs. Saves the top 3 models.
+    # Callbacks
     best_checkpoint = ModelCheckpoint(
         dirpath=str(output_dir / "checkpoints"),
         filename="depthfm-best-{step}-{val/rmse_mean:.4f}",
@@ -901,36 +725,23 @@ def run_single_training(
         save_top_k=3,
         save_last=False,
     )
-
-    # Callback 2: The "Recovery" Checkpoint (Strictly Step-based)
-    # Overwrites a single 'last.ckpt' every 500 steps, regardless of validation.
     recovery_checkpoint = ModelCheckpoint(
         dirpath=str(output_dir / "checkpoints"),
-        filename="last",  # Will always save as 'last.ckpt'
-        every_n_train_steps=config.training.save_every_steps,  # e.g., 500
-        save_top_k=1,  # Keep only the single most recent
+        filename="last",
+        every_n_train_steps=config.training.save_every_steps,
+        save_top_k=1,
     )
-
-    # Callbacks
-    callbacks = [
-        LearningRateMonitor(logging_interval="step"),
-        best_checkpoint,
-        recovery_checkpoint
-    ]
+    callbacks = [LearningRateMonitor(logging_interval="step"), best_checkpoint, recovery_checkpoint]
 
     if config.training.get("use_ema", True):
         logger.info("EMA is ENABLED.")
         callbacks.append(EMACallback())
     else:
-        logger.info("EMA is DISABLED. Evaluating active training weights.")
+        logger.info("EMA is DISABLED.")
 
     if config.training.get("early_stopping_patience"):
         callbacks.append(
-            EarlyStopping(
-                monitor="val/rmse_mean",
-                patience=config.training.early_stopping_patience,
-                mode="min",
-            )
+            EarlyStopping(monitor="val/rmse_mean", patience=config.training.early_stopping_patience, mode="min")
         )
 
     # Logger
@@ -944,7 +755,7 @@ def run_single_training(
             tags=["mars", "depthfm", "flow-matching"],
         )
 
-    # Trainer
+    # Precision
     _prec = config.training.mixed_precision
     if _prec == "bf16":
         precision = "bf16-mixed"
@@ -953,6 +764,7 @@ def run_single_training(
     else:
         precision = "32-true"
 
+    # Trainer — optimised for 4×A6000
     trainer = L.Trainer(
         max_steps=config.training.max_steps,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -966,26 +778,28 @@ def run_single_training(
         gradient_clip_val=config.training.max_grad_norm,
         accumulate_grad_batches=config.training.gradient_accumulation_steps,
         enable_progress_bar=True,
-        # plugins=[AsyncCheckpointIO()],  # Offloads disk writes to a background thread
         default_root_dir=str(output_dir),
     )
 
-    # 5. The Resumption Execution Execution
+    # Train (with resumption)
     last_ckpt_path = output_dir / "checkpoints" / "last.ckpt"
 
     if config.training.enable:
         if last_ckpt_path.exists():
-            logger.info(f"*** Resuming run {run_idx} gracefully from {last_ckpt_path} ***")
-            trainer.fit(module, loaders["train"], loaders["val"], ckpt_path=str(last_ckpt_path), weights_only=False)
+            logger.info(f"*** Resuming run {run_idx} from {last_ckpt_path} ***")
+            trainer.fit(module, loaders["train"], loaders["val"], ckpt_path=str(last_ckpt_path))
         else:
             logger.info(f"*** Starting fresh training for run {run_idx} ***")
             trainer.fit(module, loaders["train"], loaders["val"])
 
-    # Test (with EMA weights via callback)
-    trainer.test(module, loaders["test"],
-                 ckpt_path=None if config.training.get("enable", True) else str(last_ckpt_path), weights_only=False)
+    # Test
+    trainer.test(
+        module,
+        loaders["test"],
+        ckpt_path=None if config.training.get("enable", True) else str(last_ckpt_path),
+    )
 
-    # Timestep ablation: evaluate at [1, 2, 4, 8, 10, 20] Euler steps
+    # Timestep ablation
     logger.info("Running timestep ablation...")
     if config.training.get("use_ema", True) and module._ema_initialised:
         module.load_ema_weights()
@@ -998,19 +812,14 @@ def run_single_training(
         module.restore_training_weights()
 
     if trainer.is_global_zero:
-        # Save timestep ablation results
         with open(output_dir / "timestep_ablation.json", "w") as f:
-            json.dump(
-                {str(k): v for k, v in timestep_results.items()},
-                f, indent=2,
-            )
+            json.dump({str(k): v for k, v in timestep_results.items()}, f, indent=2)
 
-        # Generate timestep ablation figure
         from depth_fm.visualization import plot_timestep_ablation
+
         set_neurips_style()
         fig_dir = output_dir / "figures"
         fig_dir.mkdir(parents=True, exist_ok=True)
-
         fig = plot_timestep_ablation(
             step_counts=sorted(timestep_results.keys()),
             metrics_per_step=timestep_results,
@@ -1034,14 +843,9 @@ def run_single_training(
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(cache_path, "wb") as f:
                     f.write(artifact_bytes)
-                logger.info("Mega-Cache saved successfully to %s. Info: %s", cache_path, cache_info)
-            else:
-                logger.info("No compiler artifacts found to save.")
+                logger.info("Mega-Cache saved to %s. Info: %s", cache_path, cache_info)
 
-        # Save per-sample test results
         test_df.to_csv(output_dir / "test_results.csv", index=False)
-
-        # Save test summary
         with open(output_dir / "test_summary.json", "w") as f:
             json.dump(test_summary, f, indent=2)
 
@@ -1059,6 +863,7 @@ def run_single_training(
 # Multi-run with statistical evaluation
 # ---------------------------------------------------------------------------
 
+
 def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
     """Run training multiple times with different seeds for error bars."""
     output_root = Path(config.training.output_dir)
@@ -1073,23 +878,15 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
         logger.info("=" * 60)
         logger.info("  RUN %d / %d  (seed=%d)", run_idx + 1, n_runs, seed)
         logger.info("=" * 60)
-
-        result = run_single_training(
-            config, run_idx=run_idx, seed=seed, output_dir=output_root,
-        )
+        result = run_single_training(config, run_idx=run_idx, seed=seed, output_dir=output_root)
         all_results.append(result)
 
-    import os
     is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
 
     if is_global_zero:
-
-        # ── Generate publication figures ──
         set_neurips_style()
-
         logger.info("Generating publication figures...")
 
-        # 1. Convergence curves with error bands
         fig = plot_convergence_curves(
             [r["val_history"] for r in all_results],
             metric_key="val/rmse",
@@ -1106,7 +903,6 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
         )
         plt.close(fig)
 
-        # 2. Multi-run summary bar chart with error bars
         fig = plot_multi_run_summary_table(
             [r["test_summary"] for r in all_results],
             metrics_to_show=["rmse", "abs_rel", "delta_1", "normal_angular_error", "slope_rmse"],
@@ -1115,41 +911,29 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
         )
         plt.close(fig)
 
-        # 3. Metric distributions from the best run
         best_run = min(all_results, key=lambda r: r["test_summary"].get("rmse", {}).get("mean", 1e9))
-        best_df = best_run["test_df"]
-
         fig = plot_metric_distributions(
-            best_df,
+            best_run["test_df"],
             metrics_to_plot=["rmse", "abs_rel", "delta_1", "normal_angular_error"],
             title="Test metric distributions (best run)",
             save_path=fig_dir / "metric_distributions.pdf",
         )
         plt.close(fig)
 
-        # 4. Worst and best patches from the best run
         _generate_patch_analysis(best_run, fig_dir, config)
 
-        # 5. Timestep ablation (averaged across runs if available)
         if all("timestep_ablation" in r for r in all_results):
             from depth_fm.visualization import plot_timestep_ablation
 
-            # Average metrics across runs for each step count
             first_ablation = all_results[0]["timestep_ablation"]
             step_counts = sorted(first_ablation.keys())
-
             averaged_ablation = {}
             for s in step_counts:
                 merged = {}
                 for metric_name in first_ablation[s]:
-                    run_means = [
-                        r["timestep_ablation"][s][metric_name]["mean"]
-                        for r in all_results if s in r["timestep_ablation"]
-                    ]
-                    merged[metric_name] = {
-                        "mean": float(np.mean(run_means)),
-                        "std": float(np.std(run_means)),
-                    }
+                    run_means = [r["timestep_ablation"][s][metric_name]["mean"] for r in all_results if
+                                 s in r["timestep_ablation"]]
+                    merged[metric_name] = {"mean": float(np.mean(run_means)), "std": float(np.std(run_means))}
                 averaged_ablation[s] = merged
 
             fig = plot_timestep_ablation(
@@ -1162,23 +946,18 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
             )
             plt.close(fig)
 
-        # 6. Final summary to console and file
         _print_final_summary(all_results, output_root)
-
         logger.info("All figures saved to %s", fig_dir)
 
 
 def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
     """Generate detailed per-patch analysis from the best run."""
     aggregator = best_run["test_aggregator"]
-
     worst = aggregator.worst_k("rmse", k=5)
     best = aggregator.best_k("rmse", k=5)
-
     logger.info("Worst 5 test patches: %s", worst)
     logger.info("Best 5 test patches: %s", best)
 
-    # Save to JSON for later analysis
     analysis = {
         "worst_5_rmse": [{"tile_id": t, "rmse": float(v)} for t, v in worst],
         "best_5_rmse": [{"tile_id": t, "rmse": float(v)} for t, v in best],
@@ -1187,36 +966,29 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
     with open(fig_dir / "patch_analysis.json", "w") as f:
         json.dump(analysis, f, indent=2)
 
-    # Per-metric error distribution with patch identification
     df = best_run["test_df"]
     import seaborn as sns
 
     set_neurips_style()
 
-    # RMSE distribution with worst patches annotated
     fig, ax = plt.subplots(figsize=(8, 4))
-    sns.histplot(df["rmse"], bins=30, color=sns.color_palette("flare")[2],
-                 kde=True, ax=ax, alpha=0.6)
+    sns.histplot(df["rmse"], bins=30, color=sns.color_palette("flare")[2], kde=True, ax=ax, alpha=0.6)
     for tile_id, rmse_val in worst[:3]:
         ax.axvline(rmse_val, color="red", linestyle="--", alpha=0.7, linewidth=1)
-        ax.text(rmse_val, ax.get_ylim()[1] * 0.9, tile_id,
-                rotation=45, fontsize=7, color="red")
+        ax.text(rmse_val, ax.get_ylim()[1] * 0.9, tile_id, rotation=45, fontsize=7, color="red")
     ax.set_xlabel("RMSE (m)")
     ax.set_ylabel("Count")
     ax.set_title("Test RMSE distribution with worst patches")
     fig.savefig(fig_dir / "rmse_distribution.pdf", bbox_inches="tight")
     plt.close(fig)
 
-    # Error vs slope complexity scatter
     fig, ax = plt.subplots(figsize=(6, 5))
     if "slope_rmse" in df.columns and "rmse" in df.columns:
-        ax.scatter(df["slope_rmse"], df["rmse"],
-                   c=df["normal_angular_error"], cmap="flare",
-                   s=20, alpha=0.6)
+        ax.scatter(df["slope_rmse"], df["rmse"], c=df["normal_angular_error"], cmap="flare", s=20, alpha=0.6)
         ax.set_xlabel("Slope RMSE (°)")
         ax.set_ylabel("Elevation RMSE (m)")
         ax.set_title("Error vs terrain complexity")
-        cbar = fig.colorbar(ax.collections[0], label="Normal error (°)")
+        fig.colorbar(ax.collections[0], label="Normal error (°)")
         fig.savefig(fig_dir / "error_vs_complexity.pdf", bbox_inches="tight")
     plt.close(fig)
 
@@ -1225,9 +997,7 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
     """Print and save the final multi-run summary."""
     import pandas as pd
 
-    metrics_of_interest = ["rmse", "abs_rel", "delta_1", "delta_2",
-                           "normal_angular_error", "slope_rmse"]
-
+    metrics_of_interest = ["rmse", "abs_rel", "delta_1", "delta_2", "normal_angular_error", "slope_rmse"]
     rows = []
     for i, r in enumerate(all_results):
         row = {"run": i}
@@ -1237,25 +1007,17 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
         rows.append(row)
 
     df = pd.DataFrame(rows)
-
-    summary_lines = []
-    summary_lines.append("=" * 70)
-    summary_lines.append("FINAL RESULTS (mean ± std across runs)")
-    summary_lines.append("=" * 70)
+    summary_lines = ["=" * 70, "FINAL RESULTS (mean ± std across runs)", "=" * 70]
     for m in metrics_of_interest:
         if m in df.columns:
-            mean = df[m].mean()
-            std = df[m].std()
-            summary_lines.append(f"  {m:<30s}  {mean:.4f} ± {std:.4f}")
+            summary_lines.append(f"  {m:<30s}  {df[m].mean():.4f} ± {df[m].std():.4f}")
     summary_lines.append("=" * 70)
 
     for line in summary_lines:
         logger.info(line)
 
-    # Save to file
     with open(output_dir / "final_summary.txt", "w") as f:
         f.write("\n".join(summary_lines))
-
     df.to_csv(output_dir / "all_runs_metrics.csv", index=False)
 
 
@@ -1263,99 +1025,81 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def main():
     import warnings
+
     warnings.filterwarnings("ignore", message=r".*isinstance(treespec, LeafSpec).*")
     warnings.filterwarnings("ignore", message=r"Found \d+ module")
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
     parser = argparse.ArgumentParser(description="Train Mars DepthFM")
     parser.add_argument("--config", type=str, default="configs/train_hirise.yaml")
-    parser.add_argument("--n_runs", type=int, default=1,
-                        help="Number of training runs for error bars")
-    parser.add_argument("--n_folds", type=int, default=None,
-                        help="K-fold CV (overrides config)")
-    parser.add_argument("--fold_idx", type=int, default=0,
-                        help="Which fold to use as test (0 to n_folds-1)")
+    parser.add_argument("--n_runs", type=int, default=1, help="Number of training runs for error bars")
+    parser.add_argument("--n_folds", type=int, default=None, help="K-fold CV (overrides config)")
+    parser.add_argument("--fold_idx", type=int, default=0, help="Which fold to use as test (0 to n_folds-1)")
     parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--analyze_topography", action="store_true",
-                        help="Run dataset mask statistics and exit without training")
-    parser.add_argument("--analyze_masks", action="store_true",
-                        help="Run dataset mask statistics and exit without training")
-    parser.add_argument("--view_thumbnails", action="store_true",
-                        help="Save a 4x4 grid of random dataset input images and exit")
-    parser.add_argument("--view_loss_physics", action="store_true",
-                        help="Visualize the photoclinometric normals and shadow rendering")
-    parser.add_argument("--view_loss_components", action="store_true",
-                        help="Visualize the photoclinometric normals and shadow rendering")
-
+    parser.add_argument("--analyze_topography", action="store_true")
+    parser.add_argument("--analyze_masks", action="store_true")
+    parser.add_argument("--view_thumbnails", action="store_true")
+    parser.add_argument("--view_loss_physics", action="store_true")
+    parser.add_argument("--view_loss_components", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     config = OmegaConf.load(args.config)
     if args.overrides:
         config = OmegaConf.merge(config, OmegaConf.from_dotlist(args.overrides))
-
-    # Override K-fold from CLI
     if args.n_folds is not None:
         config.data.n_folds = args.n_folds
         config.data.fold_idx = args.fold_idx
 
-    import os
     is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
-
     config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type", "depthfm")
 
-    if args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components:
+    # Log hardware info
+    if is_global_zero:
+        logger.info("Hardware: %d CPU cores detected, %d GPUs, workers/GPU=%d", _TOTAL_CORES, _NUM_GPUS_DEFAULT,
+                    _WORKERS_PER_GPU)
+
+    # Inspection modes
+    inspection = args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components
+    if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
             L.seed_everything(args.seed, workers=True)
-
             loaders = build_dataloaders(config, split_seed=args.seed, parallel=config.data.get("parallel_load", False))
             output_path = Path(config.training.output_dir) / "inspection"
 
             if args.analyze_topography:
-                compute_topography_statistics(loaders["test"], split_name=f"Test Set")
-
+                compute_topography_statistics(loaders["test"], split_name="Test Set")
             if args.analyze_masks:
                 for split_name, loader in loaders.items():
                     compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
-
             if args.view_thumbnails:
-                # We pull from the 'train' loader because shuffle=True naturally provides random samples
                 generate_thumbnail_grids(loaders["val"], output_dir=output_path, num_samples=8)
-
             if args.view_loss_physics:
                 visualize_loss_physics(loaders["val"], output_dir=output_path, num_samples=8)
-
             if args.view_loss_components:
                 visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
 
-            logger.info("Data inspection complete. Exiting pipeline without training.")
+            logger.info("Data inspection complete. Exiting without training.")
         return
 
+    # Training
     if args.n_runs > 1:
         run_multi_seed_experiment(config, n_runs=args.n_runs, base_seed=args.seed)
     else:
-        result = run_single_training(config, run_idx=0, seed=args.seed,
-                                     output_dir=config.training.output_dir)
+        result = run_single_training(config, run_idx=0, seed=args.seed, output_dir=config.training.output_dir)
 
         if is_global_zero:
-            # Generate single-run figures
             fig_dir = Path(config.training.output_dir) / "run_0" / "figures"
             fig_dir.mkdir(parents=True, exist_ok=True)
-
             set_neurips_style()
-            df = result["test_df"]
-            fig = plot_metric_distributions(df, save_path=fig_dir / "metrics.pdf")
+            fig = plot_metric_distributions(result["test_df"], save_path=fig_dir / "metrics.pdf")
             plt.close(fig)
-
             _generate_patch_analysis(result, fig_dir, config)
             _print_final_summary([result], Path(config.training.output_dir))
 

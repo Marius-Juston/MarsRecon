@@ -1,80 +1,133 @@
-import glob
+"""
+Recompute sun vectors in an existing LitData cache.
+
+Reads the old LitData cache, recalculates sun_vector/intensity/ambient
+using the current estimate_sun_vector_ols (CPU-side Python math), and
+writes a new LitData cache with corrected values.
+
+Two-phase approach (same as build_litdata.py):
+  Phase 1: Read old cache sequentially → write corrected .npz files (no GDAL)
+  Phase 2: litdata.optimize repacks .npz into new optimized chunks
+
+Usage:
+    python patch_sun_vectors_litdata.py \
+        --input /scratch/mars_hirise_dtm/litdata_cache_d737fb4b0c75695d \
+        --output /scratch/mars_hirise_dtm/litdata_cache_d737fb4b0c75695d_patched
+"""
+import argparse
 import logging
+import shutil
 from pathlib import Path
 
+import numpy as np
 import torch
-import webdataset as wds
+from litdata import StreamingDataset, optimize
 from tqdm import tqdm
 
-# Import your fixed math function
 from depth_fm.depthfm_adapter import estimate_sun_vector_ols
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def patch_split(old_dir: Path, new_dir: Path, split: str):
-    """Streams an old WDS split, recalculates sun vectors, and writes to a new WDS."""
-    input_pattern = str(old_dir / split / f"{split}-*.tar")
-    urls = sorted(glob.glob(input_pattern))
+# ── Top-level function for litdata.optimize (must be picklable for spawn) ──
 
-    if not urls:
-        logger.warning(f"No .tar files found for {split} at {input_pattern}")
+def _repack_npz(npz_path: str) -> dict:
+    """Read a temp .npz and return dict for litdata chunking."""
+    import numpy as np
+    data = np.load(npz_path)
+    return {
+        "image": data["image"],
+        "dtm": data["dtm"],
+        "confidence": data["confidence"],
+        "sun_vector": data["sun_vector"],
+        "intensity": data["intensity"],
+        "ambient": data["ambient"],
+    }
+
+
+def patch_split(input_dir: Path, output_dir: Path, split: str, workers: int = 32):
+    """Read one split from old LitData cache, recompute sun vectors, write new cache."""
+    split_input = input_dir / split
+    split_output = str(output_dir / split)
+
+    if not (split_input / "index.json").exists():
+        logger.warning(f"No LitData index found for {split} at {split_input}")
         return
 
-    out_split_dir = new_dir / split
-    out_split_dir.mkdir(parents=True, exist_ok=True)
-    out_pattern = str(out_split_dir / f"{split}-%06d.tar")
+    success_marker = Path(split_output) / "_SUCCESS"
+    if success_marker.exists():
+        logger.info(f"[{split}] Already patched. Skipping.")
+        return
 
-    # 1. Read and decode the old WebDataset
-    dataset = wds.DataPipeline(
-        wds.SimpleShardList(urls),
-        wds.tarfile_to_samples(),
-        wds.decode("torch")
-    )
+    # Read from old cache
+    dataset = StreamingDataset(input_dir=str(split_input), shuffle=False)
+    num_samples = len(dataset)
+    logger.info(f"[{split}] Patching {num_samples} samples...")
 
-    # 2. Setup the writer for the new dataset
-    sink = wds.ShardWriter(out_pattern, maxsize=2e9)
+    # Phase 1: Read old samples, recompute sun vectors, write temp .npz
+    tmp_dir = output_dir / f"_patch_tmp_{split}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    npz_paths = []
 
-    logger.info(f"Patching {split} split...")
-    count = 0
+    for i in tqdm(range(num_samples), desc=f"Patch {split}"):
+        raw = dataset[i]
 
-    for sample in tqdm(dataset):
-        # Extract the heavy tensors (already processed by GDAL/TorchGeo!)
-        dtm = sample["dtm.pth"][:1]
-        img = sample["image.pth"]
-        mask = sample["confidence.pth"]
+        # Reconstruct torch tensors (float16 → float32 for the OLS math)
+        image = torch.from_numpy(raw["image"].astype(np.float32))   # (3, H, W)
+        dtm = torch.from_numpy(raw["dtm"].astype(np.float32))       # (3, H, W)
+        confidence = torch.from_numpy(raw["confidence"].astype(np.float32))  # (1, H, W)
 
-        # Recalculate using your current, bug-free python code
-        sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm, img, mask)
+        # Recompute using single-channel DTM and the image
+        dtm_1ch = dtm[:1]  # (1, H, W) — first channel of the 3ch replicated DTM
+        sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_1ch, image, confidence)
 
-        # Enforce strict float32 unit vector to prevent Parquet/serialization drift
+        # Normalize to strict unit vector
         sun_vec = torch.nn.functional.normalize(sun_vec, p=2, dim=0)
 
-        # Overwrite the broken data in the dictionary
-        sample["sun_vector.pth"] = sun_vec
-        sample["intensity.pth"] = intensity
-        sample["ambient.pth"] = ambient
+        # Write corrected sample
+        npz_path = str(tmp_dir / f"{i:08d}.npz")
+        np.savez(
+            npz_path,
+            image=raw["image"],          # keep original float16
+            dtm=raw["dtm"],              # keep original float16
+            confidence=raw["confidence"],  # keep original float16
+            sun_vector=sun_vec.numpy(),
+            intensity=intensity.numpy(),
+            ambient=ambient.numpy(),
+        )
+        npz_paths.append(npz_path)
 
-        # Write back to the new archive
-        sink.write(sample)
-        count += 1
+    del dataset
+    logger.info(f"[{split}] Phase 1 complete: {len(npz_paths)} corrected .npz files.")
 
-    sink.close()
+    # Phase 2: Repack into LitData optimized chunks
+    logger.info(f"[{split}] Phase 2: Repacking into LitData chunks at {split_output}...")
+    optimize(
+        fn=_repack_npz,
+        inputs=npz_paths,
+        output_dir=split_output,
+        num_workers=min(workers, 32),
+        chunk_bytes="256MB",
+    )
 
-    # Write the success marker so your dataloader trusts this directory
-    (out_split_dir / "_SUCCESS").touch()
-    logger.info(f"Successfully patched {count} samples for {split}.\n")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    success_marker.touch()
+    logger.info(f"[{split}] Done.")
 
 
 if __name__ == "__main__":
-    # Update these paths to match your actual cache hash
-    OLD_WDS_DIR = Path("/scratch/mars_hirise_dtm/wds_cache_d737fb4b0c75695d")
-    NEW_WDS_DIR = Path("/scratch/mars_hirise_dtm/wds_cache_d737fb4b0c75695d_patched")
+    parser = argparse.ArgumentParser(description="Patch sun vectors in LitData cache")
+    parser.add_argument("--input", type=str, required=True, help="Path to old litdata_cache_<hash> directory")
+    parser.add_argument("--output", type=str, required=True, help="Path to write patched cache")
+    parser.add_argument("--workers", type=int, default=32)
+    args = parser.parse_args()
 
-    NEW_WDS_DIR.mkdir(parents=True, exist_ok=True)
+    input_dir = Path(args.input)
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     for split in ["train", "val", "test"]:
-        patch_split(OLD_WDS_DIR, NEW_WDS_DIR, split)
+        patch_split(input_dir, output_dir, split, workers=args.workers)
 
-    logger.info("All splits patched! You can now rename the PATCHED folder to match your config hash.")
+    logger.info("All splits patched! Rename the patched folder to match your config hash.")
