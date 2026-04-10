@@ -123,6 +123,22 @@ To have even faster dataset throughput you can convert the information for the W
 PYTHONPATH=src uv run -m src.depth_fm.build_webdataset
 ```
 
+The sun view is probably doing to be wrong due to the GPU vs CPU computation, this can be validated using 
+
+```bash
+bash scripts/launch_train.sh configs/train_hirise.yaml 1 4 --view_loss_physics 
+```
+
+and verifying that both final columns look the exact same. If that is not the case then the system will not be correct.
+
+As such you need to patch the WebDataset using
+
+```bash
+PYTHONPATH=src uv run -m scripts.patch_sun_vectors.py
+```
+
+this is an important thing to run otherwise you will not have the correct losses.
+
 ## Running
 
 ```bash
