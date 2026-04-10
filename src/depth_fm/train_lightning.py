@@ -82,8 +82,8 @@ _NUM_GPUS_DEFAULT = torch.cuda.device_count() if torch.cuda.is_available() else 
 # Workers per GPU: leave headroom for the main process and OS.
 # 256 cores / 4 GPUs = 64 per GPU; cap at 48 to avoid memory pressure from
 # too many rasterio/GDAL file handles.
-_WORKERS_PER_GPU = min(48, max(4, (_TOTAL_CORES - 8) // max(_NUM_GPUS_DEFAULT, 1)))
-_VAL_WORKERS = min(8, _WORKERS_PER_GPU)
+_WORKERS_PER_GPU = min(24, max(4, (_TOTAL_CORES - 16) // max(_NUM_GPUS_DEFAULT, 1)))
+_VAL_WORKERS = min(4, _WORKERS_PER_GPU)
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +514,7 @@ def _build_litdata_loaders(config, split_seed: int = 42) -> dict:
             num_workers=num_workers if is_train else _VAL_WORKERS,
             pin_memory=tc.pin_memory,
             drop_last=is_train,
-            persistent_workers=True,
+            persistent_workers=is_train,  # val/test: spawn fresh to avoid resource contention
         )
         logger.info(
             "LitData [%s]: batch_size=%d, workers=%d",
@@ -603,8 +603,7 @@ def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -
             pin_memory=tc.pin_memory,
             prefetch_factor=tc.get("prefetch_factor", 4) if is_train else 2,
             drop_last=is_train,
-            persistent_workers=True,
-            multiprocessing_context="fork",
+            persistent_workers=is_train,
             worker_init_fn=configure_worker_logger,
         )
         logger.info(
@@ -765,6 +764,20 @@ def run_single_training(
         precision = "32-true"
 
     # Trainer — optimised for 4×A6000
+    # IMPORTANT: val_check_interval must be an integer (steps) not a float
+    # (fraction of epoch) to avoid DDP deadlocks when ranks disagree on
+    # epoch length. LitData handles its own sharding, so disable Lightning's
+    # DistributedSampler to avoid double-sharding / uneven batch counts.
+    val_interval = config.training.val_every_steps
+    if isinstance(val_interval, float) and val_interval < 1.0:
+        # Convert fraction to a safe step count
+        logger.warning(
+            "val_every_steps=%.2f is a fraction — converting to 200 steps "
+            "to prevent DDP deadlock. Set an integer value in your config.",
+            val_interval,
+        )
+        val_interval = 200
+
     trainer = L.Trainer(
         max_steps=config.training.max_steps,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -773,13 +786,13 @@ def run_single_training(
         precision=precision,
         callbacks=callbacks,
         logger=wandb_logger,
-        val_check_interval=config.training.val_every_steps,
+        val_check_interval=int(val_interval),
         log_every_n_steps=config.training.log_every_steps,
         gradient_clip_val=config.training.max_grad_norm,
         accumulate_grad_batches=config.training.gradient_accumulation_steps,
         enable_progress_bar=True,
         default_root_dir=str(output_dir),
-        use_distributed_sampler=False
+        use_distributed_sampler=False,
     )
 
     # Train (with resumption)

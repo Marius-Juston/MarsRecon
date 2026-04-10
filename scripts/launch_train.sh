@@ -45,11 +45,15 @@ fi
 echo "═══════════════════════════════════════════════════════════════"
 
 export PYTHONPATH=src
-export OMP_NUM_THREADS=32
+export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_DISABLE=1
 export TQDM_MININTERVAL=1
+
+# Increase NCCL timeout to surface real deadlocks instead of silent hangs
+export NCCL_TIMEOUT=1800
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 # Reduce memory fragmentation on large-VRAM cards (A6000 = 48 GB)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

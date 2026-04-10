@@ -235,7 +235,7 @@ class MarsDepthFMDataModule(L.LightningDataModule):
             num_workers=min(self.tc.num_workers, 4),
             pin_memory=self.tc.pin_memory,
             drop_last=False,
-            persistent_workers=True,
+            persistent_workers=False,
         )
 
     def test_dataloader(self):
@@ -245,7 +245,7 @@ class MarsDepthFMDataModule(L.LightningDataModule):
             num_workers=min(self.tc.num_workers, 4),
             pin_memory=self.tc.pin_memory,
             drop_last=False,
-            persistent_workers=True,
+            persistent_workers=False,
         )
 
 
@@ -298,7 +298,7 @@ def build_litdata_dataloaders(config, split_seed: int = 42) -> dict:
             num_workers=tc.num_workers if is_train else min(tc.num_workers, 4),
             pin_memory=tc.pin_memory,
             drop_last=is_train,
-            persistent_workers=True,
+            persistent_workers=is_train,
         )
 
         logger.info(

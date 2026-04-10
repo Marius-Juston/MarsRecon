@@ -198,22 +198,21 @@ class DepthFMLightningModule(L.LightningModule):
             t_mean = t.float().mean()
             t_std = t.float().std()
 
-        # FIX: All logging is UNCONDITIONAL — no conditional sync_dist
-        # that could cause DDP deadlock. Use sync_dist=False for cheap
-        # per-rank stats; sync_dist=True only for metrics we truly need averaged.
+        # Per the Lightning docs, rank_zero_only=True prevents synchronization
+        # that would produce a deadlock. Use for diagnostics we only need from rank 0.
         step = self.global_step
 
-        self.log("train/v_pred_norm", v_pred_norm, sync_dist=False)
-        self.log("train/v_target_norm", v_target_norm, sync_dist=False)
-        self.log("train/v_rel_error", v_rel_error, sync_dist=False)
-        self.log("train/t_mean", t_mean, sync_dist=False)
-        self.log("train/t_std", t_std, sync_dist=False)
+        self.log("train/v_pred_norm", v_pred_norm, rank_zero_only=True)
+        self.log("train/v_target_norm", v_target_norm, rank_zero_only=True)
+        self.log("train/v_rel_error", v_rel_error, rank_zero_only=True)
+        self.log("train/t_mean", t_mean, rank_zero_only=True)
+        self.log("train/t_std", t_std, rank_zero_only=True)
 
         # FIX: Removed conditional `if step % 10 == 0` around sync_dist=True logs.
         # These are cheap scalars — log every step with sync_dist=False.
         with torch.no_grad():
-            self.log("train/z_depth_std", z_depth_raw.std().item(), sync_dist=False)
-            self.log("train/noise_std", x_source.std().item(), sync_dist=False)
+            self.log("train/z_depth_std", z_depth_raw.std().item(), rank_zero_only=True)
+            self.log("train/noise_std", x_source.std().item(), rank_zero_only=True)
 
         # Pixel-space losses
         pred_pix = gt_pix = None
@@ -235,13 +234,14 @@ class DepthFMLightningModule(L.LightningModule):
             intensity=batch.get("intensity"),
         )
 
-        # Logging — sync only the main loss for accurate progress bar
-        self.log("train/loss", loss_dict["total"], prog_bar=True, sync_dist=True)
-        self.log("train/loss_velocity", loss_dict["velocity"], sync_dist=False)
-        self.log("train/loss_normals", loss_dict["normals"], sync_dist=False)
-        self.log("train/loss_freq", loss_dict["freq"], sync_dist=False)
-        self.log("train/loss_grad", loss_dict["grad"], sync_dist=False)
-        self.log("train/lr", self.optimizers().param_groups[0]["lr"], sync_dist=False)
+        # Logging — NO sync_dist in training_step to avoid DDP deadlock.
+        # rank_zero_only=True per Lightning docs: prevents sync that causes deadlock.
+        self.log("train/loss", loss_dict["total"], prog_bar=True, sync_dist=False)
+        self.log("train/loss_velocity", loss_dict["velocity"], rank_zero_only=True)
+        self.log("train/loss_normals", loss_dict["normals"], rank_zero_only=True)
+        self.log("train/loss_freq", loss_dict["freq"], rank_zero_only=True)
+        self.log("train/loss_grad", loss_dict["grad"], rank_zero_only=True)
+        self.log("train/lr", self.optimizers().param_groups[0]["lr"], rank_zero_only=True)
 
         if self.val_history and batch_idx == 0:
             self.val_history["train/loss"].append(loss_dict["total"].item())
@@ -333,9 +333,17 @@ class DepthFMLightningModule(L.LightningModule):
         if not summary:
             return
 
-        for metric_name, stats in summary.items():
-            self.log(f"val/{metric_name}", stats["mean"], sync_dist=True)
-            self.log(f"val/{metric_name}_std", stats["std"], sync_dist=True)
+        # SAFETY: Use a fixed metric list so ALL ranks execute the same number
+        # of sync_dist=True calls. If summary.items() differed across ranks
+        # (e.g. one rank got a NaN), the mismatched sync would deadlock.
+        _FIXED_VAL_METRICS = [
+            "rmse", "abs_rel", "delta_1", "delta_2", "delta_3",
+            "normal_angular_error", "slope_rmse",
+        ]
+        for metric_name in _FIXED_VAL_METRICS:
+            if metric_name in summary:
+                self.log(f"val/{metric_name}", summary[metric_name]["mean"], sync_dist=True)
+                self.log(f"val/{metric_name}_std", summary[metric_name]["std"], sync_dist=True)
 
         self.log("val/rmse_mean", summary.get("rmse", {}).get("mean", 0), prog_bar=True, sync_dist=True)
         self.log("val/delta_1_mean", summary.get("delta_1", {}).get("mean", 0), prog_bar=True, sync_dist=True)
@@ -527,8 +535,14 @@ class DepthFMLightningModule(L.LightningModule):
         if not summary:
             return
 
-        for metric_name, stats in summary.items():
-            self.log(f"test/{metric_name}", stats["mean"], sync_dist=True)
+        # SAFETY: Fixed metric list — same reason as on_validation_epoch_end
+        _FIXED_TEST_METRICS = [
+            "rmse", "abs_rel", "delta_1", "delta_2", "delta_3",
+            "normal_angular_error", "slope_rmse",
+        ]
+        for metric_name in _FIXED_TEST_METRICS:
+            if metric_name in summary:
+                self.log(f"test/{metric_name}", summary[metric_name]["mean"], sync_dist=True)
 
         logger.info("=" * 60)
         logger.info("TEST SET RESULTS")
@@ -634,7 +648,7 @@ class DepthFMLightningModule(L.LightningModule):
         for p in self.model.backbone.parameters():
             if p.grad is not None:
                 total_norm_sq += p.grad.detach().float().norm().item() ** 2
-        self.log("train/grad_norm", total_norm_sq ** 0.5, prog_bar=False, sync_dist=False)
+        self.log("train/grad_norm", total_norm_sq ** 0.5, prog_bar=False, rank_zero_only=True)
 
     # ------------------------------------------------------------------
     # Optimizer & scheduler
