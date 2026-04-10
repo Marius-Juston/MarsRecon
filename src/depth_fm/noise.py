@@ -5,9 +5,8 @@ Copied verbatim from depth-fm/depthfm/dfm.py so that both codepaths
 are provably identical to the reference implementation.
 """
 
-import math
-import numpy as np
 import einops
+import numpy as np
 import torch
 
 
@@ -26,10 +25,10 @@ def cosine_alpha_bar(t: float) -> float:
 
 @torch.no_grad()
 def q_sample(
-    x_start: torch.Tensor,
-    t: int,
-    noise: torch.Tensor = None,
-    n_diffusion_timesteps: int = 1000,
+        x_start: torch.Tensor,
+        t: int,
+        noise: torch.Tensor = None,
+        n_diffusion_timesteps: int = 1000,
 ) -> torch.Tensor:
     """
     Diffuse x_start for t steps: sample from q(x_t | x_0).

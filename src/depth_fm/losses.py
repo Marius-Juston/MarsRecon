@@ -12,10 +12,6 @@ Auxiliary losses (all operate in pixel space on the predicted clean depth):
 
 import logging
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -132,6 +128,7 @@ class PhotoclinometricLoss(nn.Module):
         loss = 1.0 - correlation[valid_batch_items].mean()
 
         return loss
+
 
 class FlowMatchingVelocityLoss(nn.Module):
     """

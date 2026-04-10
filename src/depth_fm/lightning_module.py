@@ -187,7 +187,7 @@ class DepthFMLightningModule(L.LightningModule):
         z_img = self._encode(batch["image"])
         z_depth_raw = self._encode(batch["dtm"])
 
-        z_depth = z_depth_raw*self.config.data.get("signal_boost", 1.0)
+        z_depth = z_depth_raw * self.config.data.get("signal_boost", 1.0)
 
         B = z_img.shape[0]
         t = self._sample_timesteps(B)
@@ -300,7 +300,6 @@ class DepthFMLightningModule(L.LightningModule):
 
         z_img = self._encode(batch["image"])
         z_depth = self._encode(batch["dtm"]) * signal_boost
-
 
         # 1-step Euler prediction
         z_pred = self._predict_depth(z_img, num_steps=self.config.get("test_euler_steps", 4))

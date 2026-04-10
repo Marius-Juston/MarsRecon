@@ -19,6 +19,7 @@ model:
 data:
   source: "hirise"
   parallel_load: true
+  use_wds: true
 
   hirise:
     root: "/scratch/mars_hirise_dtm"
@@ -50,7 +51,7 @@ data:
   dtm_normalization: "relative"
   stats_path: "dataset_stats/dtm/dataset_stats.json"
   random_flip: true
-  brightness_jitter: 0.1
+  brightness_jitter: 0.0
 
   signal_boost: 10.0
 
@@ -125,6 +126,6 @@ training:
   ema_decay: 0.99
 
   # 128 cores / 4 GPUs = 32 workers per process
-  num_workers: 32
+  num_workers: 16
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 32

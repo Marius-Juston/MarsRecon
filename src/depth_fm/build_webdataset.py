@@ -3,8 +3,6 @@ Extracts raw tensors from MarsHiRISEDTM and packs them into WebDataset .tar arch
 Run this ONCE per configuration. Subsequence runs with the same config will skip extraction.
 """
 import argparse
-import hashlib
-import json
 import logging
 import os
 from pathlib import Path
@@ -13,12 +11,11 @@ from tqdm import tqdm
 
 # Force maximum GDAL speed for the extraction phase & prevent CPU choking
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
-os.environ["VSI_CACHE"] = "FALSE" # Good for sequential extraction
+os.environ["VSI_CACHE"] = "FALSE"  # Good for sequential extraction
 os.environ["GDAL_NUM_THREADS"] = "1"
 os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
-os.environ["OMP_NUM_THREADS"] = "1" # Prevent NumPy/SciPy thread explosion with many workers
+os.environ["OMP_NUM_THREADS"] = "1"  # Prevent NumPy/SciPy thread explosion with many workers
 
-import torch
 import webdataset as wds
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
@@ -31,10 +28,10 @@ from depth_fm.train_lightning import configure_worker_logger, get_wds_cache_key
 
 # Prevent "Too many open files" errors when using many DataLoader workers
 import torch.multiprocessing as mp
+
 mp.set_sharing_strategy('file_system')
 
 logger = logging.getLogger(__name__)
-
 
 
 def build_wds_for_split(config, split: str, wds_hash: str, workers: int = 64):
@@ -108,6 +105,9 @@ def build_wds_for_split(config, split: str, wds_hash: str, workers: int = 64):
     manifest_cache_dir = dataset_root / ".cache" / "manifests"
     manifest_cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # FIXME it seems that since the current math is done on the CPU rather on the GPU some of the algorithms do not
+    # return exactly what is expected, so there is a difference between the true sun_view and the expected
+
     # 3. Adapter (CRITICAL: Disable augmentations for static storage!)
     adapter = DepthFMHiRISEAdapterCached(
         base_dataset=base_dataset,
@@ -118,14 +118,14 @@ def build_wds_for_split(config, split: str, wds_hash: str, workers: int = 64):
         brightness_jitter=0.0,
         stats_path=stats_path,
         use_manifest=True,
-        manifest_workers=min(workers, 94), # Cap manifest workers to avoid OOM
+        manifest_workers=min(workers, 94),  # Cap manifest workers to avoid OOM
         manifest_dir=str(manifest_cache_dir)
     )
 
     # 4. DataLoader
     loader = DataLoader(
         adapter,
-        batch_size=None, # CRITICAL: Must be None to return raw uncollated dictionaries
+        batch_size=None,  # CRITICAL: Must be None to return raw uncollated dictionaries
         shuffle=False,
         num_workers=workers,
         pin_memory=False,

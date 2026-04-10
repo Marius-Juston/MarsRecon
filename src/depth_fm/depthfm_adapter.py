@@ -51,8 +51,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
 
-from dataset.mars_hirise_dtm import MarsHiRISEDTM
-
 logger = logging.getLogger(__name__)
 
 # Hardcoded fallback quantiles derived from dataset_stats/dtm/dataset_stats.json
