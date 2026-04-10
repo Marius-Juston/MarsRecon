@@ -39,15 +39,18 @@ Usage with the HiRISE sampler::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 from pathlib import Path
 from typing import Literal
 
+import pandas as pd
 import torch
-import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+from tqdm import tqdm  # Highly recommended to see progress during the one-time build
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +200,81 @@ def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold
     zero_curvature_ratio = (valid_laplacian.abs() < 1e-2).float().mean().item()
 
     return zero_curvature_ratio > threshold
+
+
+import torch
+import torch.nn.functional as F
+
+
+def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: torch.Tensor) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Estimates the sun vector [sx, sy, sz] using Ordinary Least Squares.
+    Handles shapes (C, H, W) or (1, C, H, W).
+    """
+    device = dtm.device
+
+    # Helper for fallback returns
+    def get_defaults():
+        default_sun = F.normalize(torch.tensor([0.5, -0.5, 1.0], device=device), p=2, dim=0)
+        return default_sun, torch.tensor(1.0, device=device), torch.tensor(0.3, device=device)
+
+    # Ensure 3D (C, H, W)
+    if dtm.ndim == 4: dtm = dtm[0]
+    if ortho.ndim == 4: ortho = ortho[0]
+    if valid_mask.ndim == 4: valid_mask = valid_mask[0]
+
+    # Convert ortho to grayscale if it's RGB
+    if ortho.shape[0] == 3:
+        ortho = ortho.mean(dim=0, keepdim=True)
+
+    # Sobel kernels
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device) / 8.0
+    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device) / 8.0
+
+    spatial_scale = max(dtm.shape[-2], dtm.shape[-1]) / 2.0
+    padded_dtm = F.pad(dtm.unsqueeze(0), (1, 1, 1, 1), mode='replicate')
+
+    n_x = -F.conv2d(padded_dtm, sobel_x.view(1, 1, 3, 3)) * spatial_scale
+    n_y = -F.conv2d(padded_dtm, sobel_y.view(1, 1, 3, 3)) * spatial_scale
+    n_z = torch.ones_like(n_x)
+
+    normals = torch.cat([n_x, n_y, n_z], dim=1)
+    normals = F.normalize(normals, p=2, dim=1).squeeze(0)  # Shape: (3, H, W)
+
+    mask = valid_mask.squeeze(0).bool()
+
+    # Filter extreme shadows
+    ortho_valid = ortho.squeeze(0)[mask]
+    if len(ortho_valid) == 0:
+        return get_defaults()
+
+    intensity_threshold = torch.quantile(ortho_valid, 0.05)
+    shadow_mask = ortho.squeeze(0) > intensity_threshold
+    final_mask = mask & shadow_mask
+
+    N_flat = normals[:, final_mask].t()  # Shape: (M, 3)
+    Y_flat = ortho.squeeze(0)[final_mask].unsqueeze(1)  # Shape: (M, 1)
+
+    if N_flat.shape[0] < 100:
+        return get_defaults()
+
+    # Add column of 1s for bias/ambient light
+    ones = torch.ones((N_flat.shape[0], 1), device=device)
+    A = torch.cat([N_flat, ones], dim=1)  # Shape: (M, 4)
+
+    # Solve Least Squares
+    x = torch.linalg.lstsq(A, Y_flat).solution
+
+    # Extract and normalize the sun vector
+    k = x[:3, 0]
+    ambient = x[3, 0]  # <--- The scene's ambient light bounce
+    intensity = torch.norm(k, p=2)  # <--- The scene's overall brightness
+
+    sun_vec = F.normalize(k, p=2, dim=0)
+
+    # Return all 3 parameters
+    return sun_vec, intensity, ambient
 
 
 def _normalize_dtm_relative(
@@ -350,7 +428,7 @@ def compute_topographic_residual(elevation: torch.Tensor, valid_mask: torch.Tens
     return residual_rms
 
 
-class DepthFMHiRISEAdapter(Dataset):
+class DepthFMHiRISEAdapterCached(Dataset):
     """Adapter that converts MarsHiRISEDTM samples into DepthFM training pairs.
 
     Each ``__getitem__`` call draws a geo-slice from the sampler, loads the
@@ -380,67 +458,123 @@ class DepthFMHiRISEAdapter(Dataset):
             random_jitter: bool = False,
             brightness_jitter: float = 0.1,
             stats_path: str | None = None,
-            max_retries: int = 10
+            use_manifest: bool = True,
+            manifest_workers: int = 16,  # Set this high to build the cache fast
+            manifest_dir: str = ".cache/manifests"
     ):
         super().__init__()
-        self.max_retries = max_retries
-        self.random_jitter = random_jitter
         self.base = base_dataset
         self.sampler = sampler
         self.resolution = resolution
         self.dtm_norm = dtm_normalization
         self.flip = random_flip
+        self.random_jitter = random_jitter
         self.bright_jitter = brightness_jitter
-
         self.is_train = random_flip
 
-        # Load global quantiles for normalization
+        self.use_manifest = use_manifest
+        self.manifest_workers = manifest_workers
+        self.manifest_dir = Path(manifest_dir)
+
+        # Load global quantiles
         (
             self.elev_p02, self.elev_p98,
             self.img_p02, self.img_p98,
             self.elev_scale,
         ) = _load_quantiles(stats_path)
-        logger.info(
-            "DepthFMHiRISEAdapter: elev scale=%.2f m, img p02=%.4f p98=%.4f (norm=%s)",
-            self.elev_scale, self.img_p02, self.img_p98, dtm_normalization,
+
+        # Pre-materialise sampler indices
+        self._raw_indices = list(sampler)
+
+        # --- Cache Handling ---
+        if self.use_manifest:
+            self._init_manifest()
+        else:
+            self.clean_records = None
+            logger.warning("Manifest disabled. Training will be slow due to on-the-fly validation.")
+
+    def _get_manifest_hash(self) -> str:
+        """Create a unique key so the cache rebuilds if dataset/sampler params change."""
+        key_parts = {
+            "root": str(getattr(self.base, "root", "unknown")),
+            "resolution": self.resolution,
+            "sampler_length": len(self._raw_indices),
+            "split": getattr(self.sampler, "split", "unknown"),
+            "seed": getattr(self.sampler, "seed", 0)
+        }
+        raw = json.dumps(key_parts, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _init_manifest(self):
+        """Loads the parquet manifest or triggers a fast multiprocessing build."""
+        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = self.manifest_dir / f"hirise_manifest_{self._get_manifest_hash()}.parquet"
+
+        if manifest_path.exists():
+            logger.info(f"Loading rich manifest from {manifest_path}")
+            df = pd.read_parquet(manifest_path)
+        else:
+            logger.info(f"Manifest not found. Building cache using {self.manifest_workers} workers...")
+            df = self._build_manifest_parallel(manifest_path)
+
+        # Filter the dataframe to only keep good patches
+        # You can easily adjust these thresholds in the future without rebuilding the cache!
+        clean_df = df[
+            (df['is_valid_data'] == True) &
+            (df['valid_ratio'] >= 0.85) &
+            (df['residual'] >= 0.1) &
+            (df['is_tin'] == False)
+            ]
+
+        # Convert to a list of dicts for O(1) lookup during training
+        self.clean_records = clean_df.to_dict('records')
+        logger.info(f"Manifest ready: Filtered {len(df)} total patches down to {len(self.clean_records)} clean pairs.")
+
+    def _build_manifest_parallel(self, save_path: Path) -> pd.DataFrame:
+        """Uses a temporary PyTorch DataLoader to build the cache at maximum speed."""
+
+        # 1. Define a lightweight inner dataset just for computing stats
+        class _ManifestBuilderDS(Dataset):
+            def __init__(self, adapter):
+                self.adapter = adapter
+
+            def __len__(self):
+                return len(self.adapter._raw_indices)
+
+            def __getitem__(self, idx):
+                return self.adapter._evaluate_patch_for_manifest(idx)
+
+        # 2. Use standard PyTorch DataLoader to bypass the GIL
+        builder_loader = DataLoader(
+            _ManifestBuilderDS(self),
+            batch_size=1,  # Process one by one
+            num_workers=self.manifest_workers,
+            collate_fn=lambda x: x[0],  # Prevent PyTorch from batching dicts into tensors
+            shuffle=False
         )
 
-        # Pre-materialise sampler indices for random access
-        self._indices = list(sampler)
-        logger.info(
-            "DepthFMHiRISEAdapter: %d samples, resolution=%d, norm=%s",
-            len(self._indices), resolution, dtm_normalization,
-        )
+        records = []
+        for record in tqdm(builder_loader, desc="Scanning HiRISE Data", unit="patch"):
+            records.append(record)
 
-    def __len__(self) -> int:
-        return len(self._indices)
+        # 3. Save and return
+        df = pd.DataFrame(records)
+        df.to_parquet(save_path)
+        return df
 
-    def rand_idx(self) -> torch.int64:
-        return torch.randint(0, len(self._indices), (1,)).item()
+    def _evaluate_patch_for_manifest(self, idx: int) -> dict:
+        """The heavy lifting: loads data, calculates stats, and returns a dictionary.
+        This ONLY runs once during cache generation."""
+        try:
+            geo_slice = self._raw_indices[idx]
+            sample = self.base[geo_slice]
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        for retries in range(getattr(self, 'max_retries', 10)):
-            geo_slice = self._indices[idx]
-
-            # Load from the base MarsHiRISEDTM dataset
-            try:
-                # Load from the base MarsHiRISEDTM dataset
-                sample = self.base[geo_slice]
-            except IndexError as e:
-                idx = self.rand_idx()
-                logger.exception("An error occurred while trying to retrieve a sample.")
-                continue
-
-            # ── 1. Load Elevation ──
-            elevation = sample["elevation"]  # (1, H, W)
-            if elevation.ndim == 4:
-                elevation = elevation[0]
-
+            elevation = sample["elevation"]
+            if elevation.ndim == 4: elevation = elevation[0]
             if elevation.shape[-1] == 0 or elevation.shape[-2] == 0:
-                idx = self.rand_idx()
-                continue
+                return {"idx": idx, "is_valid_data": False}
 
-            # ── 2. Select Orthoimage FIRST ──
+            # Select Orthoimage
             left_key, right_key = "left_red", "right_red"
             has_left = left_key in sample and sample[left_key] is not None
             has_right = right_key in sample and sample[right_key] is not None
@@ -452,48 +586,19 @@ class DepthFMHiRISEAdapter(Dataset):
             elif has_right:
                 key = right_key
             else:
-                key = None
-
-            if key is not None:
-                ortho = sample[key]
-            else:
-                # Fallback: try IRB
-                for fallback_key in ("left_irb", "right_irb"):
-                    if fallback_key in sample and sample[fallback_key] is not None:
-                        ortho = sample[fallback_key]
-                        key = fallback_key
+                for fk in ("left_irb", "right_irb"):
+                    if fk in sample and sample[fk] is not None:
+                        key = fk
                         break
                 else:
-                    logger.warning(f"No orthoimage found for sample {idx}, using zeros")
-                    ortho = torch.zeros(1, elevation.shape[-2], elevation.shape[-1])
-                    key = "dummy"
+                    return {"idx": idx, "is_valid_data": False}
 
-            if ortho.ndim == 4:
-                ortho = ortho[0]
+            ortho = sample[key]
+            if ortho.ndim == 4: ortho = ortho[0]
 
-            if ortho.shape[-1] == 0 or ortho.shape[-2] == 0:
-                idx = self.rand_idx()
-                continue
-
-            # ── 3. Extract MATCHING Metadata ──
-            meta_list = sample.get("meta", [])
-            meta_key = f"{key}_meta"
-
-            incidence, azimuth = 45.0, 270.0  # Safe defaults
-            if meta_list and meta_key in meta_list[0]:
-                incidence = meta_list[0][meta_key]["incidence_angle"]
-                azimuth = meta_list[0][meta_key]["solar_azimuth"]
-
-            # Convert spherical to cartesian vector
-            inc_rad = math.radians(incidence)
-            az_rad = math.radians(azimuth)
-            sun_x = math.sin(inc_rad) * math.cos(az_rad)
-            sun_y = math.sin(inc_rad) * math.sin(az_rad)
-            sun_z = math.cos(inc_rad)
-
-            sun_vector = torch.tensor([-sun_x, -sun_y, sun_z], dtype=torch.float32)
-
-            # ── 4. Resize and Mask ──
+            # -------------------------------------------------------------
+            # 1. Masking and Resizing (Moved UP so OLS can use it)
+            # -------------------------------------------------------------
             dtm_resized = _safe_resize(elevation, self.resolution, has_nans=True)
             image_resized = _safe_resize(ortho, self.resolution)
 
@@ -501,77 +606,129 @@ class DepthFMHiRISEAdapter(Dataset):
             elev_valid = torch.isfinite(dtm_resized) & (dtm_resized != 0.0)
             valid_mask_resized = (ortho_valid & elev_valid).float()
 
-            # ── 5. Filtering Logic ──
-            if True or getattr(self, 'is_train', False):
-                valid_ratio = valid_mask_resized.mean().item()
+            valid_ratio = valid_mask_resized.mean().item()
 
-                if valid_ratio >= 0.85:
-                    try:
-                        std = compute_topographic_residual(dtm_resized, valid_mask_resized)
-                        if std < 0.1:
-                            logger.info(f"Skipping flat patch, std: {std:.3f}")
-                            idx = self.rand_idx()
-                            continue
+            # -------------------------------------------------------------
+            # 2. Sun Vector Math (Now with OLS Fallback)
+            # -------------------------------------------------------------
+            meta_list = sample.get("meta", [])
+            meta_key = f"{key}_meta"
 
-                        elev_valid_native = torch.isfinite(elevation) & (elevation != 0.0)
+            if meta_list and meta_key in meta_list[0]:
+                # We have metadata, use standard orbital mechanics
+                incidence = meta_list[0][meta_key]["incidence_angle"]
+                azimuth = meta_list[0][meta_key]["solar_azimuth"]
 
-                        # from depth_fm.depthfm_adapter import is_tin_artifact
-                        if is_tin_artifact(elevation, elev_valid_native, threshold=0.15):
-                            print("Skipping")
-                            logger.info("Skipping patch: Detected artificial TIN triangles.")
-                            idx = self.rand_idx()
-                            continue
-                    except Exception:
-                        logger.exception("An error occured while validating.")
-                        idx = self.rand_idx()
-                        continue
+                inc_rad = math.radians(incidence)
+                az_rad = math.radians(azimuth)
+                sun_x = -math.sin(inc_rad) * math.cos(az_rad)
+                sun_y = -math.sin(inc_rad) * math.sin(az_rad)
+                sun_z = math.cos(inc_rad)
 
-                    break  # Passed all checks
-                else:
-                    idx = self.rand_idx()
-                    continue
+                # Metadata doesn't contain scene brightness, provide safe defaults
+                intensity_val = 1.0
+                ambient_val = 0.3
             else:
-                break  # Validation/Test always breaks immediately
+                # Metadata missing! Use OLS on the resized tensors
+                sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_resized, image_resized, valid_mask_resized)
 
-        else:
-            # ── Fallback if max_retries hit ──
-            logger.warning(f"Hit max_retries in DataLoader. Returning dummy patch.")
+                sun_x = sun_vec[0].item()
+                sun_y = sun_vec[1].item()
+                sun_z = sun_vec[2].item()
+                intensity_val = intensity.item()
+                ambient_val = ambient.item()
+
+            # -------------------------------------------------------------
+            # 3. Heavy Math Operations
+            # -------------------------------------------------------------
+            residual = compute_topographic_residual(dtm_resized, valid_mask_resized) if valid_ratio >= 0.85 else 0.0
+
+            elev_valid_native = torch.isfinite(elevation) & (elevation != 0.0)
+            is_tin = is_tin_artifact(elevation, elev_valid_native, threshold=0.15) if valid_ratio >= 0.85 else True
+
             return {
-                "image": torch.zeros(3, self.resolution, self.resolution),
-                "dtm": torch.zeros(3, self.resolution, self.resolution),
-                "confidence": torch.zeros(1, self.resolution, self.resolution),
-                "sun_vector": torch.tensor([0.5, -0.5, 1.0], dtype=torch.float32)
+                "idx": idx,
+                "is_valid_data": True,
+                "ortho_key": key,
+                "valid_ratio": valid_ratio,
+                "residual": residual,
+                "is_tin": is_tin,
+                "sun_x": sun_x,
+                "sun_y": sun_y,
+                "sun_z": sun_z,
+                "intensity": intensity_val,
+                "ambient": ambient_val
             }
 
-        # ── 6. Normalization ──
+        except Exception as e:
+            logger.exception("Failed to generate manifest for patch")
+            return {"idx": idx, "is_valid_data": False}
+
+    def __len__(self) -> int:
+        if self.use_manifest:
+            return len(self.clean_records)
+        return len(self._raw_indices)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        """Lightning fast __getitem__. No retries, no heavy math."""
+        if not self.use_manifest:
+            raise NotImplementedError(
+                "Fallback on-the-fly __getitem__ removed for brevity. Please run with use_manifest=True.")
+
+        # 1. Get pre-validated metadata in O(1) time
+        record = self.clean_records[idx]
+        geo_slice = self._raw_indices[record["idx"]]
+        key = record["ortho_key"]
+
+        # 2. Load the data (Guaranteed to be valid)
+        sample = self.base[geo_slice]
+
+        elevation = sample["elevation"]
+        if elevation.ndim == 4: elevation = elevation[0]
+
+        ortho = sample[key]
+        if ortho.ndim == 4: ortho = ortho[0]
+
+        sun_vector = torch.tensor([record["sun_x"], record["sun_y"], record["sun_z"]], dtype=torch.float32)
+        intensity = torch.tensor(record["intensity"], dtype=torch.float32)
+        ambient = torch.tensor(record["ambient"], dtype=torch.float32)
+
+        # 3. Resize
+        dtm_resized = _safe_resize(elevation, self.resolution, has_nans=True)
+        image_resized = _safe_resize(ortho, self.resolution)
+
+        # Masks
+        ortho_valid = (image_resized != 0.0).any(dim=0, keepdim=True)
+        elev_valid = torch.isfinite(dtm_resized) & (dtm_resized != 0.0)
+        valid_mask_resized = (ortho_valid & elev_valid).float()
+
+        # 4. Normalization
         dtm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
         dtm = _to_3ch(dtm)
 
         image = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
         image = _to_3ch(image)
 
-        # ── 7. Synchronised Augmentation (INCLUDING SUN VECTOR) ──
+        # 5. Synchronised Augmentation
         if getattr(self, 'is_train', False) and getattr(self, 'flip', False):
             if torch.rand(1).item() > 0.5:
                 image = torch.flip(image, [-1])
                 dtm = torch.flip(dtm, [-1])
                 valid_mask_resized = torch.flip(valid_mask_resized, [-1])
-                sun_vector[0] = -sun_vector[0]  # Flip X axis
+                sun_vector[0] = -sun_vector[0]
 
             if torch.rand(1).item() > 0.5:
                 image = torch.flip(image, [-2])
                 dtm = torch.flip(dtm, [-2])
                 valid_mask_resized = torch.flip(valid_mask_resized, [-2])
-                sun_vector[1] = -sun_vector[1]  # Flip Y axis
+                sun_vector[1] = -sun_vector[1]
 
-            # 90-degree rotations
             k_rot = torch.randint(0, 4, (1,)).item()
             if k_rot > 0:
                 image = torch.rot90(image, k=k_rot, dims=[-2, -1])
                 dtm = torch.rot90(dtm, k=k_rot, dims=[-2, -1])
                 valid_mask_resized = torch.rot90(valid_mask_resized, k=k_rot, dims=[-2, -1])
 
-                # Rotate sun vector in X-Y plane
                 sx, sy = sun_vector[0].clone(), sun_vector[1].clone()
                 if k_rot == 1:
                     sun_vector[0], sun_vector[1] = -sy, sx
@@ -580,15 +737,21 @@ class DepthFMHiRISEAdapter(Dataset):
                 elif k_rot == 3:
                     sun_vector[0], sun_vector[1] = sy, -sx
 
-        # Brightness jitter on image only
+        # Brightness jitter
         if getattr(self, 'is_train', False) and getattr(self, 'bright_jitter', 0) > 0:
             import random
             factor = 1.0 + random.uniform(-self.bright_jitter, self.bright_jitter)
             image = (image * factor).clamp(-1.0, 1.0)
 
+            # Scale the physical lighting parameters so the loss physics still match the augmented image
+            intensity *= factor
+            ambient *= factor
+
         return {
             "image": image,
             "dtm": dtm,
             "confidence": valid_mask_resized,
-            "sun_vector": sun_vector
+            "sun_vector": sun_vector,
+            "intensity": intensity,
+            "ambient": ambient
         }

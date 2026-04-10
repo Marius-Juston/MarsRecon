@@ -26,8 +26,6 @@ from copy import deepcopy
 from pathlib import Path
 
 import lightning as L
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from lightning.pytorch.callbacks import (
     LearningRateMonitor,
@@ -38,7 +36,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from depth_fm.depthfm_adapter import DepthFMHiRISEAdapter
+from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_ols
 from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
 from depth_fm.visualization import (
     set_neurips_style,
@@ -54,6 +52,127 @@ torch.set_float32_matmul_precision('high')
 import torch
 from tqdm import tqdm
 import logging
+import torch.fft
+import numpy as np
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def visualize_loss_components(dataloader, output_dir, num_samples=4):
+    """
+    Visualizes the internal data representations used by the auxiliary loss functions.
+    Layout: [Ortho] | [GT DTM] | [Grads 1x] | [Grads 4x] | [FFT Spectrum]
+    """
+    logger.info(f"Generating Loss Component visualizations for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(num_samples, 5, figsize=(20, 4 * num_samples))
+    plt.subplots_adjust(wspace=0.1, hspace=0.1)
+
+    count = 0
+    with tqdm(total=num_samples) as pbar:
+        for batch in dataloader:
+            if count >= num_samples: break
+
+            B = batch["image"].shape[0]
+            for i in range(B):
+                if count >= num_samples: break
+
+                img = batch["image"][i:i + 1]  # (1, 3, H, W)
+                dtm = batch["dtm"][i:i + 1, :1]  # (1, 1, H, W)
+                mask = batch["confidence"][i:i + 1]  # (1, 1, H, W)
+
+                # ---------------------------------------------------------
+                # 1. Multi-Scale Gradients (Simulating MultiScaleGradientLoss)
+                # ---------------------------------------------------------
+                def get_grad_mag(tensor, scale):
+                    if scale > 1:
+                        tensor = F.avg_pool2d(tensor, kernel_size=scale, stride=scale)
+
+                    # Calculate finite differences (exactly as in the loss function)
+                    dy = tensor[:, :, 1:, :] - tensor[:, :, :-1, :]
+                    dx = tensor[:, :, :, 1:] - tensor[:, :, :, :-1]
+
+                    # Pad back to shape for visualization
+                    dy = F.pad(dy, (0, 0, 0, 1))
+                    dx = F.pad(dx, (0, 1, 0, 0))
+
+                    # Magnitude
+                    mag = torch.sqrt(dx ** 2 + dy ** 2)
+                    return mag[0, 0].cpu().numpy()
+
+                grad_1x = get_grad_mag(dtm, scale=1)
+                grad_4x = get_grad_mag(dtm, scale=4)
+
+                # ---------------------------------------------------------
+                # 2. Focal Frequency (Simulating FocalFrequencyLoss)
+                # ---------------------------------------------------------
+                # GT Injection to prevent boundary ringing, just like your FFL code
+                # (Using 0 as dummy prediction since we just want to see GT spectrum)
+                dtm_masked = dtm * mask + 0.0 * (1.0 - mask)
+
+                # 2D Fast Fourier Transform
+                fft = torch.fft.fft2(dtm_masked[0, 0])
+                fft_shift = torch.fft.fftshift(fft)  # Move low frequencies to center
+
+                # Log magnitude for visualization (add 1 to avoid log(0))
+                fft_mag = torch.log(torch.abs(fft_shift) + 1).cpu().numpy()
+
+                # ---------------------------------------------------------
+                # Prep for Plotting
+                # ---------------------------------------------------------
+                img_disp = np.clip((np.transpose(img[0].cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+                dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                mask_np = mask[0, 0].cpu().numpy().astype(bool)
+
+                img_disp[~mask_np] = np.nan
+                dtm_disp[~mask_np] = np.nan
+
+                # Percentile stretches for gradients to handle outliers
+                p2, p98 = np.percentile(grad_1x, [2, 98])
+                grad_1x_disp = np.clip((grad_1x - p2) / (p98 - p2 + 1e-8), 0, 1)
+
+                p2, p98 = np.percentile(grad_4x, [2, 98])
+                grad_4x_disp = np.clip((grad_4x - p2) / (p98 - p2 + 1e-8), 0, 1)
+
+                # Plotting
+                ax_img = axes[count, 0]
+                ax_dtm = axes[count, 1]
+                ax_g1 = axes[count, 2]
+                ax_g4 = axes[count, 3]
+                ax_fft = axes[count, 4]
+
+                ax_img.imshow(img_disp)
+                ax_img.axis("off")
+
+                ax_dtm.imshow(dtm_disp, cmap="terrain")
+                ax_dtm.axis("off")
+
+                ax_g1.imshow(grad_1x_disp, cmap="magma")
+                ax_g1.axis("off")
+
+                ax_g4.imshow(grad_4x_disp, cmap="magma")
+                ax_g4.axis("off")
+
+                # Plasma is a great colormap for frequency domains
+                ax_fft.imshow(fft_mag, cmap="plasma")
+                ax_fft.axis("off")
+
+                if count == 0:
+                    ax_img.set_title("Ortho Input")
+                    ax_dtm.set_title("GT DTM")
+                    ax_g1.set_title("L_grad: 1x Scale Mag")
+                    ax_g4.set_title("L_grad: 4x Scale Mag")
+                    ax_fft.set_title("L_FFL: 2D FFT Spectrum")
+
+                count += 1
+                pbar.update()
+
+    save_path = output_dir / "loss_components_inspection.png"
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor='white')
+    plt.close(fig)
+    logger.info(f"Loss components visualization saved to: {save_path}")
 
 
 @torch.no_grad()
@@ -96,7 +215,8 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
                 if "sun_vector" in batch:
                     sun_vec = batch["sun_vector"][i:i + 1].to(device)
                 else:
-                    sun_vec = torch.tensor([[0.5, -0.5, 1.0]], device=device)
+                    logger.warning("Missing 'sun_vector', estimating via OLS for visualization.")
+                    sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm, img, mask)
 
                 # 2. Convert Ortho to Grayscale for Shading Comparison
                 if img.shape[1] == 3:
@@ -120,9 +240,9 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
                 normals = F.normalize(normals, p=2, dim=1)
 
                 # 4. Lambertian Rendering
-                l_dir = F.normalize(sun_vec, p=2, dim=1).view(1, 3, 1, 1)
+                l_dir = sun_vec.view(1, 3, 1, 1)
                 render = torch.sum(normals * l_dir, dim=1, keepdim=True)
-                render = torch.clamp(render, min=0.0)
+                render = (render * intensity) + ambient
 
                 # ---------------------------------------------------------
                 # Convert to Numpy for plotting
@@ -293,17 +413,18 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     images, dtms, masks = [], [], []
-
-    for batch in dataloader:
-        B = batch["image"].shape[0]
-        for i in range(B):
-            images.append(batch["image"][i].cpu().numpy())
-            dtms.append(batch["dtm"][i].cpu().numpy())
-            masks.append(batch["confidence"][i].cpu().numpy())
+    with tqdm(total=num_samples, desc="Collect samples") as pbar:
+        for batch in dataloader:
+            B = batch["image"].shape[0]
+            for i in range(B):
+                images.append(batch["image"][i].cpu().numpy())
+                dtms.append(batch["dtm"][i].cpu().numpy())
+                masks.append(batch["confidence"][i].cpu().numpy())
+                pbar.update()
+                if len(images) == num_samples:
+                    break
             if len(images) == num_samples:
                 break
-        if len(images) == num_samples:
-            break
 
     # Setup grid: 1 row per sample, 6 columns
     fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
@@ -340,7 +461,7 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
         normed[~mask] = np.nan
         return normed
 
-    for idx in range(num_samples):
+    for idx in tqdm(range(num_samples), desc="Generating thumbnails"):
         ax_img_full = axes[idx, 0]
         ax_dtm_full = axes[idx, 1]
         ax_detrend_full = axes[idx, 2]
@@ -445,7 +566,11 @@ def configure_worker_logger(worker_id):
         force=True  # Overrides any existing silent config
     )
 
-def build_dataloaders(config, split_seed: int = 42):
+
+import concurrent.futures
+
+
+def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
     """Build train/val/test DataLoaders from MarsHiRISEDTM."""
     from dataset.mars_hirise_dtm import MarsHiRISEDTM
     from dataset.hirise_sampler import HiRISEGeoSampler
@@ -459,6 +584,7 @@ def build_dataloaders(config, split_seed: int = 42):
     if isinstance(ortho_type, str):
         ortho_type = [ortho_type]
 
+    # Initialize the base dataset once (this is fast and mostly metadata)
     base_dataset = MarsHiRISEDTM(
         root=hc.root,
         include_ortho=hc.get("include_ortho", True),
@@ -493,9 +619,8 @@ def build_dataloaders(config, split_seed: int = 42):
     dtm_norm = config.data.get("dtm_normalization", "relative")
     stats_path = config.data.get("stats_path")
 
-    loaders = {}
-
-    for split in ("train", "val", "test"):
+    # Helper function to build a single split
+    def _build_split_loader(split: str):
         is_train = (split == "train")
 
         sampler = HiRISEGeoSampler(
@@ -506,7 +631,7 @@ def build_dataloaders(config, split_seed: int = 42):
             **common_sampler_kwargs,
         )
 
-        adapter = DepthFMHiRISEAdapter(
+        adapter = DepthFMHiRISEAdapterCached(
             base_dataset=base_dataset,
             sampler=sampler,
             resolution=resolution,
@@ -516,7 +641,7 @@ def build_dataloaders(config, split_seed: int = 42):
             stats_path=stats_path,
         )
 
-        loaders[split] = DataLoader(
+        loader = DataLoader(
             adapter,
             batch_size=config.training.per_gpu_batch_size,
             shuffle=is_train,
@@ -530,9 +655,43 @@ def build_dataloaders(config, split_seed: int = 42):
         )
 
         logger.info(
-            "DataLoader [%s]: %d samples, batch_size=%d",
+            "DataLoader [%s] ready: %d samples, batch_size=%d",
             split, len(adapter), config.training.per_gpu_batch_size,
         )
+        return split, loader
+
+    loaders = {}
+    splits = ("train", "val", "test")
+
+    if parallel:
+        logger.info("Initializing train, val, and test dataloaders in parallel...")
+
+        # Use ThreadPoolExecutor to run the heavy manifest caching/loading concurrently
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(splits)) as executor:
+            # Submit all three jobs
+            future_to_split = {
+                executor.submit(_build_split_loader, split): split
+                for split in splits
+            }
+
+            # Collect them as they finish
+            for future in concurrent.futures.as_completed(future_to_split):
+                split_name = future_to_split[future]
+                try:
+                    _, loader = future.result()
+                    loaders[split_name] = loader
+                except Exception as exc:
+                    logger.error(f"Failed to build DataLoader for split '{split_name}': {exc}")
+                    raise exc
+    else:
+        logger.info("Initializing train, val, and test dataloaders sequentially...")
+        for split in splits:
+            try:
+                _, loader = _build_split_loader(split)
+                loaders[split] = loader
+            except Exception as exc:
+                logger.error(f"Failed to build DataLoader for split '{split}': {exc}")
+                raise exc
 
     return loaders
 
@@ -577,7 +736,7 @@ def run_single_training(
         return {"test_summary": test_summary, "output_dir": output_dir, "skipped": True}
 
     # Build data
-    loaders = build_dataloaders(config, split_seed=seed)
+    loaders = build_dataloaders(config, split_seed=seed, parallel=config.data.get("parallel_load", False))
 
     # Build model
     module = DepthFMLightningModule(config)
@@ -970,8 +1129,6 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
     df.to_csv(output_dir / "all_runs_metrics.csv", index=False)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1000,6 +1157,8 @@ def main():
                         help="Save a 4x4 grid of random dataset input images and exit")
     parser.add_argument("--view_loss_physics", action="store_true",
                         help="Visualize the photoclinometric normals and shadow rendering")
+    parser.add_argument("--view_loss_components", action="store_true",
+                        help="Visualize the photoclinometric normals and shadow rendering")
 
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -1023,11 +1182,11 @@ def main():
 
     config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type", "depthfm")
 
-    if args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics:
+    if args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
             L.seed_everything(args.seed, workers=True)
-            loaders = build_dataloaders(config, split_seed=args.seed)
+            loaders = build_dataloaders(config, split_seed=args.seed, parallel=config.data.get("parallel_load", False))
             output_path = Path(config.training.output_dir) / "inspection"
 
             if args.analyze_topography:
@@ -1042,7 +1201,10 @@ def main():
                 generate_thumbnail_grids(loaders["val"], output_dir=output_path, num_samples=8)
 
             if args.view_loss_physics:
-                visualize_loss_physics(loaders["train"], output_dir=output_path, num_samples=8)
+                visualize_loss_physics(loaders["val"], output_dir=output_path, num_samples=8)
+
+            if args.view_loss_components:
+                visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
 
             logger.info("Data inspection complete. Exiting pipeline without training.")
         return

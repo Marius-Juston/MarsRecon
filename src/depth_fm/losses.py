@@ -29,11 +29,14 @@ try:
 except ImportError:
     _HAS_FFL = False
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 class PhotoclinometricLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        # REMOVED: self.light_dir = nn.Parameter(...)
 
         sobel_x = torch.tensor([[-1., 0., 1.],
                                 [-2., 0., 2.],
@@ -49,13 +52,11 @@ class PhotoclinometricLoss(nn.Module):
         """Calculates (Nx, Ny, Nz) unit normals from the depth map."""
         B, C, H, W = depth.shape
 
-        # NEW: Spatial scaling factor.
-        # Maps the [-1, 1] normalized Z-axis back to physical proportions relative to the X/Y grid.
+        # Spatial scaling factor
         spatial_scale = max(H, W) / 2.0
 
         padded = F.pad(depth, (1, 1, 1, 1), mode='replicate')
 
-        # Apply the scaling factor to the gradients
         dz_dx = F.conv2d(padded, self.kernel_x) * spatial_scale
         dz_dy = F.conv2d(padded, self.kernel_y) * spatial_scale
 
@@ -67,10 +68,8 @@ class PhotoclinometricLoss(nn.Module):
         return F.normalize(normals, p=2, dim=1)
 
     def forward(self, pred_depth: torch.Tensor, real_ortho: torch.Tensor, mask: torch.Tensor,
-                sun_vectors: torch.Tensor) -> torch.Tensor:
-        """
-        sun_vectors: (B, 3) tensor of precise light directions for this specific batch
-        """
+                sun_vectors: torch.Tensor, ambient: torch.Tensor, intensity: torch.Tensor) -> torch.Tensor:
+
         if pred_depth.shape[1] == 3:
             pred_depth = pred_depth[:, :1]
 
@@ -84,34 +83,55 @@ class PhotoclinometricLoss(nn.Module):
         # 1. Calculate Normals
         normals = self._get_surface_normals(pred_depth)
 
-        # 2. Normalize and reshape the Batch Sun Vectors
-        # Reshape from (B, 3) to (B, 3, 1, 1) so it broadcasts across the HxW spatial grid
+        # 2. Reshape lighting parameters for spatial broadcasting
         l_dir = F.normalize(sun_vectors, p=2, dim=1).view(B, 3, 1, 1)
+        intensity = intensity.view(B, 1, 1, 1)
+        ambient = ambient.view(B, 1, 1, 1)
 
-        # 3. Lambertian Render (Dot product of Normals and Light)
+        # 3. Lambertian Render with Real-World Lighting
         render = torch.sum(normals * l_dir, dim=1, keepdim=True)
-        render = torch.clamp(render, min=0.0)
+        render = (render * intensity) + ambient
 
-        # 4. Masked Pearson Correlation
+        # Clamp to mimic actual camera sensor bounds (-1 to 1 based on your dataloader)
+        render = torch.clamp(render, min=-1.0, max=1.0)
+
+        # 4. Masked Pearson Correlation (Computed Per-Image in Batch)
         valid_mask = mask.bool()
-        if not valid_mask.any():
+
+        # Get valid pixel counts per image. Shape: (B, 1, 1, 1)
+        valid_counts = valid_mask.view(B, -1).sum(dim=1).view(B, 1, 1, 1)
+
+        # Identify which batch items have enough valid pixels to compute correlation
+        valid_batch_items = (valid_counts.squeeze() > 100)
+
+        if not valid_batch_items.any():
             return torch.tensor(0.0, device=pred_depth.device, requires_grad=True)
 
-        r_flat = render[valid_mask]
-        o_flat = ortho_gray[valid_mask]
+        # Zero out invalid pixels so they don't affect the sum
+        r_masked = render * valid_mask
+        o_masked = ortho_gray * valid_mask
 
-        r_centered = r_flat - r_flat.mean()
-        o_centered = o_flat - o_flat.mean()
+        # Compute means per-image
+        r_mean = r_masked.view(B, -1).sum(dim=1).view(B, 1, 1, 1) / valid_counts
+        o_mean = o_masked.view(B, -1).sum(dim=1).view(B, 1, 1, 1) / valid_counts
 
-        cov = torch.sum(r_centered * o_centered)
-        var_r = torch.sum(r_centered ** 2)
-        var_o = torch.sum(o_centered ** 2)
+        # Center the variables (only for valid pixels)
+        r_centered = (render - r_mean) * valid_mask
+        o_centered = (ortho_gray - o_mean) * valid_mask
 
+        # Covariance and Variance per-image. Shape: (B,)
+        cov = (r_centered * o_centered).view(B, -1).sum(dim=1)
+        var_r = (r_centered ** 2).view(B, -1).sum(dim=1)
+        var_o = (o_centered ** 2).view(B, -1).sum(dim=1)
+
+        # Calculate Pearson per-image
         denominator = torch.sqrt(var_r * var_o)
-        if denominator < 1e-6:
-            return torch.tensor(0.0, device=pred_depth.device, requires_grad=True)
+        correlation = cov / (denominator + 1e-8)  # Epsilon prevents divide-by-zero
 
-        return 1.0 - (cov / denominator)
+        # Average the loss only over valid batch items
+        loss = 1.0 - correlation[valid_batch_items].mean()
+
+        return loss
 
 class FlowMatchingVelocityLoss(nn.Module):
     """

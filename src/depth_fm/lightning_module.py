@@ -237,6 +237,8 @@ class DepthFMLightningModule(L.LightningModule):
 
         # Pixel-space losses: project velocity → clean depth estimate (x₀ prediction)
         # x₀_pred = z_t + (1 − t) × v_pred  (rectified flow identity)
+        # Pixel-space losses: project velocity → clean depth estimate (x₀ prediction)
+        # x₀_pred = z_t + (1 − t) × v_pred  (rectified flow identity)
         pred_pix = gt_pix = None
         step = self.global_step
         if self.loss_fn.needs_pixel_decode(step):
@@ -252,7 +254,9 @@ class DepthFMLightningModule(L.LightningModule):
             confidence=batch.get("confidence"),
             global_step=step,
             real_ortho=batch["image"],
-            sun_vector=batch.get("sun_vector")
+            sun_vector=batch.get("sun_vector"),
+            ambient=batch.get("ambient"),  # <--- ADDED
+            intensity=batch.get("intensity")  # <--- ADDED
         )
 
         # Logging

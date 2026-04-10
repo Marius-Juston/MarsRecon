@@ -14,8 +14,11 @@ model:
   full_graph: true
   use_checkpoint: true
 
+  model_type: "depthfm" # none for depthfm, modulated for other
+
 data:
   source: "hirise"
+  parallel_load: true
 
   hirise:
     root: "/scratch/mars_hirise_dtm"
@@ -25,10 +28,10 @@ data:
     download: false
     reuse_cache: true
     target: null
-    bbox: [-150, 15, -90, 70]
+    bbox: [60, 0, 90, 30]
 
   sampler:
-    size: 0.009
+    size: 0.018
     length: null   # patches per epoch (null = all available)
 
   # Train/val/test split
@@ -49,14 +52,18 @@ data:
   random_flip: true
   brightness_jitter: 0.1
 
+  signal_boost: 10.0
+
 training:
+  enable: true
+
   per_gpu_batch_size: 4
   gradient_accumulation_steps: 8
   num_gpus: 4
-  max_steps: 50000
+  max_steps: 10000
   show_train_vis: true
 
-  learning_rate: 3.0e-5
+  learning_rate: 2.0e-4
   weight_decay: 0.01
   lr_scheduler: "cosine"
   lr_warmup_steps: 1000
@@ -68,6 +75,8 @@ training:
   max_grad_norm: 1.0
   mixed_precision: "bf16"
 
+  random_jitter: false
+
   flow_matching:
     timestep_sampling: "logit_normal"
     logit_normal_mean: 0.0
@@ -77,15 +86,17 @@ training:
 
   losses:
     velocity_weight: 1.0
-    normals_weight: 0.0
-    normals_start_step: 250
-    grad_weight: 0.0         # multi-scale gradient loss (no extra install)
-    grad_start_step: 250
+    normals_weight: 1.0
+    normals_start_step: 0
+    grad_weight: 1.0         # multi-scale gradient loss (no extra install)
+    grad_start_step: 0
     grad_scales: [1, 2, 4]
     # Focal Frequency Loss (requires: pip install focal-frequency-loss)
     freq_weight: 0.0
     freq_start_step: 1000
     freq_alpha: 1.0
+    photo_weight: 5.0
+    photo_start_step: 500
 
     use_confidence_weighting: true
 
@@ -111,7 +122,7 @@ training:
   resume_from: null
 
   use_ema: true
-  ema_decay: 0.9999
+  ema_decay: 0.99
 
   # 128 cores / 4 GPUs = 32 workers per process
   num_workers: 32
