@@ -49,6 +49,7 @@ export OMP_NUM_THREADS=32
 export TOKENIZERS_PARALLELISM=false
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_DISABLE=1
+export TQDM_MININTERVAL=1
 
 # Reduce memory fragmentation on large-VRAM cards (A6000 = 48 GB)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

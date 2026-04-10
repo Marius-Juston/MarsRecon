@@ -191,6 +191,7 @@ class SpatialTransformer(nn.Module):
     Then applies standard transformer blocks.
     Finally, reshapes back to image dimensions.
     """
+    _is_spatial_transformer = True  # tag for compile-friendly dispatch
 
     def __init__(
             self,

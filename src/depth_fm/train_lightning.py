@@ -779,6 +779,7 @@ def run_single_training(
         accumulate_grad_batches=config.training.gradient_accumulation_steps,
         enable_progress_bar=True,
         default_root_dir=str(output_dir),
+        use_distributed_sampler=False
     )
 
     # Train (with resumption)

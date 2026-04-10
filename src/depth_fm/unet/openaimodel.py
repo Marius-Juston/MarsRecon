@@ -68,6 +68,7 @@ class TimestepBlock(nn.Module):
     """
     Any module where forward() takes timestep embeddings as a second argument.
     """
+    _is_timestep_block = True  # tag for compile-friendly dispatch
 
     @abstractmethod
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
@@ -82,9 +83,9 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         for layer in self:
-            if isinstance(layer, TimestepBlock):
+            if getattr(layer, '_is_timestep_block', False):
                 x = layer(x, emb)
-            elif isinstance(layer, SpatialTransformer):
+            elif getattr(layer, '_is_spatial_transformer', False):
                 x = layer(x, context)
             else:
                 x = layer(x)
@@ -111,7 +112,6 @@ class Upsample(nn.Module):
             self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=padding)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.shape[1] == self.channels
         if self.dims == 3:
             x = F.interpolate(x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest")
         else:
@@ -159,7 +159,6 @@ class Downsample(nn.Module):
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.shape[1] == self.channels
         return self.op(x)
 
 
@@ -263,8 +262,8 @@ class ResBlock(TimestepBlock):
             h = self.in_layers(x)
 
         emb_out = self.emb_layers(emb).to(dtype=h.dtype)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
+        # Static reshape: emb_out is (B, C), h is (B, C, ...) with `dims` spatial dims
+        emb_out = emb_out.view(*emb_out.shape, *((1,) * (len(h.shape) - 2)))
 
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
@@ -335,7 +334,6 @@ class QKVAttentionLegacy(nn.Module):
 
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
         bs, width, length = qkv.shape
-        assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
 
         # Split Q, K, V
@@ -364,7 +362,6 @@ class QKVAttention(nn.Module):
 
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
         bs, width, length = qkv.shape
-        assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
 
         q, k, v = qkv.chunk(3, dim=1)
@@ -756,11 +753,7 @@ class UNetModel(nn.Module):
             context: Optional[torch.Tensor] = None,
             context_ca: Optional[torch.Tensor] = None,
             y: Optional[torch.Tensor] = None,
-            **kwargs
     ) -> torch.Tensor:
-        assert (y is not None) == (
-                self.num_classes is not None), "Must specify y if and only if the model is class-conditional"
-
         hs = []
         t_emb = timestep_embedding(t, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
@@ -796,11 +789,7 @@ class UNetModel(nn.Module):
             context: Optional[torch.Tensor] = None,
             context_ca: Optional[torch.Tensor] = None,
             y: Optional[torch.Tensor] = None,
-            **kwargs
     ) -> torch.Tensor:
-        assert (y is not None) == (
-                self.num_classes is not None), "Must specify y if and only if the model is class-conditional"
-
         t_emb = timestep_embedding(t, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 

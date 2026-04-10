@@ -18,7 +18,7 @@ model:
 
 data:
   source: "hirise"
-  parallel_load: true
+  parallel_load: false
   use_wds: true
 
   hirise:
@@ -59,10 +59,10 @@ training:
   enable: true
 
   per_gpu_batch_size: 4
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   num_gpus: 4
   max_steps: 10000
-  show_train_vis: true
+  show_train_vis: false
 
   learning_rate: 2.0e-4
   weight_decay: 0.01
@@ -97,12 +97,12 @@ training:
     freq_start_step: 1000
     freq_alpha: 1.0
     photo_weight: 5.0
-    photo_start_step: 500
+    photo_start_step: 0
 
     use_confidence_weighting: true
 
   # Validation and checkpointing
-  val_every_steps: 0.5
+  val_every_steps: 80
   save_every_steps: 500
   log_every_steps: 50
   num_val_samples: 8
@@ -126,6 +126,6 @@ training:
   ema_decay: 0.99
 
   # 128 cores / 4 GPUs = 32 workers per process
-  num_workers: 16
+  num_workers: 24
   pin_memory: true
-  prefetch_factor: 32
+  prefetch_factor: 4

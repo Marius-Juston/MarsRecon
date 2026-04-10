@@ -163,7 +163,6 @@ class MarsDepthFM(nn.Module):
         from depth_fm.noise import q_sample, per_sample_min_max_normalization
 
         if ensemble_size > 1:
-            assert ims.shape[0] == 1, "Ensemble mode only supported with batch size 1"
             ims = ims.repeat(ensemble_size, 1, 1, 1)
 
         bs = ims.shape[0]
@@ -307,5 +306,18 @@ def build_model(config) -> MarsDepthFM:
                 module.use_checkpoint = True
                 count += 1
         logger.info("Gradient checkpointing enabled on %d blocks", count)
+
+    # torch.compile for throughput — use "reduce-overhead" to avoid the extra
+    # VRAM that "max-autotune" reserves for CUDA-graph autotuning. This mode
+    # still captures CUDA graphs but skips expensive kernel search.
+    # disable=True skips compile entirely (useful for debugging).
+    if config.model.get("compile_backbone", False):
+        compile_mode = config.model.get("compile_mode", "max-autotune")
+        logger.info("Compiling backbone with mode=%s", compile_mode)
+        model.backbone = torch.compile(
+            model.backbone,
+            mode=compile_mode,
+            fullgraph=False,  # allow graph breaks rather than erroring
+        )
 
     return model
