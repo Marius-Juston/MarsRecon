@@ -109,11 +109,19 @@ time PYTHONPATH=src uv run -m src.dataset.compute_dataset_stats --dtm
 Converting JP2 files to Cloud Optimised GeoTIFF dramatically speeds up random-window reads:
 
 ```bash
-uv run python -m src.preprocessing --root /scratch/mars_hirise --workers 4
-uv run python -m src.preprocessing --root /scratch/mars_hirise_dtm --workers 4
+time PYTHONPATH=src uv run python -m src.dataset.preprocessing --root /scratch/mars_hirise --workers 4
+time PYTHONPATH=src uv run python -m src.dataset.preprocessing --root /scratch/mars_hirise_dtm --workers 4
 ```
 
 The dataset transparently prefers `.tif` COG sidecars when they exist alongside `.JP2` files.
+
+## WebDataset
+
+To have even faster dataset throughput you can convert the information for the WebDataset .tar format
+
+```bash
+PYTHONPATH=src uv run -m src.depth_fm.build_webdataset
+```
 
 ## Running
 

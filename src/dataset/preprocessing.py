@@ -54,7 +54,8 @@ _OVERVIEW_RESAMPLING = rasterio.enums.Resampling.average
 #: Base rasterio profile applied to every COG output (integer / uint imagery).
 _COG_CREATION_OPTIONS: dict = {
     "driver": "GTiff",
-    "compress": "deflate",
+    "compress": "zstd",  # <-- Switch to Zstandard for extreme read speed
+    "zstd_level": 1,  # <-- Level 1 prioritizes decompression speed over file size
     "predictor": 2,  # horizontal differencing — good for imagery
     "tiled": True,
     "blockxsize": 512,
@@ -237,35 +238,32 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                 # (CPU-intensive on gigabytes of data that are immediately
                 # discarded).  Compression is applied only in the final
                 # rasterio.shutil.copy call below.
-                for key in ("lossless", "quality", "compress", "predictor"):
+                for key in ("lossless", "quality", "compress", "predictor", "zstd_level"):
                     profile.pop(key, None)
 
-                logger.debug("Writing intermediate GeoTIFF for %s …", jp2_path.name)
-                with rasterio.open(tmp, "w", **profile) as dst:
-                    for band_idx in src.indexes:
-                        band_data = src.read(band_idx)
-                        dst.write(band_data, band_idx)
-                        del band_data  # release decompressed array before next band
-                    dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
-                    dst.update_tags(
-                        ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name
-                    )
+                logger.debug("Writing intermediate GeoTIFF to RAM for %s …", jp2_path.name)
+
+                with rasterio.MemoryFile() as memfile:
+                    with memfile.open(**profile) as dst:
+                        for band_idx in src.indexes:
+                            band_data = src.read(band_idx)
+                            dst.write(band_data, band_idx)
+                            del band_data
+
+                        dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
+                        dst.update_tags(ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name)
+
+                        # Second pass: copy to final COG with overviews embedded.
+                        # Use _COG_CREATION_OPTIONS directly — it already carries compress,
+                        # predictor, tiling, and copy_src_overviews.  Deriving opts from
+                        # `profile` would omit compression because we stripped it above.
+
+                        # Second pass: copy directly from RAM to the final NVMe file
+                        rasterio.shutil.copy(dst, cog, **_COG_CREATION_OPTIONS)
 
         # Source JP2 is now closed; release any lingering references before the
         # second pass so the decompressed pixel data can be reclaimed.
         gc.collect()
-
-        # Second pass: copy to final COG with overviews embedded.
-        # Use _COG_CREATION_OPTIONS directly — it already carries compress,
-        # predictor, tiling, and copy_src_overviews.  Deriving opts from
-        # `profile` would omit compression because we stripped it above.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message=".*geotransform.*|.*identity matrix.*",
-            )
-            rasterio.shutil.copy(tmp, cog, **_COG_CREATION_OPTIONS)
 
         logger.info("COG written: %s", cog.name)
         return cog
@@ -339,7 +337,7 @@ def img_to_cog(img_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                     bigtiff="IF_SAFER",
                 )
                 # Strip JP2-specific keys that don't apply
-                for key in ("lossless", "quality", "compress", "predictor"):
+                for key in ("lossless", "quality", "compress", "predictor", "zstd_level"):
                     profile.pop(key, None)
 
                 # Ensure float32 dtype for elevation data
@@ -362,28 +360,25 @@ def img_to_cog(img_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                     src.height,
                     src.count,
                 )
-                with rasterio.open(tmp, "w", **profile) as dst:
-                    for band_idx in src.indexes:
-                        band_data = src.read(band_idx)
-                        dst.write(band_data, band_idx)
-                        del band_data
-                    dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
-                    dst.update_tags(
-                        ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name
-                    )
+                logger.debug("Writing intermediate DTM GeoTIFF to RAM for %s …", img_path.name)
 
-        gc.collect()
+                # THE MAGIC: Use RAM instead of NVMe
+                with rasterio.MemoryFile() as memfile:
+                    with memfile.open(**profile) as dst:
+                        for band_idx in src.indexes:
+                            band_data = src.read(band_idx)
+                            dst.write(band_data, band_idx)
+                            del band_data
 
-        # Second pass: copy to final COG with float predictor
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message=".*geotransform.*|.*identity matrix.*",
-            )
-            rasterio.shutil.copy(tmp, cog, **_COG_CREATION_OPTIONS_FLOAT)
+                        dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
+                        dst.update_tags(ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name)
 
-        logger.info("DTM COG written: %s", cog.name)
+                        # Copy directly from RAM to NVMe
+                        rasterio.shutil.copy(dst, cog, **_COG_CREATION_OPTIONS_FLOAT)
+
+            gc.collect()
+
+            logger.info("DTM COG written: %s", cog.name)
         return cog
 
     except rasterio.errors.RasterioIOError as exc:

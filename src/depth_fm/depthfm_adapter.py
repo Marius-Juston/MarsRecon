@@ -42,7 +42,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 from pathlib import Path
 from typing import Literal
 
@@ -51,6 +50,8 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
+
+from dataset.mars_hirise_dtm import MarsHiRISEDTM
 
 logger = logging.getLogger(__name__)
 
@@ -474,7 +475,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
         self.use_manifest = use_manifest
         self.manifest_workers = manifest_workers
-        self.manifest_dir = Path(manifest_dir)
+        self.manifest_dir = self.base.root / Path(manifest_dir)
 
         # Load global quantiles
         (
@@ -597,7 +598,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             if ortho.ndim == 4: ortho = ortho[0]
 
             # -------------------------------------------------------------
-            # 1. Masking and Resizing (Moved UP so OLS can use it)
+            # 1. Masking and Resizing
             # -------------------------------------------------------------
             dtm_resized = _safe_resize(elevation, self.resolution, has_nans=True)
             image_resized = _safe_resize(ortho, self.resolution)
@@ -609,42 +610,29 @@ class DepthFMHiRISEAdapterCached(Dataset):
             valid_ratio = valid_mask_resized.mean().item()
 
             # -------------------------------------------------------------
-            # 2. Sun Vector Math (Now with OLS Fallback)
-            # -------------------------------------------------------------
-            meta_list = sample.get("meta", [])
-            meta_key = f"{key}_meta"
-
-            if meta_list and meta_key in meta_list[0]:
-                # We have metadata, use standard orbital mechanics
-                incidence = meta_list[0][meta_key]["incidence_angle"]
-                azimuth = meta_list[0][meta_key]["solar_azimuth"]
-
-                inc_rad = math.radians(incidence)
-                az_rad = math.radians(azimuth)
-                sun_x = -math.sin(inc_rad) * math.cos(az_rad)
-                sun_y = -math.sin(inc_rad) * math.sin(az_rad)
-                sun_z = math.cos(inc_rad)
-
-                # Metadata doesn't contain scene brightness, provide safe defaults
-                intensity_val = 1.0
-                ambient_val = 0.3
-            else:
-                # Metadata missing! Use OLS on the resized tensors
-                sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_resized, image_resized, valid_mask_resized)
-
-                sun_x = sun_vec[0].item()
-                sun_y = sun_vec[1].item()
-                sun_z = sun_vec[2].item()
-                intensity_val = intensity.item()
-                ambient_val = ambient.item()
-
-            # -------------------------------------------------------------
-            # 3. Heavy Math Operations
+            # 2. Heavy Math Operations
             # -------------------------------------------------------------
             residual = compute_topographic_residual(dtm_resized, valid_mask_resized) if valid_ratio >= 0.85 else 0.0
 
             elev_valid_native = torch.isfinite(elevation) & (elevation != 0.0)
             is_tin = is_tin_artifact(elevation, elev_valid_native, threshold=0.15) if valid_ratio >= 0.85 else True
+
+            # -------------------------------------------------------------
+            # 3. Sun Vector Math (Fixed)
+            # -------------------------------------------------------------
+            # We MUST normalize the data before computing the OLS sun vector because
+            # the loss function renders shadows in the [-1, 1] normalized latent space.
+            # Physical metadata is incompatible because local scaling distorts Z geometry.
+            dtm_norm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
+            image_norm = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
+
+            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_norm, image_norm, valid_mask_resized)
+
+            sun_x = sun_vec[0].item()
+            sun_y = sun_vec[1].item()
+            sun_z = sun_vec[2].item()
+            intensity_val = intensity.item()
+            ambient_val = ambient.item()
 
             return {
                 "idx": idx,
@@ -731,11 +719,11 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
                 sx, sy = sun_vector[0].clone(), sun_vector[1].clone()
                 if k_rot == 1:
-                    sun_vector[0], sun_vector[1] = -sy, sx
+                    sun_vector[0], sun_vector[1] = sy, -sx
                 elif k_rot == 2:
                     sun_vector[0], sun_vector[1] = -sx, -sy
                 elif k_rot == 3:
-                    sun_vector[0], sun_vector[1] = sy, -sx
+                    sun_vector[0], sun_vector[1] = -sy, sx
 
         # Brightness jitter
         if getattr(self, 'is_train', False) and getattr(self, 'bright_jitter', 0) > 0:

@@ -20,10 +20,25 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
+import os
 from copy import deepcopy
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# GLOBAL GDAL/IO OPTIMIZATIONS (For 256-Core / NVMe setups)
+# ---------------------------------------------------------------------------
+# Force GDAL to be as fast and silent as possible, bypassing network checks
+os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
+os.environ["VSI_CACHE"] = "TRUE"
+# Give GDAL 500MB of cache per worker
+os.environ["VSI_CACHE_SIZE"] = "500000000"
+# Use up to 10% of RAM for GDAL caching
+os.environ["GDAL_CACHEMAX"] = "10%"
+# Keep up to 1024 file descriptors open in the background per worker
+os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
 
 import lightning as L
 import torch
@@ -35,6 +50,7 @@ from lightning.pytorch.callbacks import (
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+import webdataset as wds
 
 from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_ols
 from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
@@ -194,7 +210,9 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
     kx = sobel_x.view(1, 1, 3, 3)
     ky = sobel_y.view(1, 1, 3, 3)
 
-    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+    n_cols = 5
+    scale = 4
+    fig, axes = plt.subplots(num_samples, n_cols, figsize=(n_cols * scale, scale * num_samples))
     plt.subplots_adjust(wspace=0.1, hspace=0.1)
 
     count = 0
@@ -212,11 +230,12 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
                 mask = batch["confidence"][i:i + 1].to(device)  # (1, 1, H, W)
 
                 # Fallback if sun_vector is missing, otherwise grab it
-                if "sun_vector" in batch:
-                    sun_vec = batch["sun_vector"][i:i + 1].to(device)
-                else:
-                    logger.warning("Missing 'sun_vector', estimating via OLS for visualization.")
-                    sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm, img, mask)
+                sun_vec = batch["sun_vector"][i:i + 1].to(device)
+
+                intensity = batch["intensity"][i:i + 1].to(device)
+                ambient = batch["ambient"][i:i + 1].to(device)
+
+                sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
 
                 # 2. Convert Ortho to Grayscale for Shading Comparison
                 if img.shape[1] == 3:
@@ -240,6 +259,10 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
                 normals = F.normalize(normals, p=2, dim=1)
 
                 # 4. Lambertian Rendering
+                l_dir_gt = sun_vec_gt.view(1, 3, 1, 1)
+                render_gt = torch.sum(normals * l_dir_gt, dim=1, keepdim=True)
+                render_gt = (render_gt * intensity_gt) + ambient_gt
+
                 l_dir = sun_vec.view(1, 3, 1, 1)
                 render = torch.sum(normals * l_dir, dim=1, keepdim=True)
                 render = (render * intensity) + ambient
@@ -257,18 +280,21 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
 
                 # Render is already [0, 1]
                 render_disp = render[0, 0].cpu().numpy()
+                render_disp_gt = render_gt[0, 0].cpu().numpy()
 
                 # Apply mask so nodata regions render as blank white
                 img_disp[~mask_np] = np.nan
                 dtm_disp[~mask_np] = np.nan
                 normals_disp[~mask_np] = np.nan
                 render_disp[~mask_np] = np.nan
+                render_disp_gt[~mask_np] = np.nan
 
                 # Plotting
                 ax_ortho = axes[count, 0]
                 ax_dtm = axes[count, 1]
                 ax_normals = axes[count, 2]
                 ax_render = axes[count, 3]
+                ax_render_gt = axes[count, 4]
 
                 ax_ortho.imshow(img_disp, cmap="gray")
                 ax_ortho.axis("off")
@@ -282,11 +308,15 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
                 ax_render.imshow(render_disp, cmap="gray")
                 ax_render.axis("off")
 
+                ax_render_gt.imshow(render_disp_gt, cmap="gray")
+                ax_render_gt.axis("off")
+
                 if count == 0:
                     ax_ortho.set_title("Real Ortho (Gray)")
                     ax_dtm.set_title("GT DTM")
                     ax_normals.set_title("Calculated Surface Normals")
                     ax_render.set_title("Lambertian Render (Shadows)")
+                    ax_render_gt.set_title("Lambertian Render check (Shadows)")
 
                 count += 1
                 pbar.update()
@@ -570,14 +600,112 @@ def configure_worker_logger(worker_id):
 import concurrent.futures
 
 
+def configure_worker_logger(worker_id):
+    """Forces the spawned PyTorch worker to actually print INFO logs."""
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"[Worker {worker_id}] %(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True
+    )
+
+
+def get_wds_cache_key(config) -> str:
+    """Generates a deterministic hash representing the exact WebDataset configuration."""
+    key_parts = {
+        "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
+        "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
+        "resolution": config.data.get("resolution", 512),
+        "dtm_normalization": config.data.get("dtm_normalization", "relative"),
+    }
+    raw = json.dumps(key_parts, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def rename_wds_keys(sample):
+    """Maps decoded WDS .pth keys back to their core names."""
+    out = {}
+    for k, v in sample.items():
+        if k.endswith(".pth"):
+            out[k[:-4]] = v
+        elif k != "__key__":
+            out[k] = v
+    return out
+
+
 def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
     """Build train/val/test DataLoaders from MarsHiRISEDTM."""
-    from dataset.mars_hirise_dtm import MarsHiRISEDTM
-    from dataset.hirise_sampler import HiRISEGeoSampler
-    from torchgeo.samplers import Units
 
     hc = config.data.hirise
     sc = config.data.sampler
+    splits = ("train", "val", "test")
+
+    # 1. Attempt WebDataset Initialization (Preferred for Speed)
+    use_wds_pref = config.data.get("use_wds", True)
+    wds_hash = get_wds_cache_key(config)
+    wds_root = Path(hc.root) / f"wds_cache_{wds_hash}"
+
+    wds_available = all((wds_root / split / "_SUCCESS").exists() for split in splits)
+
+    if use_wds_pref and wds_available:
+        logger.info(f"Valid WebDataset cache found at {wds_root}. Using WDS for FASTEST I/O.")
+
+        import glob
+
+        loaders = {}
+        for split in splits:
+            is_train = (split == "train")
+
+            # 1. Resolve the wildcard into a concrete list of file paths
+            url_pattern = str(wds_root / split / f"{split}-*.tar")
+            urls = sorted(glob.glob(url_pattern))
+
+            if not urls:
+                raise FileNotFoundError(f"No WebDataset shards found matching pattern: {url_pattern}")
+
+            pipeline = [
+                # 2. Pass the resolved list, not the string pattern
+                wds.SimpleShardList(urls),
+                wds.split_by_node,
+                wds.split_by_worker,
+                wds.tarfile_to_samples(),
+                wds.decode("torch"),
+                wds.map(rename_wds_keys),
+            ]
+
+            if is_train:
+                # WDS detshuffle shuffles shards once per epoch. Inner shuffle manages intra-shard variance.
+                pipeline.insert(1, wds.detshuffle())
+                pipeline.append(wds.shuffle(1000))
+
+            pipeline.append(wds.batched(config.training.per_gpu_batch_size, partial=False))
+
+            dataset = wds.DataPipeline(*pipeline)
+
+            loaders[split] = wds.WebLoader(
+                dataset,
+                batch_size=None,  # Batched in the WDS pipeline natively
+                shuffle=False,
+                num_workers=config.training.num_workers if is_train else 4,
+                pin_memory=config.training.pin_memory,
+                prefetch_factor=config.training.get("prefetch_factor", 4) if is_train else 2,
+                persistent_workers=True,
+                worker_init_fn=configure_worker_logger if is_train else None
+            )
+
+        return loaders
+
+    # 2. Fallback to Standard TorchGeo Dynamic DataLoader
+    if use_wds_pref:
+        logger.warning(f"WebDataset requested but cache is missing or incomplete at {wds_root}.")
+        logger.warning(
+            f"Falling back to STANDARD DataLoader. Consider running the extraction script for faster training.")
+    else:
+        logger.info("WebDataset disabled in config. Using STANDARD DataLoader.")
+
+    from dataset.mars_hirise_dtm import MarsHiRISEDTM
+    from dataset.hirise_sampler import HiRISEGeoSampler
+    from torchgeo.samplers import Units
 
     bbox_tuple = tuple(hc.bbox) if hc.get("bbox") else None
     ortho_type = hc.get("ortho_type", "RED")
@@ -596,6 +724,8 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
         target=hc.get("target"),
         return_meta=True
     )
+
+    base_dataset._raw_index = None
 
     split_fractions = tuple(config.data.get("split_fractions", [0.8, 0.1, 0.1]))
     split_method = config.data.get("split_method", "geographic")
@@ -650,7 +780,7 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True):
             prefetch_factor=config.training.get("prefetch_factor", 4) if is_train else 2,
             drop_last=is_train,
             persistent_workers=True,
-            multiprocessing_context="spawn",
+            multiprocessing_context="fork",
             worker_init_fn=configure_worker_logger
         )
 
@@ -1186,6 +1316,7 @@ def main():
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
             L.seed_everything(args.seed, workers=True)
+
             loaders = build_dataloaders(config, split_seed=args.seed, parallel=config.data.get("parallel_load", False))
             output_path = Path(config.training.output_dir) / "inspection"
 

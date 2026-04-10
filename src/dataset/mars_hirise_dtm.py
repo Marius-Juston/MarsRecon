@@ -66,6 +66,8 @@ _ORTHO_PATTERN = re.compile(
 
 OrthoType = Literal["RED", "IRB"]
 
+_RASTERIO_PARAMS = dict(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", VSI_CACHE=True)
+
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -521,31 +523,32 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             if not actual_path or not actual_path.exists():
                 return 0.0
 
-            with rasterio.open(actual_path) as src:
-                src_crs = src.crs
-                if src_crs is None:
-                    return 1.0  # Assume it overlaps if we can't project
+            with rasterio.Env(**_RASTERIO_PARAMS):
+                with rasterio.open(actual_path) as src:
+                    src_crs = src.crs
+                    if src_crs is None:
+                        return 1.0  # Assume it overlaps if we can't project
 
-                fl, fb, fr, ft = rasterio.warp.transform_bounds(src_crs, self.mars_crs, *src.bounds)
+                    fl, fb, fr, ft = rasterio.warp.transform_bounds(src_crs, self.mars_crs, *src.bounds)
 
-                # Normalize to [-180, 180]
-                fl_norm = ((fl + 180.0) % 360.0) - 180.0
-                fr_norm = ((fr + 180.0) % 360.0) - 180.0
+                    # Normalize to [-180, 180]
+                    fl_norm = ((fl + 180.0) % 360.0) - 180.0
+                    fr_norm = ((fr + 180.0) % 360.0) - 180.0
 
-                if fl_norm > fr_norm:
-                    # Antimeridian crossing: split into two bounding boxes
-                    ortho_geom = shapely.ops.unary_union([
-                        box(fl_norm, fb, 180.0, ft),
-                        box(-180.0, fb, fr_norm, ft)
-                    ])
-                else:
-                    ortho_geom = box(fl_norm, fb, fr_norm, ft)
+                    if fl_norm > fr_norm:
+                        # Antimeridian crossing: split into two bounding boxes
+                        ortho_geom = shapely.ops.unary_union([
+                            box(fl_norm, fb, 180.0, ft),
+                            box(-180.0, fb, fr_norm, ft)
+                        ])
+                    else:
+                        ortho_geom = box(fl_norm, fb, fr_norm, ft)
 
-                if dtm_geom.area == 0:
-                    return 0.0
+                    if dtm_geom.area == 0:
+                        return 0.0
 
-                intersection = dtm_geom.intersection(ortho_geom)
-                return intersection.area / dtm_geom.area
+                    intersection = dtm_geom.intersection(ortho_geom)
+                    return intersection.area / dtm_geom.area
 
         except Exception as e:
             logger.debug("Failed overlap check for %s: %s", ortho_path, e)
@@ -950,30 +953,31 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             return None
 
         try:
-            with rasterio.open(dtm_path) as src:
-                # 1. Translate Geographic Lat/Lon into the file's Native Meters
-                native_bounds = rasterio.warp.transform_bounds(
-                    self.mars_crs, src.crs, x.start, y.start, x.stop, y.stop
-                )
+            with rasterio.Env(**_RASTERIO_PARAMS):
+                with rasterio.open(dtm_path) as src:
+                    # 1. Translate Geographic Lat/Lon into the file's Native Meters
+                    native_bounds = rasterio.warp.transform_bounds(
+                        self.mars_crs, src.crs, x.start, y.start, x.stop, y.stop
+                    )
 
-                # 2. Get the pixel window using the native coordinates
-                window = rasterio.windows.from_bounds(*native_bounds, transform=src.transform)
+                    # 2. Get the pixel window using the native coordinates
+                    window = rasterio.windows.from_bounds(*native_bounds, transform=src.transform)
 
-                # 3. Explicitly round to integer pixel dimensions
-                h, w = int(round(window.height)), int(round(window.width))
+                    # 3. Explicitly round to integer pixel dimensions
+                    h, w = int(round(window.height)), int(round(window.width))
 
-                if h <= 0 or w <= 0:
-                    return None
+                    if h <= 0 or w <= 0:
+                        return None
 
-                # 4. Read raw pixels enforcing the exact shape
-                data = src.read(1, window=window, out_shape=(h, w), boundless=True, fill_value=_DTM_NODATA)
-                data = data.astype(np.float32)
+                    # 4. Read raw pixels enforcing the exact shape
+                    data = src.read(1, window=window, out_shape=(h, w), boundless=True, fill_value=_DTM_NODATA)
+                    data = data.astype(np.float32)
 
-                # 5. Safely mask the extreme nodata values BEFORE any resizing
-                valid = (data > -1e30) & np.isfinite(data)
-                data[~valid] = np.nan
+                    # 5. Safely mask the extreme nodata values BEFORE any resizing
+                    valid = (data > -1e30) & np.isfinite(data)
+                    data[~valid] = np.nan
 
-                return torch.from_numpy(data).unsqueeze(0)
+                    return torch.from_numpy(data).unsqueeze(0)
 
         except rasterio.errors.RasterioIOError as exc:
             logger.warning("Could not open DTM %s: %s", dtm_path, exc)
@@ -1000,36 +1004,37 @@ class MarsHiRISEDTM(MarsHiRISEBase):
         band_map = _IRB_BAND.copy() if color == "IRB" else _RED_BAND.copy()
 
         try:
-            with rasterio.open(jp2_path) as src:
-                # 1. Translate coordinates to Native CRS
-                native_bounds = rasterio.warp.transform_bounds(
-                    self.mars_crs, src.crs, x.start, y.start, x.stop, y.stop
-                )
+            with rasterio.Env(**_RASTERIO_PARAMS):
+                with rasterio.open(jp2_path) as src:
+                    # 1. Translate coordinates to Native CRS
+                    native_bounds = rasterio.warp.transform_bounds(
+                        self.mars_crs, src.crs, x.start, y.start, x.stop, y.stop
+                    )
 
-                window = rasterio.windows.from_bounds(*native_bounds, transform=src.transform)
-                h, w = int(round(window.height)), int(round(window.width))
+                    window = rasterio.windows.from_bounds(*native_bounds, transform=src.transform)
+                    h, w = int(round(window.height)), int(round(window.width))
 
-                if h <= 0 or w <= 0:
-                    return None
+                    if h <= 0 or w <= 0:
+                        return None
 
-                bands = []
-                for ch_name, band_idx in band_map.items():
-                    if band_idx > src.count:
-                        bands.append(np.zeros((h, w), dtype=np.float32))
-                        continue
+                    bands = []
+                    for ch_name, band_idx in band_map.items():
+                        if band_idx > src.count:
+                            bands.append(np.zeros((h, w), dtype=np.float32))
+                            continue
 
-                    # Read raw pixels enforcing the exact shape
-                    data = src.read(band_idx, window=window, out_shape=(h, w), boundless=True, fill_value=0.0)
-                    data = data.astype(np.float32)
+                        # Read raw pixels enforcing the exact shape
+                        data = src.read(band_idx, window=window, out_shape=(h, w), boundless=True, fill_value=0.0)
+                        data = data.astype(np.float32)
 
-                    # Radiometric calibration
-                    nodata_mask = data == 0.0
-                    data = data * meta.scaling_factor + meta.offset
-                    np.clip(data, 0.0, 1.0, out=data)
-                    data[nodata_mask] = 0.0
-                    bands.append(data)
+                        # Radiometric calibration
+                        nodata_mask = data == 0.0
+                        data = data * meta.scaling_factor + meta.offset
+                        np.clip(data, 0.0, 1.0, out=data)
+                        data[nodata_mask] = 0.0
+                        bands.append(data)
 
-                return torch.from_numpy(np.stack(bands))
+                    return torch.from_numpy(np.stack(bands))
 
         except rasterio.errors.RasterioIOError as exc:
             logger.warning("Could not open ortho %s: %s", jp2_path, exc)
@@ -1065,6 +1070,15 @@ def main(argv=None) -> None:  # pragma: no cover
     setup_logging()
 
     import argparse
+    import os
+
+    os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
+    os.environ["VSI_CACHE"] = "TRUE"
+    os.environ["VSI_CACHE_SIZE"] = "500000000"  # Give GDAL 500MB of cache per worker
+    os.environ["GDAL_CACHEMAX"] = "60%"
+    os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
+    os.environ["VSI_CACHE"] = "FALSE"
+    os.environ["GDAL_NUM_THREADS"] = "1"
 
     parser = argparse.ArgumentParser(
         description="Run a sample test on the HiRISE DTM dataset"
@@ -1140,10 +1154,12 @@ def main(argv=None) -> None:  # pragma: no cover
     from dataset.hirise_sampler import HiRISEGeoSampler
 
     sampler = HiRISEGeoSampler(
-        dataset, size=0.01,
+        dataset, size=0.018,
         length=None if args.length <= 0 else args.length,
         units=Units.CRS,
     )
+
+    dataset._raw_index = None
 
     logger.info("Number of samples: %d", len(sampler))
 
@@ -1151,12 +1167,20 @@ def main(argv=None) -> None:  # pragma: no cover
 
     dataloader = DataLoader(
         dataset, sampler=sampler,
-        num_workers=4, multiprocessing_context="spawn", prefetch_factor=10,
+        num_workers=8, multiprocessing_context="fork", prefetch_factor=32,
+        persistent_workers=True
     )
 
     output_path_3d = output_path / '3d'
 
+    import time
+
+    start_time = time.time()
+
     for i, sample in enumerate(dataloader):
+        if i == 0:
+            logger.info(f"Time to first entry {time.time() - start_time}")
+
         if args.d:
             output_path_3d.mkdir(parents=True, exist_ok=True)
             fig = dataset.plot3d(sample)
