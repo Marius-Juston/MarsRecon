@@ -170,8 +170,11 @@ def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold
     Detects artificial TIN (Triangular Irregular Network) interpolation in DTMs.
     TINs have perfectly planar facets, meaning their second derivative (Laplacian) is exactly 0.
     """
-    # Safely ensure elevation is 4D (1, 1, H, W) for the conv2d operation
-    elev_4d = elevation.view(1, 1, elevation.shape[-2], elevation.shape[-1])
+    # 1. Prevent NaN poisoning in the convolution
+    safe_elev = elevation.clone()
+    safe_elev[~valid_mask] = 0.0
+
+    elev_4d = safe_elev.view(1, 1, safe_elev.shape[-2], safe_elev.shape[-1])
 
     # 3x3 Laplacian kernel
     kernel = torch.tensor([[[[0.0, 1.0, 0.0],
@@ -181,21 +184,18 @@ def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold
     # Calculate 2nd derivative
     laplacian = torch.nn.functional.conv2d(elev_4d, kernel, padding=1)
 
-    # Flatten both tensors to 1D to guarantee the boolean indexing never throws a dimension error
-    lap_flat = laplacian.view(-1)
-    mask_flat = valid_mask.view(-1).bool()
-
-    # Mask out edges and invalid regions
-    valid_laplacian = lap_flat[mask_flat]
+    # 2. Extract only valid pixels
+    # Note: Boundary pixels where NaNs were zeroed will have massive Laplacian values.
+    # This is fine, as they will safely fail the < 1e-2 check and not inflate our TIN count.
+    valid_laplacian = laplacian.view(-1)[valid_mask.view(-1).bool()]
 
     if len(valid_laplacian) == 0:
         return True
 
-    # Count how many pixels have a Laplacian of EXACTLY zero (perfectly flat plane)
-    # We use 1e-4 to account for float32 precision limits
+    # 3. Evaluate curvature
+    # 1e-2 accounts for float32 stepping limits at high Martian altitudes (e.g. 20,000m)
     zero_curvature_ratio = (valid_laplacian.abs() < 1e-2).float().mean().item()
 
-    # If more than 'threshold' (e.g., 40%) of the valid patch is perfectly planar, reject it
     return zero_curvature_ratio > threshold
 
 
@@ -513,8 +513,10 @@ class DepthFMHiRISEAdapter(Dataset):
                             idx = self.rand_idx()
                             continue
 
+                        elev_valid_native = torch.isfinite(elevation) & (elevation != 0.0)
+
                         # from depth_fm.depthfm_adapter import is_tin_artifact
-                        if is_tin_artifact(dtm_resized, valid_mask_resized, threshold=0.15):
+                        if is_tin_artifact(elevation, elev_valid_native, threshold=0.15):
                             print("Skipping")
                             logger.info("Skipping patch: Detected artificial TIN triangles.")
                             idx = self.rand_idx()
