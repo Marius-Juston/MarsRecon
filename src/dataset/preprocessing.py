@@ -31,13 +31,9 @@ import warnings
 from collections.abc import Iterator
 from typing import Callable
 
-import geopandas as gpd
-import numpy as np
 import rasterio
 import rasterio.enums
 import rasterio.shutil
-
-from dataset.mars_hirise_base import MARS_PROJECTED_CRS
 
 logger = logging.getLogger(__name__)
 
@@ -542,6 +538,7 @@ def convert_all(
         counts["failed"],
     )
     return counts
+
 
 # ---------------------------------------------------------------------------
 # CLI entry point

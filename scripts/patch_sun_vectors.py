@@ -74,8 +74,8 @@ def patch_split(input_dir: Path, output_dir: Path, split: str, workers: int = 32
         raw = dataset[i]
 
         # Reconstruct torch tensors (float16 → float32 for the OLS math)
-        image = torch.from_numpy(raw["image"].astype(np.float32))   # (3, H, W)
-        dtm = torch.from_numpy(raw["dtm"].astype(np.float32))       # (3, H, W)
+        image = torch.from_numpy(raw["image"].astype(np.float32))  # (3, H, W)
+        dtm = torch.from_numpy(raw["dtm"].astype(np.float32))  # (3, H, W)
         confidence = torch.from_numpy(raw["confidence"].astype(np.float32))  # (1, H, W)
 
         # Recompute using single-channel DTM and the image
@@ -89,8 +89,8 @@ def patch_split(input_dir: Path, output_dir: Path, split: str, workers: int = 32
         npz_path = str(tmp_dir / f"{i:08d}.npz")
         np.savez(
             npz_path,
-            image=raw["image"],          # keep original float16
-            dtm=raw["dtm"],              # keep original float16
+            image=raw["image"],  # keep original float16
+            dtm=raw["dtm"],  # keep original float16
             confidence=raw["confidence"],  # keep original float16
             sun_vector=sun_vec.numpy(),
             intensity=intensity.numpy(),

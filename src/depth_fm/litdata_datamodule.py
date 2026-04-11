@@ -256,7 +256,6 @@ def _build_litdata_loaders(config, split_seed: int = 42) -> dict:
     (LitData GitHub Issues #316, #213, #452).
     """
     from depth_fm.litdata_datamodule import MarsStreamingDataset
-    from torch.utils.data import DataLoader as TorchDataLoader
 
     try:
         from litdata import StreamingDataLoader
@@ -298,7 +297,6 @@ def _build_litdata_loaders(config, split_seed: int = 42) -> dict:
             drop_last=True,
             persistent_workers=True,
         )
-
 
         w = num_workers if is_train else _VAL_WORKERS
         logger.info(

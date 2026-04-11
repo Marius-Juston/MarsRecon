@@ -1,5 +1,6 @@
-import json
 import argparse
+import json
+
 
 def compute_metrics(data):
     channels = data.get("channels", ["Near-infrared", "Red", "Blue-green"])

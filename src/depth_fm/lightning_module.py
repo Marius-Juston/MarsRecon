@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import gc
 import logging
-import warnings
 import time
+import warnings
 from typing import Any
 
 import lightning as L
@@ -245,6 +245,7 @@ class DepthFMLightningModule(L.LightningModule):
 
         self.log("train/loss", loss_dict["total"], prog_bar=True, sync_dist=False)
         self.log("train/loss_velocity", loss_dict["velocity"], rank_zero_only=True)
+        self.log("train/loss_photo", loss_dict["photo"], rank_zero_only=True)
         self.log("train/loss_normals", loss_dict["normals"], rank_zero_only=True)
         self.log("train/loss_freq", loss_dict["freq"], rank_zero_only=True)
         self.log("train/loss_grad", loss_dict["grad"], rank_zero_only=True)
@@ -371,8 +372,10 @@ class DepthFMLightningModule(L.LightningModule):
             self.log(f"val/{metric_name}", val, sync_dist=True)
             self.log(f"val/{metric_name}_std", std, sync_dist=True)
 
-        self.log("val/rmse_mean", summary.get("rmse", {}).get("mean", 0) if summary else 0.0, prog_bar=True, sync_dist=True)
-        self.log("val/delta_1_mean", summary.get("delta_1", {}).get("mean", 0) if summary else 0.0, prog_bar=True, sync_dist=True)
+        self.log("val/rmse_mean", summary.get("rmse", {}).get("mean", 0) if summary else 0.0, prog_bar=True,
+                 sync_dist=True)
+        self.log("val/delta_1_mean", summary.get("delta_1", {}).get("mean", 0) if summary else 0.0, prog_bar=True,
+                 sync_dist=True)
         self._trace("on_validation_epoch_end: Finished mandatory sync_dist collective calls")
 
         if not summary:
@@ -406,8 +409,8 @@ class DepthFMLightningModule(L.LightningModule):
         self._trace("Exiting on_validation_epoch_end")
 
     def _log_validation_visuals(
-        self, batch, z_img, z_depth, pred_pix, gt_pix, conf_mask,
-        flow_intermediates=None,
+            self, batch, z_img, z_depth, pred_pix, gt_pix, conf_mask,
+            flow_intermediates=None,
     ):
         """Log visualisation figures to wandb/tensorboard."""
         if self.global_rank != 0:

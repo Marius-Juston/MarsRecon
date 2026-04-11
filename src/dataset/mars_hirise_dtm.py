@@ -30,8 +30,7 @@ from torchgeo.samplers import Units
 from dataset.mars_hirise_base import (
     MarsHiRISEBase,
     ProductMeta,
-    check_overlap,
-    reproject_band, setup_logging,
+    setup_logging,
 )
 
 logger = logging.getLogger(__name__)
@@ -1039,6 +1038,7 @@ class MarsHiRISEDTM(MarsHiRISEBase):
         except rasterio.errors.RasterioIOError as exc:
             logger.warning("Could not open ortho %s: %s", jp2_path, exc)
             return None
+
     # ------------------------------------------------------------------
     # Elevation tile merging
     # ------------------------------------------------------------------
