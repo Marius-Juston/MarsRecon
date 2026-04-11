@@ -627,9 +627,6 @@ def run_single_training(
             "dataloader length. Otherwise it will do it's dataset length based on purely the batch size rather than "
             "with the world size as well")
 
-        # 2. Get the actual world size
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-
     """Execute a single training run and return test metrics."""
     L.seed_everything(seed, workers=True)
 

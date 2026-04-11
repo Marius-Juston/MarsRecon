@@ -424,7 +424,7 @@ class DepthFMLightningModule(L.LightningModule):
                 plot_flow_evolution,
                 plot_normal_maps,
                 plot_elevation_scatter,
-                plot_hillshade_comparison,
+                plot_lambertian_comparison,
             )
             import matplotlib.pyplot as plt
 
@@ -450,13 +450,30 @@ class DepthFMLightningModule(L.LightningModule):
             self._log_figure("val/error_map", fig, step)
             plt.close(fig)
 
-            fig = plot_hillshade_comparison(
-                pred, gt, azimuth=315.0, altitude=45.0, z_factor=2.0,
-                title=f"Hillshade (step {step})",
-            )
-            self._log_figure("val/hillshade", fig, step)
-            plt.close(fig)
+            sun_vec = batch.get("sun_vector")
+            intensity = batch.get("intensity")
+            ambient = batch.get("ambient")
 
+            if sun_vec is not None:
+                from depth_fm.metrics import affine_align
+                pred_aligned, _, _ = affine_align(pred, gt)
+
+                sv = sun_vec[0].cpu().numpy()
+                int_val = intensity[0].item() if intensity is not None else 1.0
+                amb_val = ambient[0].item() if ambient is not None else 0.0
+
+                fig = plot_lambertian_comparison(
+                    pred_aligned, gt,
+                    sun_vector=sv,
+                    intensity=int_val,
+                    ambient=amb_val,
+                    title=f"Lambertian Render (step {step})",
+                )
+                self._log_figure("val/lambertian_render", fig, step)
+                plt.close(fig)
+
+            # Re-generate normal maps using aligned data
+            pred_aligned, _, _ = affine_align(pred, gt)
             fig = plot_normal_maps(pred_aligned, gt, title=f"Surface normals (step {step})")
             self._log_figure("val/normal_maps", fig, step)
             plt.close(fig)

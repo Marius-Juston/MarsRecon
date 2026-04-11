@@ -81,6 +81,27 @@ def _valid_stats(arr: np.ndarray, mask: np.ndarray | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Core Physical Utilities
+# ---------------------------------------------------------------------------
+
+def compute_surface_normals(elevation: np.ndarray) -> np.ndarray:
+    """Compute surface normals with proper spatial scaling."""
+    H, W = elevation.shape
+    spatial_scale = max(H, W) / 2.0
+
+    # Calculate gradients
+    dy, dx = np.gradient(elevation)
+
+    # Scale gradients to match physical slope dimensions
+    n_x = -dx * spatial_scale
+    n_y = -dy * spatial_scale
+    n_z = np.ones_like(dx)
+
+    n = np.stack([n_x, n_y, n_z], axis=-1)
+    norm = np.linalg.norm(n, axis=-1, keepdims=True)
+    return n / np.clip(norm, 1e-8, None)
+
+# ---------------------------------------------------------------------------
 # 1. Prediction triptych
 # ---------------------------------------------------------------------------
 
@@ -499,15 +520,12 @@ def plot_normal_maps(
         title: str = "",
         save_path: str | Path | None = None,
 ) -> plt.Figure:
-    """Side-by-side surface normal maps (RGB-encoded)."""
+    """Side-by-side surface normal maps (RGB-encoded) with spatial scaling."""
     set_neurips_style()
 
     def _normals_rgb(z):
-        dy, dx = np.gradient(z)
-        n = np.stack([-dx, -dy, np.ones_like(dx)], axis=-1)
-        norm = np.linalg.norm(n, axis=-1, keepdims=True)
-        n = n / np.clip(norm, 1e-8, None)
-        return (n + 1.0) / 2.0  # map [-1,1] → [0,1] for RGB display
+        normals = compute_surface_normals(z)
+        return (normals + 1.0) / 2.0  # map [-1,1] → [0,1] for RGB display
 
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 
@@ -745,6 +763,76 @@ def plot_hillshade_comparison(
         fig.savefig(save_path, bbox_inches="tight")
     return fig
 
+
+def compute_lambertian_render(
+        elevation: np.ndarray,
+        sun_vector: np.ndarray,
+        intensity: float = 1.0,
+        ambient: float = 0.0,
+) -> np.ndarray:
+    """Compute a physically accurate Lambertian render using actual sun vectors."""
+    normals = compute_surface_normals(elevation)
+
+    # Dot product of normals and sun_vector
+    shade = np.sum(normals * sun_vector, axis=-1)
+    render = shade * intensity + ambient
+
+    return np.clip(render, 0.0, 1.0).astype(np.float32)
+
+
+def plot_lambertian_comparison(
+        pred_dtm: np.ndarray,
+        gt_dtm: np.ndarray,
+        sun_vector: np.ndarray,
+        intensity: float = 1.0,
+        ambient: float = 0.0,
+        title: str = "",
+        save_path: str | Path | None = None,
+) -> plt.Figure:
+    """Side-by-side Lambertian shading of predicted vs GT DTMs using actual physics."""
+    set_neurips_style()
+
+    from depth_fm.metrics import affine_align
+    pred_aligned, _, _ = affine_align(pred_dtm, gt_dtm)
+
+    # Fill NaN for gradient computation
+    pred_filled = np.nan_to_num(pred_aligned, nan=np.nanmean(pred_aligned))
+    gt_filled = np.nan_to_num(gt_dtm, nan=np.nanmean(gt_dtm))
+
+    render_pred = compute_lambertian_render(pred_filled, sun_vector, intensity, ambient)
+    render_gt = compute_lambertian_render(gt_filled, sun_vector, intensity, ambient)
+
+    # Difference: >0.5 = predicted brighter, <0.5 = GT brighter
+    render_diff = (render_pred - render_gt + 1.0) / 2.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
+
+    axes[0].imshow(render_pred, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+    axes[0].set_title("Predicted Lambertian Render")
+    axes[0].axis("off")
+
+    axes[1].imshow(render_gt, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+    axes[1].set_title("GT Lambertian Render")
+    axes[1].axis("off")
+
+    im = axes[2].imshow(render_diff, cmap="RdBu_r", vmin=0.3, vmax=0.7, interpolation="nearest")
+    axes[2].set_title("Render difference")
+    axes[2].axis("off")
+    fig.colorbar(im, ax=axes[2], shrink=0.8, label="Pred brighter ← → GT brighter")
+
+    sun_str = f"Sun vector: [{sun_vector[0]:.2f}, {sun_vector[1]:.2f}, {sun_vector[2]:.2f}]"
+    fig.text(
+        0.5, 0.01,
+        f"{sun_str} | Intensity: {intensity:.2f} | Ambient: {ambient:.2f}",
+        ha="center", fontsize=8, style="italic", color="gray",
+    )
+
+    if title:
+        fig.suptitle(title, fontweight="bold")
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig
 
 # ---------------------------------------------------------------------------
 # 12. Timestep-conditioned error curve (ablation)
