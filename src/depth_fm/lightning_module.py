@@ -17,6 +17,7 @@ from __future__ import annotations
 import gc
 import logging
 import warnings
+import time
 from typing import Any
 
 import lightning as L
@@ -92,6 +93,13 @@ class DepthFMLightningModule(L.LightningModule):
 
         # Cache for grad norm logging (avoid recomputing every step)
         self._grad_norm_log_interval = 50
+
+    def _trace(self, msg: str):
+        """Helper to print explicit DDP synchronization trace logs."""
+        # Using INFO level so it passes standard logging filters.
+        # You can grep for "[DDP TRACE]" in your console output.
+        step = getattr(self, "global_step", "N/A")
+        logger.debug(f"[DDP TRACE | Rank {self.global_rank} | Step {step}] {msg}")
 
     # ------------------------------------------------------------------
     # Flow matching core
@@ -169,6 +177,7 @@ class DepthFMLightningModule(L.LightningModule):
     # ------------------------------------------------------------------
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        self._trace(f"Entered training_step for batch {batch_idx}")
         z_img = self._encode(batch["image"])
         z_depth_raw = self._encode(batch["dtm"])
 
@@ -185,7 +194,9 @@ class DepthFMLightningModule(L.LightningModule):
         eps = torch.randn_like(x_source)
         z_t = (1.0 - t_exp) * x_source + t_exp * z_depth + sigma_min * eps
 
+        self._trace(f"training_step: starting model.predict_velocity (forward pass)")
         v_pred = self.model.predict_velocity(z_t, t, z_img)
+        self._trace(f"training_step: finished model.predict_velocity")
 
         # --- Velocity prediction diagnostics (detached, free) ---
         with torch.no_grad():
@@ -198,8 +209,6 @@ class DepthFMLightningModule(L.LightningModule):
             t_mean = t.float().mean()
             t_std = t.float().std()
 
-        # Per the Lightning docs, rank_zero_only=True prevents synchronization
-        # that would produce a deadlock. Use for diagnostics we only need from rank 0.
         step = self.global_step
 
         self.log("train/v_pred_norm", v_pred_norm, rank_zero_only=True)
@@ -208,8 +217,6 @@ class DepthFMLightningModule(L.LightningModule):
         self.log("train/t_mean", t_mean, rank_zero_only=True)
         self.log("train/t_std", t_std, rank_zero_only=True)
 
-        # FIX: Removed conditional `if step % 10 == 0` around sync_dist=True logs.
-        # These are cheap scalars — log every step with sync_dist=False.
         with torch.no_grad():
             self.log("train/z_depth_std", z_depth_raw.std().item(), rank_zero_only=True)
             self.log("train/noise_std", x_source.std().item(), rank_zero_only=True)
@@ -217,10 +224,12 @@ class DepthFMLightningModule(L.LightningModule):
         # Pixel-space losses
         pred_pix = gt_pix = None
         if self.loss_fn.needs_pixel_decode(step):
+            self._trace("training_step: executing loss_fn.needs_pixel_decode block")
             z_pred_clean = z_t + (1.0 - t_exp) * v_pred
             pred_pix = self._decode_pixel_loss(z_pred_clean)
             gt_pix = self._decode(z_depth)
 
+        self._trace("training_step: calculating loss_dict")
         loss_dict = self.loss_fn(
             v_pred=v_pred,
             v_target=v_target,
@@ -234,8 +243,6 @@ class DepthFMLightningModule(L.LightningModule):
             intensity=batch.get("intensity"),
         )
 
-        # Logging — NO sync_dist in training_step to avoid DDP deadlock.
-        # rank_zero_only=True per Lightning docs: prevents sync that causes deadlock.
         self.log("train/loss", loss_dict["total"], prog_bar=True, sync_dist=False)
         self.log("train/loss_velocity", loss_dict["velocity"], rank_zero_only=True)
         self.log("train/loss_normals", loss_dict["normals"], rank_zero_only=True)
@@ -246,14 +253,20 @@ class DepthFMLightningModule(L.LightningModule):
         if self.val_history and batch_idx == 0:
             self.val_history["train/loss"].append(loss_dict["total"].item())
 
-        # FIX: Training visuals — only rank 0 logs, but the data (z_img, v_pred)
-        # is already computed on all ranks. No extra model forward pass needed.
         vis_every = self.config.training.get("train_vis_every_steps", 500)
         show_vis = self.config.training.get("show_train_vis", False)
-        if self.global_rank == 0 and show_vis and step % vis_every == 0 and step > 0:
-            if self.logger and hasattr(self.logger, "experiment"):
-                self._log_training_visuals(z_img, v_target, v_pred, step)
+        if show_vis and step % vis_every == 0 and step > 0:
+            self._trace("training_step: preparing train visuals")
+            with torch.no_grad():
+                img_pix_vis = self._decode(z_img[:1])
+            if self.global_rank == 0 and self.logger and hasattr(self.logger, "experiment"):
+                self._trace("training_step: rank 0 logging train visuals")
+                start_vis = time.perf_counter()
+                self._log_training_visuals(img_pix_vis, v_target, v_pred, step)
+                vis_dur = time.perf_counter() - start_vis
+                self._trace(f"training_step: rank 0 finished train visuals in {vis_dur:.2f}s")
 
+        self._trace(f"Exiting training_step for batch {batch_idx}")
         return loss_dict["total"]
 
     # ------------------------------------------------------------------
@@ -270,15 +283,21 @@ class DepthFMLightningModule(L.LightningModule):
         self._ema_initialised = checkpoint.get("ema_initialised", False)
 
     def on_validation_epoch_start(self) -> None:
+        self._trace("Entered on_validation_epoch_start")
         self._val_aggregator = MetricsAggregator()
+        self._val_vis_data = None
+        self._trace("Exiting on_validation_epoch_start")
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
+        self._trace(f"Entered validation_step for batch {batch_idx}")
         signal_boost = self.config.data.get("signal_boost", 1.0)
 
         z_img = self._encode(batch["image"])
         z_depth = self._encode(batch["dtm"]) * signal_boost
 
+        self._trace(f"validation_step batch {batch_idx}: starting _predict_depth (DDP collective)")
         z_pred = self._predict_depth(z_img, num_steps=self.config.get("test_euler_steps", 4))
+        self._trace(f"validation_step batch {batch_idx}: finished _predict_depth")
 
         z_pred_unboosted = z_pred / signal_boost
         z_depth_unboosted = z_depth / signal_boost
@@ -288,22 +307,26 @@ class DepthFMLightningModule(L.LightningModule):
         gt_raw = batch["dtm"][:, 0].float().cpu().numpy()
 
         vae_reconstruction_error = float(np.abs(gt_decoded - gt_raw).mean())
-        self.log("val/vae_reconstruction_error", vae_reconstruction_error, sync_dist=True)
+        self.log("val/vae_reconstruction_error", vae_reconstruction_error, sync_dist=False)
 
         if "confidence" in batch:
             conf_mask = batch["confidence"][:, 0].float().cpu().numpy()
         else:
             conf_mask = np.ones_like(gt_raw)
 
-        # Velocity loss for logging — must match training_step
-        x_source = self._get_x_source(z_img)
-        v_target = z_depth - x_source
-        t = self._sample_timesteps(z_img.shape[0])
-        t_exp = t.view(-1, 1, 1, 1)
-        z_t = (1.0 - t_exp) * x_source + t_exp * z_depth
-        v_pred = self.model.predict_velocity(z_t, t, z_img)
-        vel_loss = F.mse_loss(v_pred, v_target)
-        self.log("val/loss", vel_loss, prog_bar=True, sync_dist=True)
+        with torch.no_grad():
+            x_source = self._get_x_source(z_img)
+            v_target = z_depth - x_source
+            t = self._sample_timesteps(z_img.shape[0])
+            t_exp = t.view(-1, 1, 1, 1)
+            z_t = (1.0 - t_exp) * x_source + t_exp * z_depth
+
+            self._trace(f"validation_step batch {batch_idx}: starting model.predict_velocity (DDP collective)")
+            v_pred = self.model.predict_velocity(z_t, t, z_img)
+            self._trace(f"validation_step batch {batch_idx}: finished model.predict_velocity")
+
+            vel_loss = F.mse_loss(v_pred, v_target)
+        self.log("val/loss", vel_loss, prog_bar=True, sync_dist=False)
 
         # Per-sample metrics
         for i in range(pred_pix.shape[0]):
@@ -311,65 +334,82 @@ class DepthFMLightningModule(L.LightningModule):
             metrics = compute_depth_metrics(pred_pix[i], gt_raw[i], align=True)
             self._val_aggregator.add(metrics, tile_id)
 
-        # FIX: Flow intermediates computed on ALL ranks (model forward must be
-        # collective in DDP). Only rank 0 actually logs the figures.
-        # This prevents the deadlock where rank 0 does extra model calls.
         flow_intermediates = None
         flow_vis_every = self.config.training.get("flow_vis_every_steps", 500)
         if batch_idx == 0 and self.global_step > 0:
             if self.current_epoch % max(flow_vis_every, 1) == 0:
+                self._trace(f"validation_step batch {batch_idx}: computing flow_intermediates (DDP collective)")
                 flow_intermediates = self._predict_flow_intermediates(z_img[:1], num_steps=4)
+                self._trace(f"validation_step batch {batch_idx}: finished flow_intermediates")
 
-        # Only rank 0 logs visuals — but no model calls here, just plotting
-        if self.global_rank == 0 and batch_idx == 0:
-            if self.logger and hasattr(self.logger, "experiment"):
-                self._log_validation_visuals(
-                    batch, z_img, z_depth, pred_pix, gt_raw, conf_mask,
-                    flow_intermediates=flow_intermediates,
-                )
+        if batch_idx == 0:
+            self._val_vis_data = {
+                "batch": {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in batch.items()},
+                "z_img": z_img.detach(),
+                "z_depth": z_depth.detach(),
+                "pred_pix": pred_pix,
+                "gt_raw": gt_raw,
+                "conf_mask": conf_mask,
+                "flow_intermediates": flow_intermediates,
+            }
+
+        self._trace(f"Exiting validation_step for batch {batch_idx}")
 
     def on_validation_epoch_end(self) -> None:
+        self._trace("Entered on_validation_epoch_end")
         summary = self._val_aggregator.summary()
-        if not summary:
-            return
 
-        # SAFETY: Use a fixed metric list so ALL ranks execute the same number
-        # of sync_dist=True calls. If summary.items() differed across ranks
-        # (e.g. one rank got a NaN), the mismatched sync would deadlock.
         _FIXED_VAL_METRICS = [
             "rmse", "abs_rel", "delta_1", "delta_2", "delta_3",
             "normal_angular_error", "slope_rmse",
         ]
+
+        self._trace("on_validation_epoch_end: Starting mandatory sync_dist collective calls")
         for metric_name in _FIXED_VAL_METRICS:
-            if metric_name in summary:
-                self.log(f"val/{metric_name}", summary[metric_name]["mean"], sync_dist=True)
-                self.log(f"val/{metric_name}_std", summary[metric_name]["std"], sync_dist=True)
+            val = summary.get(metric_name, {}).get("mean", 0.0) if summary else 0.0
+            std = summary.get(metric_name, {}).get("std", 0.0) if summary else 0.0
+            self.log(f"val/{metric_name}", val, sync_dist=True)
+            self.log(f"val/{metric_name}_std", std, sync_dist=True)
 
-        self.log("val/rmse_mean", summary.get("rmse", {}).get("mean", 0), prog_bar=True, sync_dist=True)
-        self.log("val/delta_1_mean", summary.get("delta_1", {}).get("mean", 0), prog_bar=True, sync_dist=True)
+        self.log("val/rmse_mean", summary.get("rmse", {}).get("mean", 0) if summary else 0.0, prog_bar=True, sync_dist=True)
+        self.log("val/delta_1_mean", summary.get("delta_1", {}).get("mean", 0) if summary else 0.0, prog_bar=True, sync_dist=True)
+        self._trace("on_validation_epoch_end: Finished mandatory sync_dist collective calls")
 
-        # Track for convergence plotting
+        if not summary:
+            self._trace("on_validation_epoch_end: Summary empty, returning early")
+            return
+
         for key in ["val/rmse", "val/abs_rel", "val/delta_1", "val/loss"]:
             metric_key = key.split("/")[-1]
             if metric_key in summary:
                 self.val_history.setdefault(key, []).append(summary[metric_key]["mean"])
 
-        # Log worst patches
         worst = self._val_aggregator.worst_k("rmse", k=5)
         if worst:
             logger.info("Worst 5 val patches by RMSE: %s",
                         ", ".join(f"{tid}={v:.2f}m" for tid, v in worst))
 
+        if self.global_rank == 0 and self._val_vis_data is not None:
+            if self.logger and hasattr(self.logger, "experiment"):
+                self._trace("on_validation_epoch_end: Rank 0 starting visual logging uploads")
+                start_vis = time.perf_counter()
+                vd = self._val_vis_data
+                self._log_validation_visuals(
+                    vd["batch"], vd["z_img"], vd["z_depth"],
+                    vd["pred_pix"], vd["gt_raw"], vd["conf_mask"],
+                    flow_intermediates=vd.get("flow_intermediates"),
+                )
+                vis_dur = time.perf_counter() - start_vis
+                self._trace(f"on_validation_epoch_end: Rank 0 finished visual logging uploads in {vis_dur:.2f}s")
+
+        self._val_vis_data = None
+        self._trace("Exiting on_validation_epoch_end")
+
     def _log_validation_visuals(
         self, batch, z_img, z_depth, pred_pix, gt_pix, conf_mask,
         flow_intermediates=None,
     ):
-        """Log visualisation figures to wandb/tensorboard.
-
-        IMPORTANT: This method must NOT call any model forward passes.
-        All inference (flow intermediates etc.) must be done in validation_step
-        on all ranks to avoid DDP deadlocks.
-        """
+        """Log visualisation figures to wandb/tensorboard."""
         if self.global_rank != 0:
             return
 
@@ -422,7 +462,6 @@ class DepthFMLightningModule(L.LightningModule):
             self._log_figure("val/elevation_scatter", fig, step)
             plt.close(fig)
 
-            # Flow evolution — intermediates already computed on all ranks
             if flow_intermediates is not None:
                 single_intermediates = {t: v[0] for t, v in flow_intermediates.items()}
                 fig = plot_flow_evolution(single_intermediates, gt, title=f"Flow (step {step})")
@@ -430,20 +469,16 @@ class DepthFMLightningModule(L.LightningModule):
                 plt.close(fig)
 
         except Exception as e:
-            logger.warning("Visual logging failed: %s", e)
+            logger.exception("Visual logging failed")
 
     def _log_training_visuals(
             self,
-            z_img: torch.Tensor,
+            img_pix_vis: torch.Tensor,
             v_target: torch.Tensor,
             v_pred: torch.Tensor,
             step: int,
     ) -> None:
-        """Log a training-time triptych: decoded input | v_target magnitude | v_pred magnitude.
-
-        All ops are no-grad; failures are silenced so training is never interrupted.
-        NOTE: Only uses data already available on this rank — no extra model calls.
-        """
+        """Log a training-time triptych."""
         if self.global_rank != 0:
             return
 
@@ -452,8 +487,7 @@ class DepthFMLightningModule(L.LightningModule):
             import matplotlib.gridspec as gridspec
 
             with torch.no_grad():
-                img_pix = self._decode(z_img[:1])
-                img_np = img_pix[0].float().cpu().numpy()
+                img_np = img_pix_vis[0].float().cpu().numpy()
                 img_np = np.transpose(img_np, (1, 2, 0))
                 img_np = np.clip((img_np + 1.0) / 2.0, 0.0, 1.0)
 
@@ -491,7 +525,7 @@ class DepthFMLightningModule(L.LightningModule):
             plt.close(fig)
 
         except Exception as e:
-            logger.warning("Training visual logging failed: %s", e)
+            logger.exception("Training visual logging failed")
 
     def _log_figure(self, tag: str, fig, step: int):
         """Log a matplotlib figure to the active logger."""
@@ -506,21 +540,27 @@ class DepthFMLightningModule(L.LightningModule):
                 elif hasattr(exp, "add_figure"):
                     exp.add_figure(tag, fig, global_step=step)
         except Exception:
-            pass
+            logger.exception(f"Failed to log figure {tag}")
 
     # ------------------------------------------------------------------
     # Test step
     # ------------------------------------------------------------------
 
     def on_test_epoch_start(self) -> None:
+        self._trace("Entered on_test_epoch_start")
         self._test_aggregator = MetricsAggregator()
+        self._trace("Exited on_test_epoch_start")
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
+        self._trace(f"Entered test_step for batch {batch_idx}")
         z_img = self._encode(batch["image"])
         z_depth = self._encode(batch["dtm"])
 
         num_steps = self.config.training.get("test_euler_steps", 4)
+
+        self._trace(f"test_step batch {batch_idx}: starting _predict_depth (DDP collective)")
         z_pred = self._predict_depth(z_img, num_steps=num_steps)
+        self._trace(f"test_step batch {batch_idx}: finished _predict_depth")
 
         pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
         gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
@@ -530,26 +570,36 @@ class DepthFMLightningModule(L.LightningModule):
             metrics = compute_depth_metrics(pred_pix[i], gt_pix[i], align=True)
             self._test_aggregator.add(metrics, tile_id)
 
-    def on_test_epoch_end(self) -> None:
-        summary = self._test_aggregator.summary()
-        if not summary:
-            return
+        self._trace(f"Exiting test_step for batch {batch_idx}")
 
-        # SAFETY: Fixed metric list — same reason as on_validation_epoch_end
+    def on_test_epoch_end(self) -> None:
+        self._trace("Entered on_test_epoch_end")
+        summary = self._test_aggregator.summary()
+
         _FIXED_TEST_METRICS = [
             "rmse", "abs_rel", "delta_1", "delta_2", "delta_3",
             "normal_angular_error", "slope_rmse",
         ]
-        for metric_name in _FIXED_TEST_METRICS:
-            if metric_name in summary:
-                self.log(f"test/{metric_name}", summary[metric_name]["mean"], sync_dist=True)
 
-        logger.info("=" * 60)
-        logger.info("TEST SET RESULTS")
-        logger.info("=" * 60)
-        for m, s in summary.items():
-            logger.info("  %-25s  %.4f ± %.4f", m, s["mean"], s["std"])
-        logger.info("=" * 60)
+        self._trace("on_test_epoch_end: Starting mandatory sync_dist collective calls")
+        for metric_name in _FIXED_TEST_METRICS:
+            val = summary.get(metric_name, {}).get("mean", 0.0) if summary else 0.0
+            self.log(f"test/{metric_name}", val, sync_dist=True)
+        self._trace("on_test_epoch_end: Finished mandatory sync_dist collective calls")
+
+        if not summary:
+            self._trace("on_test_epoch_end: Summary empty, returning early")
+            return
+
+        if self.global_rank == 0:
+            logger.info("=" * 60)
+            logger.info("TEST SET RESULTS")
+            logger.info("=" * 60)
+            for m, s in summary.items():
+                logger.info("  %-25s  %.4f ± %.4f", m, s["mean"], s["std"])
+            logger.info("=" * 60)
+
+        self._trace("Exiting on_test_epoch_end")
 
     # ------------------------------------------------------------------
     # Timestep ablation
@@ -563,6 +613,7 @@ class DepthFMLightningModule(L.LightningModule):
             max_batches: int | None = None,
     ) -> dict[int, dict[str, dict[str, float]]]:
         """Evaluate test set at multiple Euler step counts."""
+        self._trace("Entered run_timestep_ablation")
         if step_counts is None:
             step_counts = [1, 2, 4, 8, 10, 20]
 
@@ -570,6 +621,7 @@ class DepthFMLightningModule(L.LightningModule):
         results = {}
 
         for n_steps in step_counts:
+            self._trace(f"run_timestep_ablation: testing with {n_steps} steps")
             agg = MetricsAggregator()
 
             for batch_idx, batch in enumerate(test_loader):
@@ -581,11 +633,16 @@ class DepthFMLightningModule(L.LightningModule):
 
                 z_img = self._encode(image)
                 z_depth = self._encode(dtm)
+
+                self._trace(f"run_timestep_ablation (steps={n_steps}): starting _predict_depth")
                 z_pred = self._predict_depth(z_img, num_steps=n_steps)
+                self._trace(f"run_timestep_ablation (steps={n_steps}): finished _predict_depth")
 
                 if self.trainer.world_size > 1:
+                    self._trace(f"run_timestep_ablation (steps={n_steps}): starting all_gather collective")
                     z_pred = self.all_gather(z_pred).view(-1, *z_pred.shape[1:])
                     z_depth_gathered = self.all_gather(z_depth).view(-1, *z_depth.shape[1:])
+                    self._trace(f"run_timestep_ablation (steps={n_steps}): finished all_gather collective")
                 else:
                     z_depth_gathered = z_depth
 
@@ -600,14 +657,16 @@ class DepthFMLightningModule(L.LightningModule):
 
             results[n_steps] = agg.summary()
 
-            rmse_mean = results[n_steps].get("rmse", {}).get("mean", 0)
-            d1_mean = results[n_steps].get("delta_1", {}).get("mean", 0)
-            logger.info(
-                "  Steps=%2d  →  RMSE=%.4f m, δ₁=%.2f%%, n=%d samples",
-                n_steps, rmse_mean, d1_mean, len(agg.records),
-            )
+            if self.global_rank == 0:
+                rmse_mean = results[n_steps].get("rmse", {}).get("mean", 0)
+                d1_mean = results[n_steps].get("delta_1", {}).get("mean", 0)
+                logger.info(
+                    "  Steps=%2d  →  RMSE=%.4f m, δ₁=%.2f%%, n=%d samples",
+                    n_steps, rmse_mean, d1_mean, len(agg.records),
+                )
 
         self.train()
+        self._trace("Exited run_timestep_ablation")
         return results
 
     # ------------------------------------------------------------------
@@ -615,9 +674,7 @@ class DepthFMLightningModule(L.LightningModule):
     # ------------------------------------------------------------------
 
     def on_train_start(self) -> None:
-        """Register backward hooks on 1×1 Conv2d weights that produce
-        channels_last gradients under torch.compile(mode='max-autotune').
-        """
+        self._trace("Entered on_train_start")
         _contiguous_hook = lambda g: g.contiguous() if not g.is_contiguous() else g
 
         n_hooks = 0
@@ -635,20 +692,22 @@ class DepthFMLightningModule(L.LightningModule):
             " (DDP channels_last stride fix)",
             n_hooks,
         )
+        self._trace("Exited on_train_start")
 
     # ------------------------------------------------------------------
     # Gradient norm logging — throttled to reduce overhead
     # ------------------------------------------------------------------
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        """Log backbone gradient norm before clipping (throttled)."""
         if self.global_step % self._grad_norm_log_interval != 0:
             return
+        self._trace("Entered on_before_optimizer_step (grad norm logging)")
         total_norm_sq = 0.0
         for p in self.model.backbone.parameters():
             if p.grad is not None:
                 total_norm_sq += p.grad.detach().float().norm().item() ** 2
         self.log("train/grad_norm", total_norm_sq ** 0.5, prog_bar=False, rank_zero_only=True)
+        self._trace("Exited on_before_optimizer_step")
 
     # ------------------------------------------------------------------
     # Optimizer & scheduler

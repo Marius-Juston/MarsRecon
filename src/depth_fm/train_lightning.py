@@ -32,6 +32,8 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
+from depth_fm.litdata_datamodule import _build_litdata_loaders
+
 # ---------------------------------------------------------------------------
 # GLOBAL GDAL/IO OPTIMIZATIONS (For 256-Core / NVMe setups)
 # ---------------------------------------------------------------------------
@@ -471,61 +473,6 @@ def get_litdata_cache_key(config) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _build_litdata_loaders(config, split_seed: int = 42) -> dict:
-    """Build DataLoaders from pre-optimized LitData cache.
-
-    Returns dict of {split: DataLoader} or raises FileNotFoundError.
-    """
-    from depth_fm.litdata_datamodule import MarsStreamingDataset
-
-    try:
-        from litdata import StreamingDataLoader
-    except ImportError:
-        raise FileNotFoundError("litdata package not installed")
-
-    hc = config.data.hirise
-    tc = config.training
-
-    cache_hash = get_litdata_cache_key(config)
-    litdata_root = Path(hc.root) / f"litdata_cache_{cache_hash}"
-
-    splits = ("train", "val", "test")
-    if not all((litdata_root / s / "_SUCCESS").exists() for s in splits):
-        raise FileNotFoundError(f"LitData cache incomplete at {litdata_root}")
-
-    brightness_jitter = config.data.get("brightness_jitter", 0.1)
-    num_workers = tc.get("num_workers", _WORKERS_PER_GPU)
-
-    loaders = {}
-    for split in splits:
-        is_train = split == "train"
-        dataset = MarsStreamingDataset(
-            input_dir=str(litdata_root / split),
-            is_train=is_train,
-            random_flip=is_train,
-            brightness_jitter=brightness_jitter if is_train else 0.0,
-            shuffle=is_train,
-            drop_last=is_train,
-            seed=split_seed,
-        )
-        loaders[split] = StreamingDataLoader(
-            dataset,
-            batch_size=tc.per_gpu_batch_size,
-            num_workers=num_workers if is_train else _VAL_WORKERS,
-            pin_memory=tc.pin_memory,
-            drop_last=is_train,
-            persistent_workers=is_train,  # val/test: spawn fresh to avoid resource contention
-        )
-        logger.info(
-            "LitData [%s]: batch_size=%d, workers=%d",
-            split,
-            tc.per_gpu_batch_size,
-            num_workers if is_train else _VAL_WORKERS,
-        )
-
-    return loaders
-
-
 def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -> dict:
     """Fallback: build DataLoaders from DepthFMHiRISEAdapterCached (live GDAL reads)."""
     from dataset.hirise_sampler import HiRISEGeoSampler
@@ -652,9 +599,9 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True) -> di
         logger.info("Using LitData StreamingDataset for maximum I/O throughput.")
         return loaders
     except FileNotFoundError as e:
-        logger.info("LitData not available (%s). Falling back to cached GDAL loader.", e)
+        logger.exception("LitData not available (%s). Falling back to cached GDAL loader.")
     except Exception as e:
-        logger.warning("LitData failed unexpectedly (%s). Falling back to cached GDAL loader.", e)
+        logger.exception("LitData failed unexpectedly (%s). Falling back to cached GDAL loader.")
 
     # ── Fallback to cached adapter ──
     return _build_cached_loaders(config, split_seed=split_seed, parallel=parallel)
@@ -663,6 +610,7 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True) -> di
 # ---------------------------------------------------------------------------
 # Single training run
 # ---------------------------------------------------------------------------
+import torch.distributed as dist
 
 
 def run_single_training(
@@ -671,6 +619,17 @@ def run_single_training(
         seed: int = 42,
         output_dir: str | Path = "outputs",
 ) -> dict:
+    if "WORLD_SIZE" in os.environ and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+        logger.warning(
+            "You NEED to ensure that the DDP is already initialized for StreamingDataLoader to generate the correct "
+            "dataloader length. Otherwise it will do it's dataset length based on purely the batch size rather than "
+            "with the world size as well")
+
+        # 2. Get the actual world size
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+
     """Execute a single training run and return test metrics."""
     L.seed_everything(seed, workers=True)
 
@@ -694,6 +653,8 @@ def run_single_training(
         return {"test_summary": test_summary, "output_dir": output_dir, "skipped": True}
 
     # Build data
+    # FIXME
+    # MAJOR CRITICAL CONCERN YOU NEED TO ENSURE THAT DISTRIBUTED HAS ALREADY STARTED WITH THE PROPER SETUP OTHERWISE StreamingDataLoader WILL NOT BE USING THE CORRECT SIZES AS IT WILL NOT BE CALCULATING THE LENGTHS CORRECTLY!!!!!
     loaders = build_dataloaders(config, split_seed=seed, parallel=config.data.get("parallel_load", False))
 
     # Build model
@@ -763,36 +724,23 @@ def run_single_training(
     else:
         precision = "32-true"
 
-    # Trainer — optimised for 4×A6000
-    # IMPORTANT: val_check_interval must be an integer (steps) not a float
-    # (fraction of epoch) to avoid DDP deadlocks when ranks disagree on
-    # epoch length. LitData handles its own sharding, so disable Lightning's
-    # DistributedSampler to avoid double-sharding / uneven batch counts.
-    val_interval = config.training.val_every_steps
-    if isinstance(val_interval, float) and val_interval < 1.0:
-        # Convert fraction to a safe step count
-        logger.warning(
-            "val_every_steps=%.2f is a fraction — converting to 200 steps "
-            "to prevent DDP deadlock. Set an integer value in your config.",
-            val_interval,
-        )
-        val_interval = 200
+    using_litdata = loaders["train"].__class__.__name__ == "StreamingDataLoader"
 
     trainer = L.Trainer(
         max_steps=config.training.max_steps,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=config.training.num_gpus,
+        devices='auto',
         strategy="ddp" if config.training.num_gpus > 1 else "auto",
         precision=precision,
         callbacks=callbacks,
         logger=wandb_logger,
-        val_check_interval=int(val_interval),
+        val_check_interval=config.training.val_every_steps,
         log_every_n_steps=config.training.log_every_steps,
         gradient_clip_val=config.training.max_grad_norm,
         accumulate_grad_batches=config.training.gradient_accumulation_steps,
         enable_progress_bar=True,
         default_root_dir=str(output_dir),
-        use_distributed_sampler=False,
+        use_distributed_sampler=not using_litdata,
     )
 
     # Train (with resumption)
@@ -1038,6 +986,15 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def dataload_switch_test(config, args):
+    loaders = build_dataloaders(config, split_seed=args.seed, parallel=config.data.get("parallel_load", False))
+
+    for i in range(3):
+        logger.info(f"Loading data for run {i}")
+        for split, loader in loaders.items():
+            logger.info(f"Starting dataloader for split {split}")
+            for b in tqdm(loader):
+                pass
 
 
 def main():

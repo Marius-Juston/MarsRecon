@@ -58,8 +58,11 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # Reduce memory fragmentation on large-VRAM cards (A6000 = 48 GB)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 3. Execute Python with safe array expansion
-uv run python -m depth_fm.train_lightning \
+# 3. Execute Python using torchrun
+uv run torchrun \
+    --standalone \
+    --nproc_per_node=4 \
+    -m depth_fm.train_lightning \
     --config "${CONFIG}" \
     --n_runs "${N_RUNS}" \
     --seed "${SEED}" \
