@@ -619,13 +619,17 @@ def run_single_training(
         seed: int = 42,
         output_dir: str | Path = "outputs",
 ) -> dict:
-    if "WORLD_SIZE" in os.environ and not dist.is_initialized():
+    if config.training.get("num_gpus", 1) and "WORLD_SIZE" not in os.environ:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend=backend)
         logger.warning(
             "You NEED to ensure that the DDP is already initialized for StreamingDataLoader to generate the correct "
             "dataloader length. Otherwise it will do it's dataset length based on purely the batch size rather than "
             "with the world size as well")
+
+    if config.training.get("num_gpus", 1) and "WORLD_SIZE" not in os.environ:
+        raise RuntimeError(
+            "You need to have DDP's WORLD_SIZE environemnt variable intialized for proper StreamingDataLoader to work run with `torchrun`")
 
     """Execute a single training run and return test metrics."""
     L.seed_everything(seed, workers=True)
@@ -746,17 +750,45 @@ def run_single_training(
     if config.training.enable:
         if last_ckpt_path.exists():
             logger.info(f"*** Resuming run {run_idx} from {last_ckpt_path} ***")
-            trainer.fit(module, loaders["train"], loaders["val"], ckpt_path=str(last_ckpt_path))
+            trainer.fit(module, loaders["train"], loaders["val"], ckpt_path=str(last_ckpt_path), weights_only=False)
         else:
             logger.info(f"*** Starting fresh training for run {run_idx} ***")
             trainer.fit(module, loaders["train"], loaders["val"])
 
     # Test
+    best_path = best_checkpoint.best_model_path
+
+    # Fallback if training was skipped (enable=False) and best_path is empty in memory
+    if not best_path:
+        ckpt_dir = output_dir / "checkpoints"
+        best_ckpts = list(ckpt_dir.glob("depthfm-best-*.ckpt"))
+
+        if best_ckpts:
+            import re
+
+            # The float metric is right before the .ckpt extension
+            def extract_rmse(path):
+                match = re.search(r"([0-9]+\.[0-9]+)\.ckpt$", path.name)
+                return float(match.group(1)) if match else float('inf')
+
+            # Grab the checkpoint with the lowest RMSE value
+            best_path = str(min(best_ckpts, key=extract_rmse))
+            logger.info(f"*** Found best checkpoint via glob: {best_path} ***")
+        else:
+            logger.warning("*** No best checkpoint found via glob, falling back to last.ckpt ***")
+            best_path = str(last_ckpt_path)
+    else:
+        logger.info(f"*** Testing with best checkpoint from memory: {best_path} ***")
+
+    # Test
     trainer.test(
         module,
         loaders["test"],
-        ckpt_path=None if config.training.get("enable", True) else str(last_ckpt_path),
+        ckpt_path=best_path,
+        weights_only=False
     )
+
+    module.to(trainer.strategy.root_device)
 
     # Timestep ablation
     logger.info("Running timestep ablation...")
