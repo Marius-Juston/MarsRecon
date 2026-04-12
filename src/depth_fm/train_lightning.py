@@ -792,13 +792,26 @@ def run_single_training(
         module.model.backbone = torch.compile(module.model.backbone, mode=compile_mode, fullgraph=full_graph)
         logger.info("torch.compile enabled on UNet backbone (mode=%s)", compile_mode)
 
-    # Callbacks
+    # Callbacks — dual checkpoint strategy
+    # 1. Best by standard RMSE (traditional depth estimation metric)
     best_checkpoint = ModelCheckpoint(
         dirpath=str(output_dir / "checkpoints"),
-        filename="depthfm-best-{step}-{val/rmse_mean:.4f}",
+        filename="depthfm-best-rmse-{step}-{val/rmse_mean:.4f}",
         monitor="val/rmse_mean",
         mode="min",
         save_top_k=3,
+        save_last=False,
+    )
+    # 2. Best by photometric consistency (resolution-independent quality)
+    #    This may select a different model than RMSE when GT is low-resolution,
+    #    since photo_consistency measures whether the predicted terrain
+    #    correctly reproduces the observed shading in the high-res orthoimage.
+    best_photo_checkpoint = ModelCheckpoint(
+        dirpath=str(output_dir / "checkpoints"),
+        filename="depthfm-best-photo-{step}-{val/photo_consistency_mean:.4f}",
+        monitor="val/photo_consistency_mean",
+        mode="max",
+        save_top_k=2,
         save_last=False,
     )
     recovery_checkpoint = ModelCheckpoint(
@@ -807,7 +820,7 @@ def run_single_training(
         every_n_train_steps=config.training.save_every_steps,
         save_top_k=1,
     )
-    callbacks = [LearningRateMonitor(logging_interval="step"), best_checkpoint, recovery_checkpoint]
+    callbacks = [LearningRateMonitor(logging_interval="step"), best_checkpoint, best_photo_checkpoint, recovery_checkpoint]
 
     if config.training.get("use_ema", True):
         logger.info("EMA is ENABLED.")
@@ -870,13 +883,26 @@ def run_single_training(
             logger.info(f"*** Starting fresh training for run {run_idx} ***")
             trainer.fit(module, loaders["train"], loaders["val"])
 
-    # Test
-    best_path = best_checkpoint.best_model_path
+    best_choice =  config.training.get("test_choice", "rmse")
+
+    # Test — use best RMSE checkpoint as primary
+    best_path_rmse = best_checkpoint.best_model_path
+    best_photo_path = best_photo_checkpoint.best_model_path
+
+    # Log both checkpoint paths for comparison
+    if trainer.is_global_zero:
+        logger.info("Best RMSE checkpoint: %s", best_path_rmse or "N/A")
+        logger.info("Best photo checkpoint: %s", best_photo_path or "N/A")
+
+    if best_choice == "rmse":
+        best_path = best_path_rmse
+    else:
+        best_path = best_photo_path
 
     # Fallback if training was skipped (enable=False) and best_path is empty in memory
     if not best_path:
         ckpt_dir = output_dir / "checkpoints"
-        best_ckpts = list(ckpt_dir.glob("depthfm-best-*.ckpt"))
+        best_ckpts = list(ckpt_dir.glob(f"depthfm-best-{best_choice}-*.ckpt"))
 
         if best_ckpts:
             import re
@@ -888,12 +914,12 @@ def run_single_training(
 
             # Grab the checkpoint with the lowest RMSE value
             best_path = str(min(best_ckpts, key=extract_rmse))
-            logger.info(f"*** Found best checkpoint via glob: {best_path} ***")
+            logger.info(f"*** Found best {best_choice.upper()} checkpoint via glob: {best_path} ***")
         else:
             logger.warning("*** No best checkpoint found via glob, falling back to last.ckpt ***")
             best_path = str(last_ckpt_path)
     else:
-        logger.info(f"*** Testing with best checkpoint from memory: {best_path} ***")
+        logger.info(f"*** Testing with best {best_choice.upper()} checkpoint from memory: {best_path} ***")
 
     # Test
     trainer.test(
@@ -932,7 +958,16 @@ def run_single_training(
             primary_metric="rmse",
             secondary_metrics=["delta_1", "normal_angular_error"],
             title="Mars DTM: inference quality vs Euler steps",
-            save_path=fig_dir / "timestep_ablation.pdf",
+            save_path=fig_dir / "timestep_ablation_rmse.pdf",
+        )
+        plt.close(fig)
+        fig = plot_timestep_ablation(
+            step_counts=sorted(timestep_results.keys()),
+            metrics_per_step=timestep_results,
+            primary_metric="photo_consistency",
+            secondary_metrics=["delta_1", "normal_angular_error"],
+            title="Mars DTM: inference quality vs Euler steps",
+            save_path=fig_dir / "timestep_ablation_rmse.pdf",
         )
         plt.close(fig)
 
@@ -962,6 +997,8 @@ def run_single_training(
         "test_df": test_df,
         "timestep_ablation": timestep_results,
         "output_dir": output_dir,
+        "best_rmse_ckpt": best_path,
+        "best_photo_ckpt": best_photo_path or "",
     }
 
 
@@ -1011,7 +1048,7 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
 
         fig = plot_multi_run_summary_table(
             [r["test_summary"] for r in all_results],
-            metrics_to_show=["rmse", "abs_rel", "delta_1", "normal_angular_error", "slope_rmse"],
+            metrics_to_show=["rmse", "abs_rel", "si_log", "delta_1", "normal_angular_error", "photo_consistency"],
             title=f"Test results ({n_runs} runs)",
             save_path=fig_dir / "multi_run_summary.pdf",
         )
@@ -1020,7 +1057,7 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
         best_run = min(all_results, key=lambda r: r["test_summary"].get("rmse", {}).get("mean", 1e9))
         fig = plot_metric_distributions(
             best_run["test_df"],
-            metrics_to_plot=["rmse", "abs_rel", "delta_1", "normal_angular_error"],
+            metrics_to_plot=["rmse", "abs_rel", "si_log", "delta_1", "normal_angular_error", "photo_consistency"],
             title="Test metric distributions (best run)",
             save_path=fig_dir / "metric_distributions.pdf",
         )
@@ -1048,7 +1085,16 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
                 primary_metric="rmse",
                 secondary_metrics=["delta_1", "normal_angular_error"],
                 title=f"Inference quality vs Euler steps ({n_runs}-run avg)",
-                save_path=fig_dir / "timestep_ablation_averaged.pdf",
+                save_path=fig_dir / "timestep_ablation_averaged_rmse.pdf",
+            )
+            plt.close(fig)
+            fig = plot_timestep_ablation(
+                step_counts=step_counts,
+                metrics_per_step=averaged_ablation,
+                primary_metric="photo_consistency",
+                secondary_metrics=["delta_1", "normal_angular_error"],
+                title="Mars DTM: inference quality vs Euler steps",
+                save_path=fig_dir / "timestep_ablation_averaged_photo.pdf",
             )
             plt.close(fig)
 
@@ -1103,7 +1149,11 @@ def _print_final_summary(all_results: list[dict], output_dir: Path):
     """Print and save the final multi-run summary."""
     import pandas as pd
 
-    metrics_of_interest = ["rmse", "abs_rel", "delta_1", "delta_2", "normal_angular_error", "slope_rmse"]
+    metrics_of_interest = [
+        "rmse", "abs_rel", "si_log", "delta_1",
+        "normal_angular_error", "slope_rmse",
+        "photo_consistency", "psd_ratio",
+    ]
     rows = []
     for i, r in enumerate(all_results):
         row = {"run": i}
@@ -1201,7 +1251,7 @@ def main():
             if args.view_loss_components:
                 visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
             if args.view_invalid_fill:
-                visualize_invalid_fill(loaders["val"], output_dir=output_path, num_samples=8)
+                visualize_invalid_fill(loaders["train"], output_dir=output_path, num_samples=16)
 
             logger.info("Data inspection complete. Exiting without training.")
         return
