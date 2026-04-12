@@ -42,11 +42,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pandas as pd
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 import torch
+from pykrige.ok import OrdinaryKriging
+from pykrige.uk import UniversalKriging
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
@@ -168,7 +174,6 @@ def _safe_resize(tensor: torch.Tensor, size: int, is_mask: bool = False, has_nan
 
 
 import torch
-import numpy as np
 from scipy import ndimage
 
 
@@ -202,7 +207,6 @@ def fill_invalid_nearest_neighbor(
     )
     # indices: (2, H, W)
 
-    H, W = mask_np.shape
     iy, ix = indices  # each (H, W)
 
     # --------------------------------------------------
@@ -243,14 +247,161 @@ def fill_invalid_nearest_neighbor(
     return torch.from_numpy(filled_np).to(device=device, dtype=dtype)
 
 
-def fill_invalid_smooth_diffusion(
+def fill_voids_kriging(
+        image: torch.Tensor,
+        dtm: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        erode_radius: int = 2,
+        max_training_points: int = 2500,
+        variogram_model: str = "linear",
+        seed: int = 42,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fill voids in an orthoimage and DTM with a single kriging pass per channel.
+
+    Optimised for 512x512 tiles: subsamples valid pixels for training,
+    then predicts every void pixel at once. No iteration, no per-void
+    labelling, no diffusion loop.
+
+    Parameters
+    ----------
+    image : torch.Tensor
+        (C, H, W) or (1, C, H, W), normalised to [-1, 1].
+    dtm : torch.Tensor
+        (1, H, W) or (1, 1, H, W), normalised to [-1, 1].
+    valid_mask : torch.Tensor
+        (1, H, W) or (1, 1, H, W), binary (1 = valid, 0 = void).
+    erode_radius : int
+        Pixels to erode from mask edges before filling.
+    max_training_points : int
+        Cap on valid pixels used for kriging (controls speed).
+        2500 keeps fit under ~1s per channel on CPU.
+    variogram_model : str
+        PyKrige variogram model. 'linear' is best for slope continuation.
+    seed : int
+        RNG seed for reproducible subsampling.
+
+    Returns
+    -------
+    (filled_image, filled_dtm) with the same shapes/dtypes as inputs.
+    """
+    rng = np.random.default_rng(seed)
+
+    # --- shape bookkeeping ------------------------------------------------
+    img_3d = image.ndim == 3
+    dtm_3d = dtm.ndim == 3
+    msk_3d = valid_mask.ndim == 3
+
+    if img_3d:
+        image = image.unsqueeze(0)
+    if dtm_3d:
+        dtm = dtm.unsqueeze(0)
+    if msk_3d:
+        valid_mask = valid_mask.unsqueeze(0)
+
+    device = image.device
+    img_dtype = image.dtype
+    dtm_dtype = dtm.dtype
+
+    # --- erode and convert to numpy ---------------------------------------
+    eroded = erode_valid_mask(valid_mask, erode_radius)
+    valid = eroded[0, 0].cpu().numpy() > 0.5  # (H, W) bool
+    void = ~valid
+
+    img_np = np.nan_to_num(image[0].cpu().numpy(), nan=0.0).astype(np.float64)
+    dtm_np = np.nan_to_num(dtm[0].cpu().numpy(), nan=0.0).astype(np.float64)
+
+    if not void.any():
+        if img_3d:
+            image = image.squeeze(0)
+        if dtm_3d:
+            dtm = dtm.squeeze(0)
+        return image, dtm
+
+    # --- coordinates -------------------------------------------------------
+    y_valid, x_valid = np.where(valid)
+    y_void, x_void = np.where(void)
+
+    n_valid = len(y_valid)
+    if n_valid < 6:
+        logger.warning("Fewer than 6 valid pixels — returning inputs unchanged.")
+        if img_3d:
+            image = image.squeeze(0)
+        if dtm_3d:
+            dtm = dtm.squeeze(0)
+        return image, dtm
+
+    # subsample training set
+    if n_valid > max_training_points:
+        idx = rng.choice(n_valid, size=max_training_points, replace=False)
+        y_train = y_valid[idx].astype(np.float64)
+        x_train = x_valid[idx].astype(np.float64)
+    else:
+        y_train = y_valid.astype(np.float64)
+        x_train = x_valid.astype(np.float64)
+
+    y_pred = y_void.astype(np.float64)
+    x_pred = x_void.astype(np.float64)
+
+    filled_img = img_np.copy()
+    filled_dtm = dtm_np.copy()
+
+    # --- DTM: Universal Kriging (slope continuation) ----------------------
+    for c in range(dtm_np.shape[0]):
+        z_train = dtm_np[c, y_train.astype(int), x_train.astype(int)]
+        try:
+            uk = UniversalKriging(
+                x_train, y_train, z_train,
+                variogram_model=variogram_model,
+                drift_terms=["regional_linear"],
+                verbose=False,
+                enable_plotting=False,
+            )
+            z_pred, _ = uk.execute("points", x_pred, y_pred)
+            filled_dtm[c, y_void, x_void] = np.asarray(z_pred).ravel()
+        except Exception as e:
+            logger.warning("DTM kriging failed (ch %d): %s", c, e)
+
+    # --- Image: Ordinary Kriging (smooth colour) --------------------------
+    for c in range(img_np.shape[0]):
+        z_train = img_np[c, y_train.astype(int), x_train.astype(int)]
+        try:
+            ok = OrdinaryKriging(
+                x_train, y_train, z_train,
+                variogram_model=variogram_model,
+                verbose=False,
+                enable_plotting=False,
+            )
+            z_pred, _ = ok.execute("points", x_pred, y_pred)
+            filled_img[c, y_void, x_void] = np.asarray(z_pred).ravel()
+        except Exception as e:
+            logger.warning("Image kriging failed (ch %d): %s", c, e)
+
+    # --- back to torch ----------------------------------------------------
+    filled_img_t = (
+        torch.from_numpy(filled_img).unsqueeze(0).to(device=device, dtype=img_dtype)
+    )
+    filled_dtm_t = (
+        torch.from_numpy(filled_dtm).unsqueeze(0).to(device=device, dtype=dtm_dtype)
+    )
+
+    if img_3d:
+        filled_img_t = filled_img_t.squeeze(0)
+    if dtm_3d:
+        filled_dtm_t = filled_dtm_t.squeeze(0)
+
+    return filled_img_t, filled_dtm_t
+
+
+def fill_dtm_smart_diffusion(
         tensor: torch.Tensor,
         valid_mask: torch.Tensor,
-        iterations: int = 64
+        iterations: int = 64,
+        erode_radius: int = 2
 ) -> torch.Tensor:
     """
     Fills invalid regions using Laplacian diffusion (solving the heat equation).
-    Creates a perfectly smooth gradient from the valid boundaries down to the global mean.
     """
     is_3d = tensor.ndim == 3
     if is_3d:
@@ -261,33 +412,271 @@ def fill_invalid_smooth_diffusion(
     device = tensor.device
     dtype = tensor.dtype
 
-    # 1. Sanitize the inputs to destroy any hidden NaNs that could poison the convolution
+    # 1. Sanitize the inputs
     tensor = torch.nan_to_num(tensor, nan=0.0)
-    valid_bool = valid_mask > 0.5
 
-    # 2. Calculate the global mean of the valid pixels ONLY
+    # 2. Mask Erosion (Using the corrected function)
+    valid_bool = erode_valid_mask(valid_mask, erode_radius) > 0.5
+
+    # 3. Calculate the global mean
     valid_sum = (tensor * valid_bool.to(dtype)).sum(dim=[-2, -1], keepdim=True)
     valid_count = valid_bool.sum(dim=[-2, -1], keepdim=True).clamp(min=1.0)
     global_mean = valid_sum / valid_count
 
-    # 3. Initialize the working tensor.
-    # Valid pixels keep their real values, invalid empty space starts as the flat global mean.
+    # 4. Initialize working tensor
     filled = torch.where(valid_bool, tensor, global_mean)
 
-    # 4. Create a simple normalized 3x3 averaging kernel
+    # 5. Create averaging kernel
     kernel = torch.ones((C, 1, 3, 3), device=device, dtype=dtype) / 9.0
 
-    # 5. Laplacian Diffusion (Jacobi method)
+    # 6. Laplacian Diffusion
     for _ in range(iterations):
-        # Blur the entire canvas
-        blurred = F.conv2d(filled, kernel, padding=1, groups=C)
+        # -------------------------------------------------------------------------
+        # FIX: Pad the image using 'replicate' instead of F.conv2d's default zeros.
+        # This stops the physical outside edges of the image tensor from dragging
+        # the boundary values down to 0.0 during the blur phase.
+        # -------------------------------------------------------------------------
+        padded_filled = F.pad(filled, pad=(1, 1, 1, 1), mode='replicate')
+        blurred = F.conv2d(padded_filled, kernel, padding=0, groups=C)
 
-        # Re-clamp the original valid regions back to their ground-truth values
-        filled = torch.where(valid_bool, tensor, blurred)
+        # Re-clamp safely eroded regions back to ground-truth
+        filled = torch.where(valid_mask, tensor, blurred)
 
     if is_3d:
         return filled.squeeze(0)
+
     return filled
+
+
+# ---------------------------------------------------------------------------
+# Mask erosion
+# ---------------------------------------------------------------------------
+
+def erode_valid_mask(valid_mask: torch.Tensor, erode_radius: int = 1) -> torch.Tensor:
+    """Erode a binary mask to trim noisy boundary pixels."""
+    if erode_radius <= 0:
+        return valid_mask
+
+    is_3d = valid_mask.ndim == 3
+    if is_3d:
+        valid_mask = valid_mask.unsqueeze(0)
+
+    kernel_size = 2 * erode_radius + 1
+    padded_mask = F.pad(
+        valid_mask,
+        pad=(erode_radius, erode_radius, erode_radius, erode_radius),
+        mode="constant",
+        value=1.0,
+    )
+    eroded_mask = -F.max_pool2d(
+        -padded_mask, kernel_size=kernel_size, stride=1, padding=0
+    )
+    eroded_mask = (eroded_mask > 0.5).float()
+
+    if is_3d:
+        return eroded_mask.squeeze(0)
+    return eroded_mask
+
+
+# ---------------------------------------------------------------------------
+# Vectorised graph Laplacian
+# ---------------------------------------------------------------------------
+@lru_cache
+def _build_grid_laplacian(H: int, W: int, connectivity: int = 4) -> sp.csc_matrix:
+    """
+    Build graph Laplacian L = D - W for an H×W grid.
+    Fully vectorised — no Python loops over pixels.
+    """
+    N = H * W
+    idx = np.arange(N).reshape(H, W)
+
+    # Collect all (i, j) neighbour pairs
+    pairs = []
+
+    # Horizontal: every pixel to its right neighbour
+    left = idx[:, :-1].ravel()
+    right = idx[:, 1:].ravel()
+    pairs.append((left, right))
+
+    # Vertical: every pixel to its lower neighbour
+    top = idx[:-1, :].ravel()
+    bot = idx[1:, :].ravel()
+    pairs.append((top, bot))
+
+    if connectivity == 8:
+        # Diagonal ↘
+        tl = idx[:-1, :-1].ravel()
+        br = idx[1:, 1:].ravel()
+        pairs.append((tl, br))
+        # Diagonal ↙
+        tr = idx[:-1, 1:].ravel()
+        bl = idx[1:, :-1].ravel()
+        pairs.append((tr, bl))
+
+    # Stack all edges
+    src = np.concatenate([p[0] for p in pairs] + [p[1] for p in pairs])
+    dst = np.concatenate([p[1] for p in pairs] + [p[0] for p in pairs])
+
+    # Off-diagonal: W_{ij} = -1 for neighbours
+    n_edges = len(src)
+    off_diag = sp.coo_matrix(
+        (-np.ones(n_edges), (src, dst)), shape=(N, N)
+    )
+
+    # Diagonal: D_{ii} = degree of node i
+    degree = np.zeros(N)
+    np.add.at(degree, src, 1.0)
+    diag = sp.diags(degree, format="coo")
+
+    L = (diag + off_diag).tocsc()
+    return L
+
+
+# ---------------------------------------------------------------------------
+# Conditional GMRF solve
+# ---------------------------------------------------------------------------
+
+def _gmrf_fill_channel(
+        channel: np.ndarray,
+        void_idx: np.ndarray,
+        obs_idx: np.ndarray,
+        Q: sp.csc_matrix,
+        nugget: float,
+) -> np.ndarray:
+    """
+    Fill void pixels via  u_void = -Q_vv⁻¹ Q_vo u_obs.
+    """
+    flat = channel.ravel().astype(np.float64)
+
+    Q_vv = Q[np.ix_(void_idx, void_idx)] + nugget * sp.eye(len(void_idx), format="csc")
+    Q_vo = Q[np.ix_(void_idx, obs_idx)]
+
+    rhs = -Q_vo @ flat[obs_idx]
+
+    try:
+        u_void = spla.spsolve(Q_vv, rhs)
+    except Exception as e:
+        logger.warning("spsolve failed (%s), using LSQR.", e)
+        u_void = spla.lsqr(Q_vv, rhs)[0]
+
+    filled = flat.copy()
+    filled[void_idx] = u_void
+    return filled.reshape(channel.shape)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def fill_voids_gmrf(
+        image: torch.Tensor,
+        dtm: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        erode_radius: int = 2,
+        connectivity: int = 4,
+        tau: float = 1.0,
+        nugget: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fill voids in an orthoimage and DTM using GMRF conditional distribution.
+
+    One sparse linear solve per channel. No iteration. O(n^{3/2}) on 2D grids.
+
+    Parameters
+    ----------
+    image : torch.Tensor
+        (C, H, W) or (1, C, H, W).
+    dtm : torch.Tensor
+        (1, H, W) or (1, 1, H, W).
+    valid_mask : torch.Tensor
+        (1, H, W) or (1, 1, H, W), binary (1 = valid, 0 = void).
+    erode_radius : int
+        Pixels to erode from mask edges.
+    connectivity : int
+        4 (rook) or 8 (queen) pixel neighbours.
+    tau : float
+        Precision scale (higher = stronger spatial smoothing).
+    nugget : float
+        Small diagonal regularisation for numerical stability.
+
+    Returns
+    -------
+    (filled_image, filled_dtm, eroded_mask)
+        filled_image, filled_dtm: same shapes/dtypes as inputs, voids filled.
+        eroded_mask: the post-erosion binary mask, same shape as valid_mask input.
+            After filling, all pixels are valid, but this mask records which
+            pixels were considered trustworthy (1) vs infilled (0).
+    """
+    # --- shape bookkeeping ------------------------------------------------
+    img_3d = image.ndim == 3
+    dtm_3d = dtm.ndim == 3
+    msk_3d = valid_mask.ndim == 3
+
+    if img_3d:
+        image = image.unsqueeze(0)
+    if dtm_3d:
+        dtm = dtm.unsqueeze(0)
+    if msk_3d:
+        valid_mask = valid_mask.unsqueeze(0)
+
+    device = image.device
+    img_dtype = image.dtype
+    dtm_dtype = dtm.dtype
+
+    # --- erode and convert to numpy ---------------------------------------
+    eroded = erode_valid_mask(valid_mask, erode_radius)
+    valid = eroded[0, 0].cpu().numpy() > 0.5
+
+    img_np = np.nan_to_num(image[0].cpu().numpy(), nan=0.0).astype(np.float64)
+    dtm_np = np.nan_to_num(dtm[0].cpu().numpy(), nan=0.0).astype(np.float64)
+
+    if not (~valid).any():
+        eroded_out = eroded
+        if img_3d:
+            image = image.squeeze(0)
+        if dtm_3d:
+            dtm = dtm.squeeze(0)
+        if msk_3d:
+            eroded_out = eroded_out.squeeze(0)
+        return image, dtm, eroded_out
+
+    H, W = valid.shape
+
+    # --- build Laplacian and index sets (shared across channels) ----------
+    L = _build_grid_laplacian(H, W, connectivity)
+    Q = tau * L
+
+    obs_idx = np.where(valid.ravel())[0]
+    void_idx = np.where(~valid.ravel())[0]
+
+    logger.debug(
+        "GMRF fill: %d void pixels (%.1f%%), %d-connected, H=%d W=%d",
+        len(void_idx), 100.0 * len(void_idx) / (H * W), connectivity, H, W,
+    )
+
+    # --- fill each channel ------------------------------------------------
+    filled_dtm = dtm_np.copy()
+    filled_img = img_np.copy()
+
+    for c in range(dtm_np.shape[0]):
+        filled_dtm[c] = _gmrf_fill_channel(dtm_np[c], void_idx, obs_idx, Q, nugget)
+
+    for c in range(img_np.shape[0]):
+        filled_img[c] = _gmrf_fill_channel(img_np[c], void_idx, obs_idx, Q, nugget)
+
+    # --- back to torch ----------------------------------------------------
+    filled_img_t = torch.from_numpy(filled_img).unsqueeze(0).to(device=device, dtype=img_dtype)
+    filled_dtm_t = torch.from_numpy(filled_dtm).unsqueeze(0).to(device=device, dtype=dtm_dtype)
+
+    if img_3d:
+        filled_img_t = filled_img_t.squeeze(0)
+    if dtm_3d:
+        filled_dtm_t = filled_dtm_t.squeeze(0)
+    if msk_3d:
+        eroded = eroded.squeeze(0)
+
+    return filled_img_t, filled_dtm_t, eroded
 
 
 def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.15) -> bool:
@@ -584,9 +973,11 @@ class DepthFMHiRISEAdapterCached(Dataset):
             stats_path: str | None = None,
             use_manifest: bool = True,
             manifest_workers: int = 16,  # Set this high to build the cache fast
-            manifest_dir: str = ".cache/manifests"
+            manifest_dir: str = ".cache/manifests",
+            erode_radius: int = 2,
     ):
         super().__init__()
+        self.erode_radius = erode_radius
         self.base = base_dataset
         self.sampler = sampler
         self.resolution = resolution
@@ -819,8 +1210,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
         # --- PRE-VAE NEAREST NEIGHBOR FILL ---
         # Fills regions outside the valid mask so the VAE doesn't encode sharp black boundaries
-        dtm = fill_invalid_smooth_diffusion(dtm, valid_mask_resized)
-        image = fill_invalid_smooth_diffusion(image, valid_mask_resized)
+        # 2. Mask Erosion (Using the corrected function)
+        image, dtm, valid_mask_resized = fill_voids_gmrf(image, dtm, valid_mask_resized)
 
         dtm = _to_3ch(dtm)
         image = _to_3ch(image)

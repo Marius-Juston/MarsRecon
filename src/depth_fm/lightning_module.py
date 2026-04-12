@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from depth_fm.losses import CombinedLoss
-from depth_fm.metrics import compute_depth_metrics, MetricsAggregator
+from depth_fm.metrics import compute_depth_metrics, compute_photo_consistency, MetricsAggregator
 from depth_fm.model import build_model
 from depth_fm.noise import q_sample
 
@@ -93,6 +93,10 @@ class DepthFMLightningModule(L.LightningModule):
 
         # Cache for grad norm logging (avoid recomputing every step)
         self._grad_norm_log_interval = 50
+
+        # Directory for vector-format (PDF) figures for paper use.
+        # Resolved lazily from trainer.default_root_dir once training starts.
+        self._vector_fig_dir: str | None = None
 
     def _trace(self, msg: str):
         """Helper to print explicit DDP synchronization trace logs."""
@@ -250,6 +254,8 @@ class DepthFMLightningModule(L.LightningModule):
         self.log("train/loss_freq", loss_dict["freq"], rank_zero_only=True)
         self.log("train/loss_grad", loss_dict["grad"], rank_zero_only=True)
         self.log("train/lr", self.optimizers().param_groups[0]["lr"], rank_zero_only=True)
+        if "lunar_lambert_weight" in loss_dict:
+            self.log("train/lunar_lambert_weight", loss_dict["lunar_lambert_weight"], rank_zero_only=True)
 
         if self.val_history and batch_idx == 0:
             self.val_history["train/loss"].append(loss_dict["total"].item())
@@ -274,7 +280,20 @@ class DepthFMLightningModule(L.LightningModule):
                 self._trace(f"training_step: rank 0 finished train visuals in {vis_dur:.2f}s")
 
         self._trace(f"Exiting training_step for batch {batch_idx}")
-        return loss_dict["total"]
+
+        # Final NaN guard — prevent NaN from reaching the optimizer.
+        # Under DDP + gradient accumulation, a single NaN poisons all
+        # accumulated grads across all ranks.
+        total_loss = loss_dict["total"]
+        if not torch.isfinite(total_loss):
+            logger.warning(
+                "training_step: NaN/Inf loss at step %d batch %d. "
+                "Returning zero to skip this step.",
+                step, batch_idx,
+            )
+            return torch.tensor(0.0, device=total_loss.device, requires_grad=True)
+
+        return total_loss
 
     # ------------------------------------------------------------------
     # Validation step — DDP-safe
@@ -293,6 +312,8 @@ class DepthFMLightningModule(L.LightningModule):
         self._trace("Entered on_validation_epoch_start")
         self._val_aggregator = MetricsAggregator()
         self._val_vis_data = None
+        # Store per-sample data for worst/best gallery plots
+        self._val_gallery_data: dict[str, dict] = {}
         self._trace("Exiting on_validation_epoch_start")
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
@@ -335,11 +356,50 @@ class DepthFMLightningModule(L.LightningModule):
             vel_loss = F.mse_loss(v_pred, v_target)
         self.log("val/loss", vel_loss, prog_bar=True, sync_dist=False)
 
-        # Per-sample metrics
+        # Per-sample metrics (including photo consistency when sun data available)
         for i in range(pred_pix.shape[0]):
             tile_id = batch.get("tile_id", [""])[i] if "tile_id" in batch else f"b{batch_idx}_s{i}"
             metrics = compute_depth_metrics(pred_pix[i], gt_raw[i], align=True)
+
+            # Compute photometric consistency if sun data is available
+            if "sun_vector" in batch and "intensity" in batch and "ambient" in batch:
+                from depth_fm.metrics import affine_align
+                pred_aligned_i, _, _ = affine_align(pred_pix[i], gt_raw[i])
+                img_i = batch["image"][i].float().cpu().numpy()
+                if img_i.shape[0] == 3:
+                    ortho_gray_i = img_i.mean(axis=0)
+                else:
+                    ortho_gray_i = img_i[0]
+                # Denormalize from [-1,1] to [0,1]
+                ortho_gray_i = (ortho_gray_i + 1.0) / 2.0
+                sv_i = batch["sun_vector"][i].cpu().numpy()
+                int_i = batch["intensity"][i].item()
+                amb_i = batch["ambient"][i].item()
+                ll_w = self.loss_fn.photo_loss.lunar_lambert_weight.item() if hasattr(
+                    self.loss_fn.photo_loss, 'lunar_lambert_weight') else 0.5
+                try:
+                    photo_score = compute_photo_consistency(
+                        pred_aligned_i, ortho_gray_i, sv_i, int_i, amb_i, ll_w,
+                        valid_mask=(conf_mask[i] > 0.5) if conf_mask is not None else None,
+                    )
+                    metrics.photo_consistency = photo_score
+                except Exception:
+                    pass
+
             self._val_aggregator.add(metrics, tile_id)
+
+            # Store per-sample data for worst/best gallery (limit memory: keep max 50)
+            if len(self._val_gallery_data) < 50:
+                img_i = batch["image"][i].float().cpu().numpy()
+                if img_i.shape[0] == 3:
+                    img_i = np.transpose(img_i, (1, 2, 0))
+                    img_i = (img_i + 1.0) / 2.0
+                self._val_gallery_data[tile_id] = {
+                    "image": img_i,
+                    "pred": pred_pix[i].copy(),
+                    "gt": gt_raw[i].copy(),
+                    "rmse": metrics.rmse,
+                }
 
         flow_intermediates = None
         flow_vis_every = self.config.training.get("flow_vis_every_steps", 500)
@@ -366,9 +426,13 @@ class DepthFMLightningModule(L.LightningModule):
         self._trace("Entered on_validation_epoch_end")
         summary = self._val_aggregator.summary()
 
+        # State-of-the-art metric set:
+        # SILog (Eigen 2014, KITTI primary) replaces delta_2/delta_3 as more informative
+        # photo_consistency captures resolution-independent quality
         _FIXED_VAL_METRICS = [
-            "rmse", "abs_rel", "delta_1", "delta_2", "delta_3",
+            "rmse", "abs_rel", "si_log", "delta_1",
             "normal_angular_error", "slope_rmse",
+            "photo_consistency", "psd_ratio",
         ]
 
         self._trace("on_validation_epoch_end: Starting mandatory sync_dist collective calls")
@@ -382,6 +446,10 @@ class DepthFMLightningModule(L.LightningModule):
                  sync_dist=True)
         self.log("val/delta_1_mean", summary.get("delta_1", {}).get("mean", 0) if summary else 0.0, prog_bar=True,
                  sync_dist=True)
+        # Photo consistency as prog_bar metric for dual-checkpoint monitoring
+        self.log("val/photo_consistency_mean",
+                 summary.get("photo_consistency", {}).get("mean", 0) if summary else 0.0,
+                 prog_bar=True, sync_dist=True)
         self._trace("on_validation_epoch_end: Finished mandatory sync_dist collective calls")
 
         if not summary:
@@ -394,9 +462,13 @@ class DepthFMLightningModule(L.LightningModule):
                 self.val_history.setdefault(key, []).append(summary[metric_key]["mean"])
 
         worst = self._val_aggregator.worst_k("rmse", k=5)
+        best = self._val_aggregator.best_k("rmse", k=5)
         if worst:
             logger.info("Worst 5 val patches by RMSE: %s",
                         ", ".join(f"{tid}={v:.2f}m" for tid, v in worst))
+        if best:
+            logger.info("Best 5 val patches by RMSE: %s",
+                        ", ".join(f"{tid}={v:.2f}m" for tid, v in best))
 
         if self.global_rank == 0 and self._val_vis_data is not None:
             if self.logger and hasattr(self.logger, "experiment"):
@@ -408,10 +480,18 @@ class DepthFMLightningModule(L.LightningModule):
                     vd["pred_pix"], vd["gt_raw"], vd["conf_mask"],
                     flow_intermediates=vd.get("flow_intermediates"),
                 )
+
+                # Log worst/best 5 gallery for val
+                self._log_gallery("val", worst, best)
+
                 vis_dur = time.perf_counter() - start_vis
                 self._trace(f"on_validation_epoch_end: Rank 0 finished visual logging uploads in {vis_dur:.2f}s")
 
+            # Upload all vector PDFs as a downloadable wandb artifact
+            self._upload_vector_figures_artifact(prefix="val")
+
         self._val_vis_data = None
+        self._val_gallery_data = {}
         self._trace("Exiting on_validation_epoch_end")
 
     def _log_validation_visuals(
@@ -578,12 +658,52 @@ class DepthFMLightningModule(L.LightningModule):
         except Exception as e:
             logger.exception("Training visual logging failed")
 
+    def _get_vector_fig_dir(self) -> str:
+        """Return (and create) the directory for vector-format PDF figures."""
+        if self._vector_fig_dir is None:
+            from pathlib import Path
+            root = getattr(self.trainer, "default_root_dir", "outputs")
+            d = Path(root) / "vector_figures"
+            d.mkdir(parents=True, exist_ok=True)
+            self._vector_fig_dir = str(d)
+        return self._vector_fig_dir
+
     def _log_figure(self, tag: str, fig, step: int):
-        """Log a matplotlib figure to the active logger."""
-        if self.logger is None:
+        """Log a matplotlib figure as BOTH a raster preview and a vector PDF.
+
+        Strategy for publication-quality outputs:
+          1. Save as PDF locally in vector_figures/ — lossless vector format
+             ready for LaTeX/Overleaf inclusion.
+          2. Log a raster preview to wandb via wandb.Image() for quick
+             browsing in the web UI.
+
+        The PDFs are additionally bundled into a wandb Artifact at the end
+        of each validation/test epoch for bulk download.
+        """
+        from pathlib import Path
+
+        if self.logger is None and self.global_rank != 0:
             return
+
+        # --- 1. Save vector PDF locally ---
         try:
-            if hasattr(self.logger, "experiment"):
+            fig_dir = self._get_vector_fig_dir()
+            # Sanitise tag for filename: "val/triptych" → "val_triptych"
+            safe_name = tag.replace("/", "_").replace("\\", "_")
+            pdf_path = Path(fig_dir) / f"{safe_name}_step{step}.pdf"
+            fig.savefig(
+                str(pdf_path),
+                format="pdf",
+                bbox_inches="tight",
+                dpi=300,           # embedded raster elements (images) at 300 DPI
+                metadata={"Creator": "Mars DepthFM", "Subject": tag},
+            )
+        except Exception:
+            logger.exception(f"Failed to save vector PDF for {tag}")
+
+        # --- 2. Log raster preview to wandb / tensorboard ---
+        try:
+            if self.logger is not None and hasattr(self.logger, "experiment"):
                 exp = self.logger.experiment
                 if hasattr(exp, "log"):
                     import wandb
@@ -591,7 +711,115 @@ class DepthFMLightningModule(L.LightningModule):
                 elif hasattr(exp, "add_figure"):
                     exp.add_figure(tag, fig, global_step=step)
         except Exception:
-            logger.exception(f"Failed to log figure {tag}")
+            logger.exception(f"Failed to log raster preview for {tag}")
+
+    def _upload_vector_figures_artifact(self, prefix: str = "val"):
+        """Bundle all accumulated vector PDFs into a wandb Artifact for download.
+
+        Called at the end of each val/test epoch so all figures from that
+        epoch are available as a single downloadable artifact in the wandb UI.
+
+        Navigate to:  Artifacts → "figures-{prefix}" → Files tab → Download
+        """
+        from pathlib import Path
+
+        if self.global_rank != 0:
+            return
+        if self.logger is None or not hasattr(self.logger, "experiment"):
+            return
+
+        fig_dir = Path(self._get_vector_fig_dir())
+        pdfs = sorted(fig_dir.glob("*.pdf"))
+        if not pdfs:
+            return
+
+        try:
+            import wandb
+            exp = self.logger.experiment
+            if not hasattr(exp, "log_artifact"):
+                return
+
+            artifact = wandb.Artifact(
+                name=f"figures-{prefix}-step{self.global_step}",
+                type="figures",
+                description=f"Vector PDF figures from {prefix} epoch "
+                            f"(step {self.global_step}). Ready for LaTeX.",
+            )
+            for pdf in pdfs:
+                artifact.add_file(str(pdf), name=pdf.name)
+            exp.log_artifact(artifact)
+            logger.info(
+                "Uploaded %d vector PDFs as wandb artifact 'figures-%s-step%d'",
+                len(pdfs), prefix, self.global_step,
+            )
+        except Exception:
+            logger.exception("Failed to upload vector figures artifact")
+
+    def _log_gallery(self, prefix: str, worst: list, best: list):
+        """Log worst/best 5 gallery plots to wandb for troubleshooting.
+
+        Args:
+            prefix: "val" or "test"
+            worst: list of (tile_id, rmse_value) for worst patches
+            best: list of (tile_id, rmse_value) for best patches
+        """
+        if self.global_rank != 0 or self.logger is None:
+            return
+
+        gallery_data = getattr(self, f"_{prefix}_gallery_data", {})
+        if not gallery_data:
+            return
+
+        try:
+            from depth_fm.visualization import plot_patch_gallery
+            import matplotlib.pyplot as plt
+
+            step = self.global_step
+
+            # Build worst gallery patches
+            worst_patches = []
+            for tile_id, rmse_val in worst[:5]:
+                if tile_id in gallery_data:
+                    d = gallery_data[tile_id]
+                    worst_patches.append({
+                        "image": d["image"],
+                        "pred": d["pred"],
+                        "gt": d["gt"],
+                        "tile_id": tile_id,
+                        "rmse": rmse_val,
+                    })
+
+            if worst_patches:
+                fig = plot_patch_gallery(
+                    worst_patches,
+                    title=f"{prefix.upper()} Worst {len(worst_patches)} by RMSE (step {step})",
+                )
+                self._log_figure(f"{prefix}/worst_5_gallery", fig, step)
+                plt.close(fig)
+
+            # Build best gallery patches
+            best_patches = []
+            for tile_id, rmse_val in best[:5]:
+                if tile_id in gallery_data:
+                    d = gallery_data[tile_id]
+                    best_patches.append({
+                        "image": d["image"],
+                        "pred": d["pred"],
+                        "gt": d["gt"],
+                        "tile_id": tile_id,
+                        "rmse": rmse_val,
+                    })
+
+            if best_patches:
+                fig = plot_patch_gallery(
+                    best_patches,
+                    title=f"{prefix.upper()} Best {len(best_patches)} by RMSE (step {step})",
+                )
+                self._log_figure(f"{prefix}/best_5_gallery", fig, step)
+                plt.close(fig)
+
+        except Exception:
+            logger.exception(f"Gallery logging failed for {prefix}")
 
     # ------------------------------------------------------------------
     # Test step
@@ -600,6 +828,7 @@ class DepthFMLightningModule(L.LightningModule):
     def on_test_epoch_start(self) -> None:
         self._trace("Entered on_test_epoch_start")
         self._test_aggregator = MetricsAggregator()
+        self._test_gallery_data: dict[str, dict] = {}
         self._trace("Exited on_test_epoch_start")
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
@@ -615,11 +844,55 @@ class DepthFMLightningModule(L.LightningModule):
 
         pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
         gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
+        gt_raw = batch["dtm"][:, 0].float().cpu().numpy()
+
+        if "confidence" in batch:
+            conf_mask = batch["confidence"][:, 0].float().cpu().numpy()
+        else:
+            conf_mask = np.ones_like(gt_raw)
 
         for i in range(pred_pix.shape[0]):
             tile_id = batch.get("tile_id", [""])[i] if "tile_id" in batch else f"b{batch_idx}_s{i}"
-            metrics = compute_depth_metrics(pred_pix[i], gt_pix[i], align=True)
+            metrics = compute_depth_metrics(pred_pix[i], gt_raw[i], align=True)
+
+            # Compute photometric consistency if sun data available
+            if "sun_vector" in batch and "intensity" in batch and "ambient" in batch:
+                from depth_fm.metrics import affine_align
+                pred_aligned_i, _, _ = affine_align(pred_pix[i], gt_raw[i])
+                img_i = batch["image"][i].float().cpu().numpy()
+                if img_i.shape[0] == 3:
+                    ortho_gray_i = img_i.mean(axis=0)
+                else:
+                    ortho_gray_i = img_i[0]
+                ortho_gray_i = (ortho_gray_i + 1.0) / 2.0
+                sv_i = batch["sun_vector"][i].cpu().numpy()
+                int_i = batch["intensity"][i].item()
+                amb_i = batch["ambient"][i].item()
+                ll_w = self.loss_fn.photo_loss.lunar_lambert_weight.item() if hasattr(
+                    self.loss_fn.photo_loss, 'lunar_lambert_weight') else 0.5
+                try:
+                    photo_score = compute_photo_consistency(
+                        pred_aligned_i, ortho_gray_i, sv_i, int_i, amb_i, ll_w,
+                        valid_mask=(conf_mask[i] > 0.5) if conf_mask is not None else None,
+                    )
+                    metrics.photo_consistency = photo_score
+                except Exception:
+                    pass
+
             self._test_aggregator.add(metrics, tile_id)
+
+            # Store per-sample data for worst/best gallery (limit memory)
+            if len(self._test_gallery_data) < 50:
+                img_i = batch["image"][i].float().cpu().numpy()
+                if img_i.shape[0] == 3:
+                    img_i = np.transpose(img_i, (1, 2, 0))
+                    img_i = (img_i + 1.0) / 2.0
+                self._test_gallery_data[tile_id] = {
+                    "image": img_i,
+                    "pred": pred_pix[i].copy(),
+                    "gt": gt_raw[i].copy(),
+                    "rmse": metrics.rmse,
+                }
 
         self._trace(f"Exiting test_step for batch {batch_idx}")
 
@@ -628,8 +901,9 @@ class DepthFMLightningModule(L.LightningModule):
         summary = self._test_aggregator.summary()
 
         _FIXED_TEST_METRICS = [
-            "rmse", "abs_rel", "delta_1", "delta_2", "delta_3",
+            "rmse", "abs_rel", "si_log", "delta_1",
             "normal_angular_error", "slope_rmse",
+            "photo_consistency", "psd_ratio",
         ]
 
         self._trace("on_test_epoch_end: Starting mandatory sync_dist collective calls")
@@ -650,6 +924,22 @@ class DepthFMLightningModule(L.LightningModule):
                 logger.info("  %-25s  %.4f ± %.4f", m, s["mean"], s["std"])
             logger.info("=" * 60)
 
+            # Log worst/best 5 gallery for test
+            worst = self._test_aggregator.worst_k("rmse", k=5)
+            best = self._test_aggregator.best_k("rmse", k=5)
+            if worst:
+                logger.info("Worst 5 test patches by RMSE: %s",
+                            ", ".join(f"{tid}={v:.2f}m" for tid, v in worst))
+            if best:
+                logger.info("Best 5 test patches by RMSE: %s",
+                            ", ".join(f"{tid}={v:.2f}m" for tid, v in best))
+
+            self._log_gallery("test", worst, best)
+
+            # Upload all vector PDFs as a downloadable wandb artifact
+            self._upload_vector_figures_artifact(prefix="test")
+
+        self._test_gallery_data = {}
         self._trace("Exiting on_test_epoch_end")
 
     # ------------------------------------------------------------------

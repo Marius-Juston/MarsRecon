@@ -169,8 +169,41 @@ import torch.nn.functional as F
 
 
 class PhotoclinometricLoss(nn.Module):
-    def __init__(self):
+    """State-of-the-art photoclinometric loss for planetary DTM estimation.
+
+    Improvements over simple Lambertian:
+      1. Lunar-Lambert reflectance model (McEwen 1991; Hapke 2012):
+         Blends Lambertian and Lommel-Seeliger components with a learnable
+         weight, correctly modeling the limb-darkening behaviour of regolith.
+      2. Multi-scale rendering at 1×, 2×, 4× — enforces macro-scale
+         topographic consistency alongside fine detail.
+      3. Combined Pearson + SSIM loss — Pearson captures global correlation,
+         SSIM captures local structural similarity (Wang et al. 2004).
+         SSIM is more perceptually meaningful and produces stabler gradients
+         than pure Pearson at convergence.
+      4. Variance floor and proper epsilon handling to prevent NaN gradients
+         when renders are near-flat (e.g. shadow regions).
+
+    The loss is:
+        L = (1 - α) * (1 - Pearson) + α * (1 - SSIM)
+    averaged over scales, where α = 0.5 by default.
+
+    NaN-safety:
+        Every code path is hardened against NaN under DDP + gradient
+        accumulation + mixed precision.  Key invariants:
+        - NEVER early-return with a detached zero — always flow through
+          self.lunar_lambert_logit so DDP gradient sync sees every param.
+        - All internal math forced to float32 to avoid bf16/fp16 overflow
+          from the spatial_scale multiplication (up to 256×).
+        - sqrt() always gets eps inside to prevent ∞ gradients.
+        - F.normalize always gets eps > 0.
+        - Lommel-Seeliger cos_e clamped to prevent denominator collapse.
+    """
+
+    def __init__(self, ssim_weight: float = 0.5, scales: tuple[int, ...] = (1, 2, 4)):
         super().__init__()
+        self.ssim_weight = ssim_weight
+        self.scales = scales
 
         # Sobel kernels for computing surface gradients
         sobel_x = torch.tensor([[-1., 0., 1.],
@@ -183,24 +216,214 @@ class PhotoclinometricLoss(nn.Module):
         self.register_buffer("kernel_x", sobel_x.view(1, 1, 3, 3))
         self.register_buffer("kernel_y", sobel_y.view(1, 1, 3, 3))
 
-    def _get_surface_normals(self, depth: torch.Tensor) -> torch.Tensor:
-        """Calculates (Nx, Ny, Nz) unit normals from the depth map."""
-        B, C, H, W = depth.shape
+        # Learnable Lunar-Lambert blend: sigmoid(raw) → L ∈ (0, 1)
+        # L=1 → pure Lambertian, L=0 → pure Lommel-Seeliger
+        # Initialised at 0.0 → sigmoid(0)=0.5 (equal blend)
+        self.lunar_lambert_logit = nn.Parameter(torch.tensor(0.0))
 
-        # Spatial scaling factor ensures gradients match physical slope dimensions
+    @property
+    def lunar_lambert_weight(self) -> torch.Tensor:
+        return torch.sigmoid(self.lunar_lambert_logit)
+
+    def _zero_loss(self) -> torch.Tensor:
+        """Return a zero loss that is CONNECTED to all parameters.
+
+        Critical for DDP: if any rank skips the real loss (e.g. no valid
+        pixels), it must still produce gradients for every parameter that
+        other ranks are updating.  A plain `torch.tensor(0.0)` would cause
+        a DDP gradient sync mismatch → hang or NaN.
+
+        The `0.0 * sigmoid(logit)` produces zero loss with a zero gradient
+        for the logit, which is compatible with the real gradient on other
+        ranks.
+        """
+        return 0.0 * self.lunar_lambert_weight
+
+    def _get_surface_normals(self, depth: torch.Tensor) -> torch.Tensor:
+        """Calculates (Nx, Ny, Nz) unit normals from the depth map.
+
+        All math in float32 to prevent bf16 overflow: spatial_scale can be
+        up to 256 and Sobel gradients multiply by that, easily exceeding
+        fp16 max (~65504) with large depth values.
+        """
+        B, C, H, W = depth.shape
         spatial_scale = max(H, W) / 2.0
 
-        padded = F.pad(depth, (1, 1, 1, 1), mode='replicate')
+        # Force float32 for numerical safety
+        depth_f32 = depth.float()
+        kx = self.kernel_x.float()
+        ky = self.kernel_y.float()
 
-        dz_dx = F.conv2d(padded, self.kernel_x) * spatial_scale
-        dz_dy = F.conv2d(padded, self.kernel_y) * spatial_scale
+        padded = F.pad(depth_f32, (1, 1, 1, 1), mode='replicate')
+        dz_dx = F.conv2d(padded, kx) * spatial_scale
+        dz_dy = F.conv2d(padded, ky) * spatial_scale
+
+        # Clamp extreme gradients to prevent downstream overflow
+        grad_clamp = 1e4
+        dz_dx = dz_dx.clamp(-grad_clamp, grad_clamp)
+        dz_dy = dz_dy.clamp(-grad_clamp, grad_clamp)
 
         n_x = -dz_dx
         n_y = -dz_dy
         n_z = torch.ones_like(n_x)
-
         normals = torch.cat([n_x, n_y, n_z], dim=1)
-        return F.normalize(normals, p=2, dim=1)
+        # eps=1e-6 prevents NaN from zero-norm vectors (degenerate surfaces)
+        return F.normalize(normals, p=2, dim=1, eps=1e-6)
+
+    def _lunar_lambert_render(
+            self, normals: torch.Tensor, l_dir: torch.Tensor,
+            intensity: torch.Tensor, ambient: torch.Tensor,
+    ) -> torch.Tensor:
+        """Full Lunar-Lambert reflectance (McEwen 1991).
+
+        NaN-safe: cos_e is clamped to [1e-4, 1] to prevent Lommel-Seeliger
+        denominator collapse.  Even at extreme incidence angles where
+        cos_i ≈ 0 and cos_e ≈ 0, the division stays bounded.
+        """
+        # Cosine of incidence angle
+        cos_i = torch.sum(normals * l_dir, dim=1, keepdim=True)
+        cos_i_clamped = torch.clamp(cos_i, min=0.0)
+
+        # Cosine of emission angle (Z-normal for nadir view)
+        # Clamp to [1e-4, 1] — cos_e near zero means the surface is edge-on
+        # to the camera, which is physically degenerate for nadir imagery.
+        cos_e = normals[:, 2:3, :, :].clamp(min=1e-4)
+
+        # Lambertian and Lommel-Seeliger components
+        lambert = cos_i_clamped
+        # With cos_e ≥ 1e-4, denominator ≥ 1e-4, so gradient stays bounded
+        lommel_seeliger = cos_i_clamped / (cos_i_clamped + cos_e + 1e-6)
+
+        # Learnable blend
+        L = self.lunar_lambert_weight
+        render = (L * lambert + (1.0 - L) * lommel_seeliger) * intensity + ambient
+        return torch.clamp(render, min=-1.0, max=1.0)
+
+    def _masked_pearson(
+            self, render: torch.Tensor, ortho: torch.Tensor,
+            valid_mask: torch.Tensor, B: int,
+    ) -> torch.Tensor:
+        """Pearson correlation loss, NaN-safe for DDP.
+
+        Returns scalar loss connected to the computation graph.
+        If no valid pixels exist, returns self._zero_loss() instead of
+        a detached tensor.
+        """
+        valid_counts = valid_mask.view(B, -1).sum(dim=1).view(B, 1, 1, 1).float()
+        H, W = render.shape[-2:]
+        min_pixels = max(100, int(H * W * 0.05))
+
+        # Handle scalar vs 1-element tensor from squeeze
+        vc_squeezed = valid_counts.view(B)
+        valid_batch = (vc_squeezed > min_pixels)
+
+        if not valid_batch.any():
+            return self._zero_loss()
+
+        r_masked = render * valid_mask
+        o_masked = ortho * valid_mask
+
+        r_mean = r_masked.view(B, -1).sum(dim=1).view(B, 1, 1, 1) / (valid_counts + 1e-8)
+        o_mean = o_masked.view(B, -1).sum(dim=1).view(B, 1, 1, 1) / (valid_counts + 1e-8)
+
+        r_centered = (render - r_mean) * valid_mask
+        o_centered = (ortho - o_mean) * valid_mask
+
+        cov = (r_centered * o_centered).view(B, -1).sum(dim=1)
+        var_r = (r_centered ** 2).view(B, -1).sum(dim=1)
+        var_o = (o_centered ** 2).view(B, -1).sum(dim=1)
+
+        # Variance floor: skip near-flat renders / uniform ortho patches
+        min_var = 1e-4
+        has_variance = (var_r > min_var) & (var_o > min_var)
+        final_valid = valid_batch & has_variance
+
+        if not final_valid.any():
+            return self._zero_loss()
+
+        # eps INSIDE sqrt to prevent ∞ gradient at var→0
+        denom = torch.sqrt(var_r * var_o + 1e-8)
+        correlation = cov / (denom + 1e-8)
+
+        # Clamp correlation to [-1, 1] — floating point can exceed this
+        correlation = correlation.clamp(-1.0, 1.0)
+
+        pearson_loss = 1.0 - correlation[final_valid].mean()
+
+        # Clamp the final loss to prevent extreme values from
+        # propagating through gradient accumulation
+        return pearson_loss.clamp(0.0, 2.0)
+
+    def _masked_ssim(
+            self, render: torch.Tensor, ortho: torch.Tensor,
+            valid_mask: torch.Tensor, window_size: int = 7,
+    ) -> torch.Tensor:
+        """Differentiable SSIM loss (1 - SSIM), NaN-safe.
+
+        Uses the simplified SSIM formulation from Wang et al. 2004 with
+        Gaussian-weighted local statistics.
+        """
+        C1, C2 = 0.01 ** 2, 0.03 ** 2  # stability constants (data_range ≈ 1.0)
+
+        # nan_to_num before filling: if render has NaN from degenerate
+        # normals, replace with 0 before computing statistics
+        render_safe = torch.nan_to_num(render, nan=0.0, posinf=1.0, neginf=-1.0)
+        ortho_safe = torch.nan_to_num(ortho, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Fill invalid regions with per-image mean to avoid boundary artifacts
+        r_mean_fill = (render_safe * valid_mask).sum(dim=(-2, -1), keepdim=True) / \
+                      (valid_mask.sum(dim=(-2, -1), keepdim=True) + 1e-8)
+        o_mean_fill = (ortho_safe * valid_mask).sum(dim=(-2, -1), keepdim=True) / \
+                      (valid_mask.sum(dim=(-2, -1), keepdim=True) + 1e-8)
+        r_filled = render_safe * valid_mask + r_mean_fill * (1.0 - valid_mask)
+        o_filled = ortho_safe * valid_mask + o_mean_fill * (1.0 - valid_mask)
+
+        # Gaussian kernel for local statistics
+        pad = window_size // 2
+        kernel = self._gaussian_kernel(window_size, 1.5, render.device, render.dtype)
+
+        mu_r = F.conv2d(r_filled, kernel, padding=pad)
+        mu_o = F.conv2d(o_filled, kernel, padding=pad)
+
+        mu_r_sq = mu_r ** 2
+        mu_o_sq = mu_o ** 2
+        mu_ro = mu_r * mu_o
+
+        sigma_r_sq = F.conv2d(r_filled ** 2, kernel, padding=pad) - mu_r_sq
+        sigma_o_sq = F.conv2d(o_filled ** 2, kernel, padding=pad) - mu_o_sq
+        sigma_ro = F.conv2d(r_filled * o_filled, kernel, padding=pad) - mu_ro
+
+        # Clamp variances for numerical stability
+        sigma_r_sq = torch.clamp(sigma_r_sq, min=0.0)
+        sigma_o_sq = torch.clamp(sigma_o_sq, min=0.0)
+
+        numerator = (2 * mu_ro + C1) * (2 * sigma_ro + C2)
+        denominator = (mu_r_sq + mu_o_sq + C1) * (sigma_r_sq + sigma_o_sq + C2)
+
+        # denominator should always be > 0 due to C1, C2, but clamp to be safe
+        ssim_map = numerator / (denominator + 1e-8)
+
+        # Clamp SSIM map to [-1, 1] — prevents runaway values
+        ssim_map = ssim_map.clamp(-1.0, 1.0)
+
+        # Erode mask for border safety
+        mask_eroded = F.avg_pool2d(valid_mask.float(), window_size, stride=1, padding=pad)
+        mask_eroded = (mask_eroded > 0.99).float()
+
+        if mask_eroded.sum() < 10:
+            return self._zero_loss()
+
+        ssim_val = (ssim_map * mask_eroded).sum() / (mask_eroded.sum() + 1e-8)
+        loss = (1.0 - ssim_val).clamp(0.0, 2.0)
+        return loss
+
+    @staticmethod
+    def _gaussian_kernel(size: int, sigma: float, device, dtype=None) -> torch.Tensor:
+        coords = torch.arange(size, dtype=torch.float32, device=device) - size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum()
+        kernel = g.unsqueeze(0) * g.unsqueeze(1)
+        return kernel.view(1, 1, size, size)
 
     def forward(self, pred_depth: torch.Tensor, real_ortho: torch.Tensor, mask: torch.Tensor,
                 sun_vectors: torch.Tensor, ambient: torch.Tensor, intensity: torch.Tensor) -> torch.Tensor:
@@ -215,58 +438,66 @@ class PhotoclinometricLoss(nn.Module):
         else:
             ortho_gray = real_ortho
 
-        # 1. Calculate Normals
-        normals = self._get_surface_normals(pred_depth)
+        # ---- Force float32 for entire computation ----
+        # bf16/fp16 WILL overflow: spatial_scale * sobel_grad can reach
+        # 256 * depth_range, easily >65504 (fp16 max).
+        pred_depth = pred_depth.float()
+        ortho_gray = ortho_gray.float()
+        mask = mask.float()
+        sun_vectors = sun_vectors.float()
+        ambient = ambient.float()
+        intensity = intensity.float()
 
-        # 2. Reshape lighting parameters for spatial broadcasting
-        l_dir = F.normalize(sun_vectors, p=2, dim=1).view(B, 3, 1, 1)
+        # eps=1e-6 prevents NaN when sun_vector is all-zeros
+        l_dir = F.normalize(sun_vectors, p=2, dim=1, eps=1e-6).view(B, 3, 1, 1)
         intensity = intensity.view(B, 1, 1, 1)
         ambient = ambient.view(B, 1, 1, 1)
+        valid_mask = mask
 
-        # 3. Lambertian Render with Real-World Lighting
-        render = torch.sum(normals * l_dir, dim=1, keepdim=True)
-        render = (render * intensity) + ambient
+        # Check for degenerate inputs: NaN/Inf depth from VAE decoder
+        if not torch.isfinite(pred_depth).all():
+            logger.warning("PhotoclinometricLoss: non-finite pred_depth detected, returning zero loss")
+            return self._zero_loss()
 
-        # Clamp to mimic actual camera sensor bounds (-1 to 1 based on your dataloader)
-        render = torch.clamp(render, min=-1.0, max=1.0)
+        total_loss = self._zero_loss()  # start from param-connected zero
 
-        # 4. Masked Pearson Correlation (Computed Per-Image in Batch)
-        valid_mask = mask.bool()
+        for s in self.scales:
+            if s > 1:
+                d_s = F.avg_pool2d(pred_depth, kernel_size=s, stride=s)
+                o_s = F.avg_pool2d(ortho_gray, kernel_size=s, stride=s)
+                m_s = F.avg_pool2d(valid_mask, kernel_size=s, stride=s)
+                # Binarise: only pixels fully valid at this scale
+                m_s = (m_s > 0.99).float()
+            else:
+                d_s, o_s, m_s = pred_depth, ortho_gray, valid_mask
 
-        # Get valid pixel counts per image. Shape: (B, 1, 1, 1)
-        valid_counts = valid_mask.view(B, -1).sum(dim=1).view(B, 1, 1, 1)
+            # Skip scale if mask is nearly empty (< 5% valid)
+            valid_ratio = m_s.sum() / max(m_s.numel(), 1)
+            if valid_ratio < 0.05:
+                continue
 
-        # Identify which batch items have enough valid pixels to compute correlation
-        valid_batch_items = (valid_counts.squeeze() > 100)
+            normals = self._get_surface_normals(d_s)
+            render = self._lunar_lambert_render(normals, l_dir, intensity, ambient)
 
-        if not valid_batch_items.any():
-            return torch.tensor(0.0, device=pred_depth.device, requires_grad=True)
+            # Pearson component
+            pearson_loss = self._masked_pearson(render, o_s, m_s, B)
 
-        # Zero out invalid pixels so they don't affect the sum
-        r_masked = render * valid_mask
-        o_masked = ortho_gray * valid_mask
+            # SSIM component
+            ssim_loss = self._masked_ssim(render, o_s, m_s)
 
-        # Compute means per-image
-        r_mean = r_masked.view(B, -1).sum(dim=1).view(B, 1, 1, 1) / valid_counts
-        o_mean = o_masked.view(B, -1).sum(dim=1).view(B, 1, 1, 1) / valid_counts
+            # Combined: (1-α)*Pearson + α*SSIM
+            alpha = self.ssim_weight
+            scale_loss = (1.0 - alpha) * pearson_loss + alpha * ssim_loss
+            total_loss = total_loss + scale_loss
 
-        # Center the variables (only for valid pixels)
-        r_centered = (render - r_mean) * valid_mask
-        o_centered = (ortho_gray - o_mean) * valid_mask
+        result = total_loss / len(self.scales)
 
-        # Covariance and Variance per-image. Shape: (B,)
-        cov = (r_centered * o_centered).view(B, -1).sum(dim=1)
-        var_r = (r_centered ** 2).view(B, -1).sum(dim=1)
-        var_o = (o_centered ** 2).view(B, -1).sum(dim=1)
+        # Final NaN guard: if anything slipped through, return zero
+        if not torch.isfinite(result):
+            logger.warning("PhotoclinometricLoss: non-finite loss detected, returning zero")
+            return self._zero_loss()
 
-        # Calculate Pearson per-image
-        denominator = torch.sqrt(var_r * var_o)
-        correlation = cov / (denominator + 1e-8)  # Epsilon prevents divide-by-zero
-
-        # Average the loss only over valid batch items
-        loss = 1.0 - correlation[valid_batch_items].mean()
-
-        return loss
+        return result
 
 
 class FlowMatchingVelocityLoss(nn.Module):
@@ -516,7 +747,10 @@ class CombinedLoss(nn.Module):
         super().__init__()
         self.photo_start_step = photo_start_step
         self.photo_weight = photo_weight
-        self.photo_loss = PhotoclinometricLoss()
+        self.photo_loss = PhotoclinometricLoss(
+            ssim_weight=0.5,
+            scales=(1, 2, 4),
+        )
         self.velocity_loss = FlowMatchingVelocityLoss(use_confidence_weighting)
         self.normals_loss = SurfaceNormalsLoss()
         self.grad_loss = MultiScaleGradientLoss(scales=grad_scales) if grad_weight > 0 else None
@@ -630,6 +864,12 @@ class CombinedLoss(nn.Module):
                 sun_vector = torch.tensor([[0.5, -0.5, 1.0]], device=pred_depth_pixels.device)
                 sun_vector = sun_vector.expand(pred_depth_pixels.shape[0], -1)
 
+            B_photo = pred_depth_pixels.shape[0]
+            if ambient is None:
+                ambient = torch.zeros(B_photo, 1, device=pred_depth_pixels.device)
+            if intensity is None:
+                intensity = torch.ones(B_photo, 1, device=pred_depth_pixels.device)
+
             l_photo = self.photo_loss(
                 pred_depth=pred_depth_pixels,
                 real_ortho=real_ortho,
@@ -643,4 +883,29 @@ class CombinedLoss(nn.Module):
             total = total + self.photo_weight * l_photo
 
         loss_dict["total"] = total
+
+        # Final NaN guard: if any loss component produced NaN, fall back to
+        # velocity-only loss to prevent poisoning the entire training run.
+        if not torch.isfinite(total):
+            logger.warning(
+                "CombinedLoss: non-finite total detected at step %d. "
+                "Components: vel=%.4f norm=%.4f freq=%.4f grad=%.4f photo=%.4f. "
+                "Falling back to velocity-only loss.",
+                global_step,
+                loss_dict["velocity"].item() if torch.is_tensor(loss_dict["velocity"]) else 0,
+                loss_dict["normals"].item() if torch.is_tensor(loss_dict["normals"]) else 0,
+                loss_dict["freq"].item() if torch.is_tensor(loss_dict["freq"]) else 0,
+                loss_dict["grad"].item() if torch.is_tensor(loss_dict["grad"]) else 0,
+                loss_dict["photo"].item() if torch.is_tensor(loss_dict["photo"]) else 0,
+            )
+            total = self.vel_weight * l_vel
+            if not torch.isfinite(total):
+                # Even velocity is NaN — return zero to prevent crash
+                total = torch.tensor(0.0, device=l_vel.device, requires_grad=True)
+            loss_dict["total"] = total
+
+        # Expose learned photometric parameter for logging
+        if self.photo_loss is not None:
+            loss_dict["lunar_lambert_weight"] = self.photo_loss.lunar_lambert_weight.detach()
+
         return loss_dict
