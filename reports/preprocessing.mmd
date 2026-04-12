@@ -1,0 +1,89 @@
+flowchart TD
+    %% -----------------------------------------------------------
+    %% 1. CLI & Batch Orchestration
+    %% -----------------------------------------------------------
+    subgraph Orchestration [1. CLI & Batch Orchestration]
+        O1([Start CLI Entry Point]) --> O2[Parse Args: --root, --workers, --overwrite, skips]
+        O2 --> O3[Initialize Logging Config]
+        O3 --> O4(convert_all: Orchestrator)
+
+        O4 --> O5{Skip JP2?}
+        O5 -->|No| O6[rglob matching *.JP2 / *.jp2]
+        O5 -->|Yes| O7{Skip DTM?}
+        O6 --> O7
+
+        O7 -->|No| O8[rglob matching *.IMG filtering for 'DTE*']
+        O7 -->|Yes| O9[Compile Task List]
+        O8 --> O9
+
+        O9 --> O10{Are there files to process?}
+        O10 -->|No| O11([Exit: Return 0 counts])
+        O10 -->|Yes| O12[Trigger Dynamic Worker Allocation]
+    end
+
+    %% -----------------------------------------------------------
+    %% 2. Dynamic Memory & Worker Allocation
+    %% -----------------------------------------------------------
+    subgraph Memory [2. Dynamic Memory Optimization]
+        M1(_safe_worker_count) --> M2[Check OS for Available System RAM]
+        M2 --> M3[Sort target files by size & sample top 8 largest]
+        M3 --> M4[Calculate average on-disk size of sample]
+
+        M4 --> M5[Multiply by 5x inflation factor\nto estimate worst-case decompressed RAM usage]
+        M5 --> M6[Reserve 25% of Available RAM for OS/GDAL overhead]
+
+        M6 --> M7[Calculate max concurrent workers that fit in usable RAM]
+        M7 --> M8[Clamp final worker count between 1 and user --workers request]
+
+        M8 --> M9[Spawn ProcessPoolExecutor\nusing 'spawn' mp_context]
+        M9 --> M10[_worker_init: Bind SIGINT & attach Logger to Worker]
+        M10 --> M11[Submit Tasks to Pool]
+    end
+    O12 -. Triggers .-> M1
+
+    %% -----------------------------------------------------------
+    %% 3. JP2 to COG Pipeline (Orthoimages)
+    %% -----------------------------------------------------------
+    subgraph JP2_Pipeline [3. JP2 to COG Conversion Pipeline]
+        J1(Worker receives JP2 Task) --> J2{Overwrite = False \n& COG exists?}
+        J2 -->|Yes| J3[Skip File]
+        J2 -->|No| J4[Suppress Geotransform Warnings]
+
+        J4 --> J5[Pass 1: Open Source JP2 via Rasterio]
+        J5 --> J6[Strip compression tags to speed up intermediate write]
+        J6 --> J7[Write uncompressed bands to .tmp.tif scratch file]
+        J7 --> J8[Build Overviews on .tmp.tif using Average Resampling]
+
+        J8 --> J9[Close Source & trigger Garbage Collection\nto release decompressed RAM footprint]
+
+        J9 --> J10[Pass 2: rasterio.shutil.copy]
+        J10 --> J11[Apply Predictor=2, Deflate Compression, & 512x512 Tiling]
+        J11 --> J12[Embed Overviews efficiently during copy to final .tif]
+
+        J12 --> J13[Delete .tmp.tif scratch file]
+
+        J5 -. Catch IOError .-> J14{Is Error 'Corrupt Bitstream'?}
+        J14 -->|Yes| J15[Delete corrupted source JP2 file]
+        J14 -->|No| J16[Log Failure]
+    end
+    M11 -. Dispatches jp2_to_cog .-> J1
+
+    %% -----------------------------------------------------------
+    %% 4. DTM to COG Pipeline (Elevation Data)
+    %% -----------------------------------------------------------
+    subgraph DTM_Pipeline [4. DTM to COG Conversion Pipeline]
+        D1(Worker receives IMG Task) --> D2{Overwrite = False \n& COG exists?}
+        D2 -->|Yes| D3[Skip File]
+        D2 -->|No| D4[Pass 1: Open Source PDS3 .IMG]
+
+        D4 --> D5[Force dtype to float32 & Set Nodata to -3.4028e+38]
+        D5 --> D6[Write flat binary data to .tmp.tif scratch file]
+        D6 --> D7[Build Overviews on .tmp.tif]
+
+        D7 --> D8[Close Source & trigger Garbage Collection]
+
+        D8 --> D9[Pass 2: rasterio.shutil.copy]
+        D9 --> D10[Apply Predictor=3 float-differencing,\nDeflate Compression, & 512x512 Tiling]
+        D10 --> D11[Write final .tif and delete scratch file]
+    end
+    M11 -. Dispatches img_to_cog .-> D1

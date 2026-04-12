@@ -45,7 +45,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Rectangle
-from shapely.geometry import box as shapely_box
 
 logging.basicConfig(
     level=logging.INFO,

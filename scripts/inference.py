@@ -110,7 +110,7 @@ def predict_dtm(
     depth_pixels = model.decode_from_latent(z_depth)
 
     # Take first channel (all 3 are identical for depth)
-    depth_map = depth_pixels[0, 0].cpu().numpy()
+    depth_map = depth_pixels[0, 0].float().cpu().numpy()
 
     return depth_map
 

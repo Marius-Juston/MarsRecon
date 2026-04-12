@@ -10,9 +10,6 @@ Provides:
 * :func:`convert_all` — Batch-convert all JP2 files under a root directory
   using a process pool.
 
-* :func:`geographic_split` — Split a spatial index GeoDataFrame into train /
-  test sets along a geographic axis to prevent spatial data leakage for crater
-  segmentation models.
 
 CLI usage::
 
@@ -34,13 +31,9 @@ import warnings
 from collections.abc import Iterator
 from typing import Callable
 
-import geopandas as gpd
-import numpy as np
 import rasterio
 import rasterio.enums
 import rasterio.shutil
-
-from dataset.mars_hirise_base import MARS_PROJECTED_CRS
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +50,8 @@ _OVERVIEW_RESAMPLING = rasterio.enums.Resampling.average
 #: Base rasterio profile applied to every COG output (integer / uint imagery).
 _COG_CREATION_OPTIONS: dict = {
     "driver": "GTiff",
-    "compress": "deflate",
+    "compress": "zstd",  # <-- Switch to Zstandard for extreme read speed
+    "zstd_level": 1,  # <-- Level 1 prioritizes decompression speed over file size
     "predictor": 2,  # horizontal differencing — good for imagery
     "tiled": True,
     "blockxsize": 512,
@@ -240,35 +234,32 @@ def jp2_to_cog(jp2_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                 # (CPU-intensive on gigabytes of data that are immediately
                 # discarded).  Compression is applied only in the final
                 # rasterio.shutil.copy call below.
-                for key in ("lossless", "quality", "compress", "predictor"):
+                for key in ("lossless", "quality", "compress", "predictor", "zstd_level"):
                     profile.pop(key, None)
 
-                logger.debug("Writing intermediate GeoTIFF for %s …", jp2_path.name)
-                with rasterio.open(tmp, "w", **profile) as dst:
-                    for band_idx in src.indexes:
-                        band_data = src.read(band_idx)
-                        dst.write(band_data, band_idx)
-                        del band_data  # release decompressed array before next band
-                    dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
-                    dst.update_tags(
-                        ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name
-                    )
+                logger.debug("Writing intermediate GeoTIFF to RAM for %s …", jp2_path.name)
+
+                with rasterio.MemoryFile() as memfile:
+                    with memfile.open(**profile) as dst:
+                        for band_idx in src.indexes:
+                            band_data = src.read(band_idx)
+                            dst.write(band_data, band_idx)
+                            del band_data
+
+                        dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
+                        dst.update_tags(ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name)
+
+                        # Second pass: copy to final COG with overviews embedded.
+                        # Use _COG_CREATION_OPTIONS directly — it already carries compress,
+                        # predictor, tiling, and copy_src_overviews.  Deriving opts from
+                        # `profile` would omit compression because we stripped it above.
+
+                        # Second pass: copy directly from RAM to the final NVMe file
+                        rasterio.shutil.copy(dst, cog, **_COG_CREATION_OPTIONS)
 
         # Source JP2 is now closed; release any lingering references before the
         # second pass so the decompressed pixel data can be reclaimed.
         gc.collect()
-
-        # Second pass: copy to final COG with overviews embedded.
-        # Use _COG_CREATION_OPTIONS directly — it already carries compress,
-        # predictor, tiling, and copy_src_overviews.  Deriving opts from
-        # `profile` would omit compression because we stripped it above.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message=".*geotransform.*|.*identity matrix.*",
-            )
-            rasterio.shutil.copy(tmp, cog, **_COG_CREATION_OPTIONS)
 
         logger.info("COG written: %s", cog.name)
         return cog
@@ -342,7 +333,7 @@ def img_to_cog(img_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                     bigtiff="IF_SAFER",
                 )
                 # Strip JP2-specific keys that don't apply
-                for key in ("lossless", "quality", "compress", "predictor"):
+                for key in ("lossless", "quality", "compress", "predictor", "zstd_level"):
                     profile.pop(key, None)
 
                 # Ensure float32 dtype for elevation data
@@ -365,28 +356,25 @@ def img_to_cog(img_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                     src.height,
                     src.count,
                 )
-                with rasterio.open(tmp, "w", **profile) as dst:
-                    for band_idx in src.indexes:
-                        band_data = src.read(band_idx)
-                        dst.write(band_data, band_idx)
-                        del band_data
-                    dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
-                    dst.update_tags(
-                        ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name
-                    )
+                logger.debug("Writing intermediate DTM GeoTIFF to RAM for %s …", img_path.name)
 
-        gc.collect()
+                # THE MAGIC: Use RAM instead of NVMe
+                with rasterio.MemoryFile() as memfile:
+                    with memfile.open(**profile) as dst:
+                        for band_idx in src.indexes:
+                            band_data = src.read(band_idx)
+                            dst.write(band_data, band_idx)
+                            del band_data
 
-        # Second pass: copy to final COG with float predictor
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message=".*geotransform.*|.*identity matrix.*",
-            )
-            rasterio.shutil.copy(tmp, cog, **_COG_CREATION_OPTIONS_FLOAT)
+                        dst.build_overviews(_OVERVIEW_LEVELS, _OVERVIEW_RESAMPLING)
+                        dst.update_tags(ns="rio_overview", resampling=_OVERVIEW_RESAMPLING.name)
 
-        logger.info("DTM COG written: %s", cog.name)
+                        # Copy directly from RAM to NVMe
+                        rasterio.shutil.copy(dst, cog, **_COG_CREATION_OPTIONS_FLOAT)
+
+            gc.collect()
+
+            logger.info("DTM COG written: %s", cog.name)
         return cog
 
     except rasterio.errors.RasterioIOError as exc:
@@ -550,78 +538,6 @@ def convert_all(
         counts["failed"],
     )
     return counts
-
-
-# ---------------------------------------------------------------------------
-# Geographic train / test split
-# ---------------------------------------------------------------------------
-
-
-def geographic_split(
-        index: gpd.GeoDataFrame,
-        test_fraction: float = 0.2,
-        split_axis: str = "longitude",
-        seed: int = 42,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """Split a spatial index into geographically separated train and test sets.
-
-    Assigns observations to blocks along the chosen axis, then randomly assigns
-    whole blocks to train or test.  This keeps geographically adjacent
-    observations on the same side of the split, preventing spatial data leakage
-    in crater segmentation models (a model should not see craters immediately
-    adjacent to its test craters during training).
-
-    Args:
-        index: The :attr:`~temp.MarsHiRISE.index` GeoDataFrame.
-        test_fraction: Fraction of observations to place in the test set.
-        split_axis: ``"longitude"`` (default) or ``"latitude"``.
-        seed: Random seed for reproducible block shuffling.
-
-    Returns:
-        ``(train_gdf, test_gdf)`` tuple of GeoDataFrames with the same schema
-        as *index*.
-
-    Example::
-
-        from preprocessing import geographic_split
-
-        dataset = MarsHiRISE(bbox=..., ...)
-        train_idx, test_idx = geographic_split(dataset.index, test_fraction=0.2)
-    """
-    # Project to a planar CRS before computing centroids to avoid the
-    # "Geometry is in a geographic CRS" UserWarning from geopandas.
-    projected = index.to_crs(MARS_PROJECTED_CRS)
-    centroids = projected.geometry.centroid.to_crs(index.crs)
-    coords: np.ndarray = (
-        centroids.x.to_numpy() if split_axis == "longitude"
-        else centroids.y.to_numpy()
-    )
-
-    # Divide the coordinate range into ~(1/test_fraction) equally-populated
-    # blocks, then assign a random subset of blocks to the test set.
-    n_blocks = max(5, int(round(1.0 / test_fraction)))
-    edges = np.percentile(coords, np.linspace(0.0, 100.0, n_blocks + 1))
-    # digitize assigns each point to a block 0 … n_blocks-1
-    block_ids = np.digitize(coords, edges[1:-1])
-
-    rng = np.random.default_rng(seed)
-    unique_blocks = np.unique(block_ids)
-    rng.shuffle(unique_blocks)
-
-    n_test_blocks = max(1, int(round(len(unique_blocks) * test_fraction)))
-    test_block_set = set(unique_blocks[:n_test_blocks].tolist())
-
-    test_mask = np.isin(block_ids, list(test_block_set))
-    train_gdf = index.iloc[~test_mask]
-    test_gdf = index.iloc[test_mask]
-
-    logger.info(
-        "Geographic split (%s axis): %d train, %d test observations.",
-        split_axis,
-        len(train_gdf),
-        len(test_gdf),
-    )
-    return train_gdf, test_gdf
 
 
 # ---------------------------------------------------------------------------

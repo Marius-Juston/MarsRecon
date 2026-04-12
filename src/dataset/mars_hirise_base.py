@@ -122,6 +122,9 @@ class ProductMeta:
     )
     bands: int = 3
 
+    incidence_angle: float = 45.0  # Default safe angle
+    solar_azimuth: float = 270.0  # Default safe direction
+
     @classmethod
     def from_lbl(cls, lbl_path: pathlib.Path) -> ProductMeta:
         """Parse a PDS3 LBL and return a populated instance."""
@@ -142,6 +145,11 @@ class ProductMeta:
         def _int(pat: str) -> int | None:
             m = re.search(pat, text, re.MULTILINE)
             return int(m.group(1)) if m else None
+
+        if (v := _float(r"^\s*INCIDENCE_ANGLE\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.incidence_angle = v
+        if (v := _float(r"^\s*SOLAR_AZIMUTH\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.solar_azimuth = v
 
         if (v := _float(r"^\s*SCALING_FACTOR\s*=\s*([\d.eE+\-]+)")) is not None:
             obj.scaling_factor = v

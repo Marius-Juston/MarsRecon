@@ -72,7 +72,7 @@ NPROCS: int = torch.cuda.device_count()  # one per GPU
 WORKERS_PER_GPU: int = min(32, os.cpu_count() // NPROCS)  # DataLoader workers per process
 TEMP_STATS_PATH: str = "/tmp/hirise_stats_rank{rank}_{dtm}.pt"
 
-BBOX_TUPLE = (-150, 15, -90, 70)
+BBOX_TUPLE = (60, 0, 90, 30)
 
 HIST_RANGE = {
     "dtm": {"min": -5300.0, "max": 21300.0},

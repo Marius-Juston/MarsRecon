@@ -81,6 +81,28 @@ def _valid_stats(arr: np.ndarray, mask: np.ndarray | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Core Physical Utilities
+# ---------------------------------------------------------------------------
+
+def compute_surface_normals(elevation: np.ndarray) -> np.ndarray:
+    """Compute surface normals with proper spatial scaling."""
+    H, W = elevation.shape
+    spatial_scale = max(H, W) / 2.0
+
+    # Calculate gradients
+    dy, dx = np.gradient(elevation)
+
+    # Scale gradients to match physical slope dimensions
+    n_x = -dx * spatial_scale
+    n_y = -dy * spatial_scale
+    n_z = np.ones_like(dx)
+
+    n = np.stack([n_x, n_y, n_z], axis=-1)
+    norm = np.linalg.norm(n, axis=-1, keepdims=True)
+    return n / np.clip(norm, 1e-8, None)
+
+
+# ---------------------------------------------------------------------------
 # 1. Prediction triptych
 # ---------------------------------------------------------------------------
 
@@ -499,15 +521,12 @@ def plot_normal_maps(
         title: str = "",
         save_path: str | Path | None = None,
 ) -> plt.Figure:
-    """Side-by-side surface normal maps (RGB-encoded)."""
+    """Side-by-side surface normal maps (RGB-encoded) with spatial scaling."""
     set_neurips_style()
 
     def _normals_rgb(z):
-        dy, dx = np.gradient(z)
-        n = np.stack([-dx, -dy, np.ones_like(dx)], axis=-1)
-        norm = np.linalg.norm(n, axis=-1, keepdims=True)
-        n = n / np.clip(norm, 1e-8, None)
-        return (n + 1.0) / 2.0  # map [-1,1] → [0,1] for RGB display
+        normals = compute_surface_normals(z)
+        return (normals + 1.0) / 2.0  # map [-1,1] → [0,1] for RGB display
 
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 
@@ -735,6 +754,102 @@ def plot_hillshade_comparison(
     fig.text(
         0.5, 0.01,
         f"Solar azimuth {azimuth}°, altitude {altitude}°, z-factor {z_factor}×",
+        ha="center", fontsize=8, style="italic", color="gray",
+    )
+
+    if title:
+        fig.suptitle(title, fontweight="bold")
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig
+
+
+def compute_lunar_lambert_render(
+        elevation: np.ndarray,
+        sun_vector: np.ndarray,
+        intensity: float = 1.0,
+        ambient: float = 0.0,
+        lunar_lambert_weight: float = 0.5,
+) -> np.ndarray:
+    """Compute a physically accurate Lunar-Lambert render for planetary surfaces."""
+    normals = compute_surface_normals(elevation)
+
+    # 1. Cosine of incidence angle (dot product of normals and sun_vector)
+    cos_i = np.sum(normals * sun_vector, axis=-1)
+
+    # Clamp shadows to strictly >= 0 (light doesn't scatter from behind)
+    cos_i_clamped = np.clip(cos_i, 0.0, None)
+
+    # 2. Cosine of emission angle (Z-normal for nadir view)
+    cos_e = normals[..., 2]
+
+    # 3. Pure Photometric Components
+    lambert_comp = cos_i_clamped
+    ls_comp = cos_i_clamped / (cos_i_clamped + cos_e + 1e-6)
+
+    # 4. Blend using the Lunar-Lambert weight
+    L = lunar_lambert_weight
+    render_blend = (L * lambert_comp) + ((1.0 - L) * ls_comp)
+
+    # 5. Apply Scene Intensity and Ambient Light
+    render = (render_blend * intensity) + ambient
+
+    return np.clip(render, 0.0, 1.0).astype(np.float32)
+
+
+def plot_lunar_lambert_comparison(
+        pred_dtm: np.ndarray,
+        gt_dtm: np.ndarray,
+        sun_vector: np.ndarray,
+        intensity: float = 1.0,
+        ambient: float = 0.0,
+        lunar_lambert_weight: float = 0.5,
+        title: str = "",
+        save_path: str | Path | None = None,
+) -> plt.Figure:
+    """Side-by-side Lunar-Lambert shading of predicted vs GT DTMs using actual physics."""
+    # Assuming set_neurips_style() is defined elsewhere in your codebase
+    # set_neurips_style()
+
+    from depth_fm.metrics import affine_align
+    pred_aligned, _, _ = affine_align(pred_dtm, gt_dtm)
+
+    # Fill NaN for gradient computation
+    pred_filled = np.nan_to_num(pred_aligned, nan=np.nanmean(pred_aligned))
+    gt_filled = np.nan_to_num(gt_dtm, nan=np.nanmean(gt_dtm))
+
+    # Pass the weight into the render function
+    render_pred = compute_lunar_lambert_render(
+        pred_filled, sun_vector, intensity, ambient, lunar_lambert_weight
+    )
+    render_gt = compute_lunar_lambert_render(
+        gt_filled, sun_vector, intensity, ambient, lunar_lambert_weight
+    )
+
+    # Difference: >0.5 = predicted brighter, <0.5 = GT brighter
+    render_diff = (render_pred - render_gt + 1.0) / 2.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
+
+    axes[0].imshow(render_pred, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+    axes[0].set_title(f"Predicted Render (L={lunar_lambert_weight:.2f})")
+    axes[0].axis("off")
+
+    axes[1].imshow(render_gt, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+    axes[1].set_title(f"GT Render (L={lunar_lambert_weight:.2f})")
+    axes[1].axis("off")
+
+    im = axes[2].imshow(render_diff, cmap="RdBu_r", vmin=0.3, vmax=0.7, interpolation="nearest")
+    axes[2].set_title("Render difference")
+    axes[2].axis("off")
+    fig.colorbar(im, ax=axes[2], shrink=0.8, label="Pred brighter ← → GT brighter")
+
+    # Include the Lunar-Lambert weight in the footer stats
+    sun_str = f"Sun vector: [{sun_vector[0]:.2f}, {sun_vector[1]:.2f}, {sun_vector[2]:.2f}]"
+    fig.text(
+        0.5, 0.01,
+        f"{sun_str} | Intensity: {intensity:.2f} | Ambient: {ambient:.2f} | LL-Weight: {lunar_lambert_weight:.2f}",
         ha="center", fontsize=8, style="italic", color="gray",
     )
 

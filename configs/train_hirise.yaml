@@ -9,8 +9,17 @@ model:
   freeze_encoder: false
   gradient_checkpointing: true
 
+  torch_compile: false
+  torch_compile_mode: "default"
+  full_graph: true
+  use_checkpoint: true
+
+  model_type: "depthfm" # none for depthfm, modulated for other
+
 data:
   source: "hirise"
+  parallel_load: false
+  use_wds: true
 
   hirise:
     root: "/scratch/mars_hirise_dtm"
@@ -20,10 +29,10 @@ data:
     download: false
     reuse_cache: true
     target: null
-    bbox: [-150, 15, -90, 70]
+    bbox: [60, 0, 90, 30]
 
   sampler:
-    size: 0.009
+    size: 0.018
     length: null   # patches per epoch (null = all available)
 
   # Train/val/test split
@@ -39,27 +48,35 @@ data:
   latent_dir: null
 
   resolution: 512
-  dtm_normalization: "log"
+  dtm_normalization: "relative"
+  stats_path: "dataset_stats/dtm/dataset_stats.json"
   random_flip: true
-  brightness_jitter: 0.1
+  brightness_jitter: 0.0
+
+  signal_boost: 1.0
 
 training:
-  per_gpu_batch_size: 2
+  enable: true
+
+  per_gpu_batch_size: 4
   gradient_accumulation_steps: 4
   num_gpus: 4
-  max_steps: 50000
+  max_steps: 1000
+  show_train_vis: true
 
-  learning_rate: 3.0e-5
+  learning_rate: 2.0e-4
   weight_decay: 0.01
   lr_scheduler: "cosine"
-  lr_warmup_steps: 1000
+  lr_warmup_steps: 50
 
   optimizer: "adamw"
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
-  mixed_precision: "f16"
+  mixed_precision: "bf16"
+
+  random_jitter: false
 
   flow_matching:
     timestep_sampling: "logit_normal"
@@ -70,19 +87,30 @@ training:
 
   losses:
     velocity_weight: 1.0
-    normals_weight: 0.1
-    normals_start_step: 2000
-    use_confidence_weighting: false
+    normals_weight: 1.0
+    normals_start_step: 0
+    grad_weight: 500.0         # multi-scale gradient loss (no extra install)
+    grad_start_step: 0
+    grad_scales: [1, 2, 4]
+    # Focal Frequency Loss (requires: pip install focal-frequency-loss)
+    freq_weight: 0.0
+    freq_start_step: 1000
+    freq_alpha: 1.0
+    photo_weight: 50.0
+    photo_start_step: 0
+
+    use_confidence_weighting: true
 
   # Validation and checkpointing
-  val_every_steps: 0.5
-  save_every_steps: 500
-  log_every_steps: 50
+  val_every_steps: 1.0
+  save_every_steps: 5
+  log_every_steps: 10
   num_val_samples: 8
-  flow_vis_every_steps: 1000
+  flow_vis_every_steps: 1
+  train_vis_every_steps: 80
 
   # Test: use more Euler steps for best quality
-  test_euler_steps: 4
+  test_euler_steps: 16
 
   # Early stopping (null = disabled)
   early_stopping_patience: null
@@ -95,9 +123,9 @@ training:
   resume_from: null
 
   use_ema: true
-  ema_decay: 0.9999
+  ema_decay: 0.99
 
   # 128 cores / 4 GPUs = 32 workers per process
-  num_workers: 32
+  num_workers: 24
   pin_memory: true
   prefetch_factor: 4

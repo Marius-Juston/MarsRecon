@@ -30,8 +30,7 @@ from torchgeo.samplers import Units
 from dataset.mars_hirise_base import (
     MarsHiRISEBase,
     ProductMeta,
-    check_overlap,
-    reproject_band, setup_logging,
+    setup_logging,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,6 +64,8 @@ _ORTHO_PATTERN = re.compile(
 )
 
 OrthoType = Literal["RED", "IRB"]
+
+_RASTERIO_PARAMS = dict(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", VSI_CACHE=True)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +143,7 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             reuse_cache: bool = True,
             normalize_elevation: bool = False,
             elevation_stats_path: str | None = None,
+            return_meta: bool = False,
     ) -> None:
         """Initialise the dataset.
 
@@ -169,6 +171,7 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             DatasetNotFoundError: If index is absent and ``download=False``.
         """
         # ── Ortho configuration (before super().__init__ calls _verify) ──
+        self.return_meta = return_meta
         self.include_ortho = include_ortho
         if isinstance(ortho_type, str):
             ortho_type = [ortho_type]
@@ -255,6 +258,8 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             for color in self.ortho_types
         }
 
+        patch_metadata: list[dict] = []
+
         for _, row in candidates.iterrows():
             # --- elevation ---
             dtm_path = row.get("dtm_path")
@@ -262,6 +267,14 @@ class MarsHiRISEDTM(MarsHiRISEBase):
                 tile = self._load_dtm_tile(pathlib.Path(dtm_path), x, y)
                 if tile is not None:
                     elevation_tiles.append(tile)
+
+            meta_entry = {}
+            if self.return_meta:
+                meta_entry = {
+                    "dtm_product_id": row.get("dtm_product_id"),
+                    "left_obs_id": row.get("left_obs_id"),
+                    "right_obs_id": row.get("right_obs_id"),
+                }
 
             # --- ortho images ---
             if self.include_ortho:
@@ -271,11 +284,25 @@ class MarsHiRISEDTM(MarsHiRISEBase):
                         p = row.get(col)
                         if not isinstance(p, str):
                             continue
-                        tile = self._load_ortho_tile(
-                            pathlib.Path(p), otype, x, y
-                        )
+
+                        path_obj = pathlib.Path(p)
+                        tile = self._load_ortho_tile(path_obj, otype, x, y)
+
                         if tile is not None:
                             ortho_tiles[f"{side}_{otype.lower()}"].append(tile)
+
+                            if self.return_meta:
+                                lbl_path = path_obj.with_suffix(".LBL")
+                                pmeta = ProductMeta.from_lbl(lbl_path)
+                                meta_entry[f"{side}_{otype.lower()}_meta"] = {
+                                    "incidence_angle": pmeta.incidence_angle,
+                                    "solar_azimuth": pmeta.solar_azimuth,
+                                    "scaling_factor": pmeta.scaling_factor,
+                                    "offset": pmeta.offset
+                                }
+
+            if self.return_meta and meta_entry:
+                patch_metadata.append(meta_entry)
 
         if not elevation_tiles:
             n = len(candidates)
@@ -290,6 +317,9 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             "bounds": self._slice_to_tensor(index),
             "crs": self.crs.to_wkt(),
         }
+
+        if self.return_meta:
+            sample["meta"] = patch_metadata
 
         if self.normalize_elevation and self._elev_mean is not None:
             elev = sample["elevation"]
@@ -492,31 +522,32 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             if not actual_path or not actual_path.exists():
                 return 0.0
 
-            with rasterio.open(actual_path) as src:
-                src_crs = src.crs
-                if src_crs is None:
-                    return 1.0  # Assume it overlaps if we can't project
+            with rasterio.Env(**_RASTERIO_PARAMS):
+                with rasterio.open(actual_path) as src:
+                    src_crs = src.crs
+                    if src_crs is None:
+                        return 1.0  # Assume it overlaps if we can't project
 
-                fl, fb, fr, ft = rasterio.warp.transform_bounds(src_crs, self.mars_crs, *src.bounds)
+                    fl, fb, fr, ft = rasterio.warp.transform_bounds(src_crs, self.mars_crs, *src.bounds)
 
-                # Normalize to [-180, 180]
-                fl_norm = ((fl + 180.0) % 360.0) - 180.0
-                fr_norm = ((fr + 180.0) % 360.0) - 180.0
+                    # Normalize to [-180, 180]
+                    fl_norm = ((fl + 180.0) % 360.0) - 180.0
+                    fr_norm = ((fr + 180.0) % 360.0) - 180.0
 
-                if fl_norm > fr_norm:
-                    # Antimeridian crossing: split into two bounding boxes
-                    ortho_geom = shapely.ops.unary_union([
-                        box(fl_norm, fb, 180.0, ft),
-                        box(-180.0, fb, fr_norm, ft)
-                    ])
-                else:
-                    ortho_geom = box(fl_norm, fb, fr_norm, ft)
+                    if fl_norm > fr_norm:
+                        # Antimeridian crossing: split into two bounding boxes
+                        ortho_geom = shapely.ops.unary_union([
+                            box(fl_norm, fb, 180.0, ft),
+                            box(-180.0, fb, fr_norm, ft)
+                        ])
+                    else:
+                        ortho_geom = box(fl_norm, fb, fr_norm, ft)
 
-                if dtm_geom.area == 0:
-                    return 0.0
+                    if dtm_geom.area == 0:
+                        return 0.0
 
-                intersection = dtm_geom.intersection(ortho_geom)
-                return intersection.area / dtm_geom.area
+                    intersection = dtm_geom.intersection(ortho_geom)
+                    return intersection.area / dtm_geom.area
 
         except Exception as e:
             logger.debug("Failed overlap check for %s: %s", ortho_path, e)
@@ -915,39 +946,37 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             x: slice,
             y: slice,
     ) -> torch.Tensor | None:
-        """Load and reproject a DTM .IMG patch.
-
-        Returns ``(1, H, W)`` float32 with elevation in metres;
-        nodata pixels are ``NaN``.
-        """
+        """Load DTM patch via native pixel window."""
         dtm_path = self.prefer_cog(dtm_path)
         if dtm_path is None or not dtm_path.exists():
             return None
 
-        out_w = max(1, int(round((x.stop - x.start) / (x.step or self.res))))
-        out_h = max(1, int(round((y.stop - y.start) / (y.step or self.res))))
-
-        dst_transform = rasterio.transform.from_bounds(
-            x.start, y.start, x.stop, y.stop, out_w, out_h
-        )
-        dst_crs = rasterio.crs.CRS.from_user_input(self.mars_crs)
-
         try:
-            with rasterio.open(dtm_path) as src:
-                if not check_overlap(src, dst_crs, x, y):
-                    logger.debug(
-                        "Query doesn't overlap DTM bounds: %s", dtm_path.name
+            with rasterio.Env(**_RASTERIO_PARAMS):
+                with rasterio.open(dtm_path) as src:
+                    # 1. Translate Geographic Lat/Lon into the file's Native Meters
+                    native_bounds = rasterio.warp.transform_bounds(
+                        self.mars_crs, src.crs, x.start, y.start, x.stop, y.stop
                     )
-                    return None
 
-                src_nodata = src.nodata if src.nodata is not None else _DTM_NODATA
+                    # 2. Get the pixel window using the native coordinates
+                    window = rasterio.windows.from_bounds(*native_bounds, transform=src.transform)
 
-                dest = reproject_band(
-                    src, 1, dst_crs, dst_transform, out_h, out_w,
-                    src_nodata=src_nodata,
-                    dst_nodata=float("nan"),
-                )
-                return torch.from_numpy(dest).unsqueeze(0)
+                    # 3. Explicitly round to integer pixel dimensions
+                    h, w = int(round(window.height)), int(round(window.width))
+
+                    if h <= 0 or w <= 0:
+                        return None
+
+                    # 4. Read raw pixels enforcing the exact shape
+                    data = src.read(1, window=window, out_shape=(h, w), boundless=True, fill_value=_DTM_NODATA)
+                    data = data.astype(np.float32)
+
+                    # 5. Safely mask the extreme nodata values BEFORE any resizing
+                    valid = (data > -1e30) & np.isfinite(data)
+                    data[~valid] = np.nan
+
+                    return torch.from_numpy(data).unsqueeze(0)
 
         except rasterio.errors.RasterioIOError as exc:
             logger.warning("Could not open DTM %s: %s", dtm_path, exc)
@@ -964,64 +993,47 @@ class MarsHiRISEDTM(MarsHiRISEBase):
             x: slice,
             y: slice,
     ) -> torch.Tensor | None:
-        """Load and reproject an orthoimage JP2 patch.
-
-        Returns ``(C, H, W)`` float32 in I/F [0, 1].
-        """
+        """Load Ortho patch via native pixel window."""
         jp2_path = self.prefer_cog(jp2_path)
         if jp2_path is None or not jp2_path.exists():
             return None
 
         lbl_path = jp2_path.with_suffix(".LBL")
         meta = ProductMeta.from_lbl(lbl_path)
-
         band_map = _IRB_BAND.copy() if color == "IRB" else _RED_BAND.copy()
 
-        out_w = max(1, int(round((x.stop - x.start) / (x.step or self.res))))
-        out_h = max(1, int(round((y.stop - y.start) / (y.step or self.res))))
-
-        dst_transform = rasterio.transform.from_bounds(
-            x.start, y.start, x.stop, y.stop, out_w, out_h
-        )
-        dst_crs = rasterio.crs.CRS.from_user_input(self.mars_crs)
-
         try:
-            with rasterio.open(jp2_path) as src:
-                if not check_overlap(src, dst_crs, x, y):
-                    return None
+            with rasterio.Env(**_RASTERIO_PARAMS):
+                with rasterio.open(jp2_path) as src:
+                    # 1. Translate coordinates to Native CRS
+                    native_bounds = rasterio.warp.transform_bounds(
+                        self.mars_crs, src.crs, x.start, y.start, x.stop, y.stop
+                    )
 
-                bands: list[np.ndarray] = []
-                for ch_name, band_idx in band_map.items():
-                    if band_idx > src.count:
-                        logger.warning(
-                            "Band %d absent in %s (%d bands); filling zeros.",
-                            band_idx, jp2_path.name, src.count,
-                        )
-                        bands.append(np.zeros((out_h, out_w), dtype=np.float32))
-                        continue
+                    window = rasterio.windows.from_bounds(*native_bounds, transform=src.transform)
+                    h, w = int(round(window.height)), int(round(window.width))
 
-                    try:
-                        dest = reproject_band(
-                            src, band_idx, dst_crs, dst_transform,
-                            out_h, out_w, dst_nodata=0.0,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Reprojection failed for %s band %d: %s",
-                            jp2_path.name, band_idx, exc,
-                        )
-                        bands.append(np.zeros((out_h, out_w), dtype=np.float32))
-                        continue
+                    if h <= 0 or w <= 0:
+                        return None
 
-                    # Radiometric calibration: I/F = DN * scaling + offset
-                    nodata_mask = dest == 0.0
-                    dest *= meta.scaling_factor
-                    dest += meta.offset
-                    np.clip(dest, 0.0, 1.0, out=dest)
-                    dest[nodata_mask] = 0.0
-                    bands.append(dest)
+                    bands = []
+                    for ch_name, band_idx in band_map.items():
+                        if band_idx > src.count:
+                            bands.append(np.zeros((h, w), dtype=np.float32))
+                            continue
 
-                return torch.from_numpy(np.stack(bands))
+                        # Read raw pixels enforcing the exact shape
+                        data = src.read(band_idx, window=window, out_shape=(h, w), boundless=True, fill_value=0.0)
+                        data = data.astype(np.float32)
+
+                        # Radiometric calibration
+                        nodata_mask = data == 0.0
+                        data = data * meta.scaling_factor + meta.offset
+                        np.clip(data, 0.0, 1.0, out=data)
+                        data[nodata_mask] = 0.0
+                        bands.append(data)
+
+                    return torch.from_numpy(np.stack(bands))
 
         except rasterio.errors.RasterioIOError as exc:
             logger.warning("Could not open ortho %s: %s", jp2_path, exc)
@@ -1058,6 +1070,15 @@ def main(argv=None) -> None:  # pragma: no cover
     setup_logging()
 
     import argparse
+    import os
+
+    os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
+    os.environ["VSI_CACHE"] = "TRUE"
+    os.environ["VSI_CACHE_SIZE"] = "500000000"  # Give GDAL 500MB of cache per worker
+    os.environ["GDAL_CACHEMAX"] = "60%"
+    os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
+    os.environ["VSI_CACHE"] = "FALSE"
+    os.environ["GDAL_NUM_THREADS"] = "1"
 
     parser = argparse.ArgumentParser(
         description="Run a sample test on the HiRISE DTM dataset"
@@ -1077,6 +1098,11 @@ def main(argv=None) -> None:  # pragma: no cover
     parser.add_argument(
         "-d", action=argparse.BooleanOptionalAction,
         help="Whether to generate 3D visualisation plots of the surface",
+        default=False
+    )
+    parser.add_argument(
+        "-g", "--global-coverage", action=argparse.BooleanOptionalAction,
+        help="Whether to plot global coverage",
         default=False
     )
 
@@ -1103,7 +1129,7 @@ def main(argv=None) -> None:  # pragma: no cover
             "--target to override."
         )
 
-        bbox_tuple = (-150, 15, -90, 70)
+        bbox_tuple = (60, 0, 90, 30)
 
     dataset = MarsHiRISEDTM(
         target=args.target,
@@ -1121,13 +1147,19 @@ def main(argv=None) -> None:  # pragma: no cover
     fig.savefig(output_path / "dtm_coverage.png", bbox_inches='tight')
     logger.info("Saved coverage figure.")
 
+    if args.global_coverage:
+        dataset.plot_global_coverage(output_path / "global_coverage.pdf")
+        logger.info("saved global coverage fig")
+
     from dataset.hirise_sampler import HiRISEGeoSampler
 
     sampler = HiRISEGeoSampler(
-        dataset, size=0.01,
+        dataset, size=0.018,
         length=None if args.length <= 0 else args.length,
         units=Units.CRS,
     )
+
+    dataset._raw_index = None
 
     logger.info("Number of samples: %d", len(sampler))
 
@@ -1135,12 +1167,20 @@ def main(argv=None) -> None:  # pragma: no cover
 
     dataloader = DataLoader(
         dataset, sampler=sampler,
-        num_workers=4, multiprocessing_context="spawn", prefetch_factor=10,
+        num_workers=8, multiprocessing_context="fork", prefetch_factor=32,
+        persistent_workers=True
     )
 
     output_path_3d = output_path / '3d'
 
+    import time
+
+    start_time = time.time()
+
     for i, sample in enumerate(dataloader):
+        if i == 0:
+            logger.info(f"Time to first entry {time.time() - start_time}")
+
         if args.d:
             output_path_3d.mkdir(parents=True, exist_ok=True)
             fig = dataset.plot3d(sample)

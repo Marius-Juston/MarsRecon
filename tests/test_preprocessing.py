@@ -1,6 +1,6 @@
 """Tests for src/dataset/preprocessing.py.
 
-Covers jp2_to_cog, convert_all, geographic_split, _available_memory_bytes,
+Covers jp2_to_cog, convert_all, _available_memory_bytes,
 and _safe_worker_count using synthetic data only.
 No real HiRISE files are required.
 """
@@ -33,7 +33,6 @@ from dataset.preprocessing import (
     _worker_init,
     convert_all,
     filter_maker,
-    geographic_split,
     jp2_to_cog,
 )
 
@@ -444,59 +443,6 @@ class TestConvertAll:
 
 
 # ---------------------------------------------------------------------------
-# geographic_split
-# ---------------------------------------------------------------------------
-
-
-class TestGeographicSplit:
-    def test_sizes_sum_to_total(self, split_index):
-        train, test = geographic_split(split_index)
-        assert len(train) + len(test) == len(split_index)
-
-    def test_no_overlap(self, split_index):
-        train, test = geographic_split(split_index)
-        train_ids = set(train["obs_id"])
-        test_ids = set(test["obs_id"])
-        assert train_ids.isdisjoint(test_ids)
-
-    def test_test_fraction_approximately_correct(self, split_index):
-        train, test = geographic_split(split_index, test_fraction=0.2)
-        actual = len(test) / len(split_index)
-        assert abs(actual - 0.2) < 0.15
-
-    def test_reproducible(self, split_index):
-        train1, test1 = geographic_split(split_index, seed=42)
-        train2, test2 = geographic_split(split_index, seed=42)
-        assert list(train1["obs_id"]) == list(train2["obs_id"])
-        assert list(test1["obs_id"]) == list(test2["obs_id"])
-
-    def test_different_seeds_differ(self, split_index):
-        _, test1 = geographic_split(split_index, seed=1)
-        _, test2 = geographic_split(split_index, seed=999)
-        # With 100 observations it is overwhelmingly likely the splits differ.
-        assert set(test1["obs_id"]) != set(test2["obs_id"])
-
-    def test_longitude_axis(self, split_index):
-        train, test = geographic_split(split_index, split_axis="longitude", seed=0)
-        assert len(train) > 0 and len(test) > 0
-
-    def test_latitude_axis(self, split_index):
-        # Rebuild index with lat variation so a latitude split is meaningful.
-        geoms = [box(-1.0, lat - 0.5, 1.0, lat + 0.5) for lat in np.linspace(-60, 60, 100)]
-        mars_crs = CRS.from_proj4("+proj=longlat +a=3396190 +b=3376200 +no_defs")
-        t_starts = pd.to_datetime(["2006-01-01"] * 100, utc=True)
-        t_stops = pd.to_datetime(["2006-01-02"] * 100, utc=True)
-        idx = gpd.GeoDataFrame(
-            {"obs_id": [f"obs_{i}" for i in range(100)]},
-            geometry=geoms,
-            crs=mars_crs,
-            index=pd.IntervalIndex.from_arrays(t_starts, t_stops, closed="both"),
-        )
-        train, test = geographic_split(idx, split_axis="latitude", seed=0)
-        assert len(train) + len(test) == 100
-
-
-# ---------------------------------------------------------------------------
 # filter_maker
 # ---------------------------------------------------------------------------
 
@@ -685,40 +631,6 @@ class TestConvertAllExtra:
                     convert_all(tmp_path, workers=1)
 
         mock_pool.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
-
-
-# ---------------------------------------------------------------------------
-# geographic_split — additional coverage tests
-# ---------------------------------------------------------------------------
-
-
-class TestGeographicSplitExtra:
-    def test_returns_geodataframes(self, split_index):
-        train, test = geographic_split(split_index)
-        assert isinstance(train, gpd.GeoDataFrame)
-        assert isinstance(test, gpd.GeoDataFrame)
-
-    def test_crs_preserved(self, split_index):
-        train, test = geographic_split(split_index)
-        assert train.crs == split_index.crs
-        assert test.crs == split_index.crs
-
-    def test_small_test_fraction_uses_more_blocks(self, split_index):
-        # test_fraction=0.05 → n_blocks = max(5, 20) = 20; split should still work.
-        train, test = geographic_split(split_index, test_fraction=0.05, seed=0)
-        assert len(train) + len(test) == len(split_index)
-        assert len(test) > 0
-
-    def test_large_test_fraction_uses_minimum_blocks(self, split_index):
-        # test_fraction=0.5 → int(round(1/0.5))=2 → max(5,2)=5; still produces both sets.
-        train, test = geographic_split(split_index, test_fraction=0.5, seed=0)
-        assert len(train) + len(test) == len(split_index)
-        assert len(train) > 0 and len(test) > 0
-
-    def test_minimum_one_test_block_guaranteed(self, split_index):
-        # Even with a very small fraction that rounds to 0 blocks, at least 1 is used.
-        train, test = geographic_split(split_index, test_fraction=0.01, seed=0)
-        assert len(test) >= 1
 
 
 # ---------------------------------------------------------------------------
