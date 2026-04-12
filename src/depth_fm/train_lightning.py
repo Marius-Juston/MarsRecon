@@ -61,8 +61,7 @@ from tqdm import tqdm
 
 from depth_fm.depthfm_adapter import (
     DepthFMHiRISEAdapterCached,
-    estimate_sun_vector_ols, fill_invalid_smooth_diffusion,
-)
+    estimate_sun_vector_ols, fill_dtm_smart_diffusion, )
 from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
 from depth_fm.visualization import (
     plot_convergence_curves,
@@ -220,8 +219,8 @@ def visualize_invalid_fill(dataloader, output_dir: Path, num_samples: int = 4, i
                 dtm_masked = dtm * mask
 
                 # 2. Apply smooth diffusion
-                img_filled = fill_invalid_smooth_diffusion(img_masked, mask, iterations=iterations)
-                dtm_filled = fill_invalid_smooth_diffusion(dtm_masked, mask, iterations=iterations)
+                img_filled = fill_dtm_smart_diffusion(img_masked, mask, iterations=iterations)
+                dtm_filled = fill_dtm_smart_diffusion(dtm_masked, mask, iterations=iterations)
 
                 # 3. Prepare for plotting (Denormalize [-1, 1] to [0, 1])
                 mask_np = mask[0, 0].cpu().numpy()
@@ -820,7 +819,8 @@ def run_single_training(
         every_n_train_steps=config.training.save_every_steps,
         save_top_k=1,
     )
-    callbacks = [LearningRateMonitor(logging_interval="step"), best_checkpoint, best_photo_checkpoint, recovery_checkpoint]
+    callbacks = [LearningRateMonitor(logging_interval="step"), best_checkpoint, best_photo_checkpoint,
+                 recovery_checkpoint]
 
     if config.training.get("use_ema", True):
         logger.info("EMA is ENABLED.")
@@ -883,7 +883,7 @@ def run_single_training(
             logger.info(f"*** Starting fresh training for run {run_idx} ***")
             trainer.fit(module, loaders["train"], loaders["val"])
 
-    best_choice =  config.training.get("test_choice", "rmse")
+    best_choice = config.training.get("test_choice", "rmse")
 
     # Test — use best RMSE checkpoint as primary
     best_path_rmse = best_checkpoint.best_model_path
