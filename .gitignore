@@ -4,6 +4,8 @@ data/
 *.TAB
 *.JP2
 
+outputs/
+
 *.ckpt
 
 papers/
