@@ -263,7 +263,13 @@ class DepthFMLightningModule(L.LightningModule):
             if self.global_rank == 0 and self.logger and hasattr(self.logger, "experiment"):
                 self._trace("training_step: rank 0 logging train visuals")
                 start_vis = time.perf_counter()
-                self._log_training_visuals(img_pix_vis, v_target, v_pred, step)
+                self._log_training_visuals(
+                    img_pix_vis=img_pix_vis,
+                    v_target=v_target,
+                    v_pred=v_pred,
+                    confidence=batch.get("confidence"),
+                    step=step
+                )
                 vis_dur = time.perf_counter() - start_vis
                 self._trace(f"training_step: rank 0 finished train visuals in {vis_dur:.2f}s")
 
@@ -424,7 +430,7 @@ class DepthFMLightningModule(L.LightningModule):
                 plot_flow_evolution,
                 plot_normal_maps,
                 plot_elevation_scatter,
-                plot_lambertian_comparison,
+                plot_lunar_lambert_comparison,
             )
             import matplotlib.pyplot as plt
 
@@ -462,11 +468,12 @@ class DepthFMLightningModule(L.LightningModule):
                 int_val = intensity[0].item() if intensity is not None else 1.0
                 amb_val = ambient[0].item() if ambient is not None else 0.0
 
-                fig = plot_lambertian_comparison(
+                fig = plot_lunar_lambert_comparison(
                     pred_aligned, gt,
                     sun_vector=sv,
                     intensity=int_val,
                     ambient=amb_val,
+                    lunar_lambert_weight=0.5, #FIXME actually train using correct metric
                     title=f"Lambertian Render (step {step})",
                 )
                 self._log_figure("val/lambertian_render", fig, step)
@@ -496,9 +503,10 @@ class DepthFMLightningModule(L.LightningModule):
             img_pix_vis: torch.Tensor,
             v_target: torch.Tensor,
             v_pred: torch.Tensor,
+            confidence: torch.Tensor | None,
             step: int,
     ) -> None:
-        """Log a training-time triptych."""
+        """Log a training-time triptych, expanded to include the confidence mask."""
         if self.global_rank != 0:
             return
 
@@ -521,21 +529,44 @@ class DepthFMLightningModule(L.LightningModule):
                 vt_disp = _norm01(vt_mag)
                 vp_disp = _norm01(vp_mag)
 
-            fig = plt.figure(figsize=(12, 4))
-            gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.05)
+                mask_disp = None
+                if confidence is not None:
+                    # Extract the (H, W) mask from the first item in the batch
+                    mask_disp = confidence[0, 0].float().cpu().numpy()
 
+            # Dynamically size the figure based on whether the mask exists
+            n_cols = 4 if mask_disp is not None else 3
+            fig = plt.figure(figsize=(4 * n_cols, 4))
+            gs = gridspec.GridSpec(1, n_cols, figure=fig, wspace=0.05)
+
+            # 1. Input Image
             ax0 = fig.add_subplot(gs[0, 0])
             ax0.imshow(img_np)
             ax0.set_title(f"Input image (step {step})", fontsize=9)
             ax0.axis("off")
 
-            ax1 = fig.add_subplot(gs[0, 1])
+            col_idx = 1
+
+            # 2. Confidence Mask (If available)
+            if mask_disp is not None:
+                ax_mask = fig.add_subplot(gs[0, col_idx])
+                # Plot binary mask in high-contrast gray
+                im_mask = ax_mask.imshow(mask_disp, cmap="gray", vmin=0, vmax=1)
+                ax_mask.set_title("Valid Data Mask", fontsize=9)
+                ax_mask.axis("off")
+                plt.colorbar(im_mask, ax=ax_mask, fraction=0.046, pad=0.04)
+                col_idx += 1
+
+            # 3. Target Velocity
+            ax1 = fig.add_subplot(gs[0, col_idx])
             im1 = ax1.imshow(vt_disp, cmap="viridis", vmin=0, vmax=1)
             ax1.set_title("v_target ||·||₂", fontsize=9)
             ax1.axis("off")
             plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+            col_idx += 1
 
-            ax2 = fig.add_subplot(gs[0, 2])
+            # 4. Predicted Velocity
+            ax2 = fig.add_subplot(gs[0, col_idx])
             im2 = ax2.imshow(vp_disp, cmap="viridis", vmin=0, vmax=1)
             ax2.set_title("v_pred ||·||₂", fontsize=9)
             ax2.axis("off")
@@ -736,6 +767,11 @@ class DepthFMLightningModule(L.LightningModule):
     def configure_optimizers(self):
         tc = self.config.training
         trainable = [p for p in self.model.backbone.parameters() if p.requires_grad]
+        losses = [p for p in self.loss_fn.parameters() if p.requires_grad]
+
+
+        logger.info("Number of trainable parameters parameters %d, loss function %d", len(trainable), len(losses))
+        trainable += losses
 
         optimizer = torch.optim.AdamW(
             trainable,

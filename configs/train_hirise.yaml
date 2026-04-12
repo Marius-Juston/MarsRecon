@@ -53,7 +53,7 @@ data:
   random_flip: true
   brightness_jitter: 0.0
 
-  signal_boost: 10.0
+  signal_boost: 1.0
 
 training:
   enable: true
@@ -89,14 +89,14 @@ training:
     velocity_weight: 1.0
     normals_weight: 1.0
     normals_start_step: 0
-    grad_weight: 1.0         # multi-scale gradient loss (no extra install)
+    grad_weight: 500.0         # multi-scale gradient loss (no extra install)
     grad_start_step: 0
     grad_scales: [1, 2, 4]
     # Focal Frequency Loss (requires: pip install focal-frequency-loss)
     freq_weight: 0.0
     freq_start_step: 1000
     freq_alpha: 1.0
-    photo_weight: 5.0
+    photo_weight: 50.0
     photo_start_step: 0
 
     use_confidence_weighting: true
@@ -110,7 +110,7 @@ training:
   train_vis_every_steps: 80
 
   # Test: use more Euler steps for best quality
-  test_euler_steps: 4
+  test_euler_steps: 16
 
   # Early stopping (null = disabled)
   early_stopping_patience: null

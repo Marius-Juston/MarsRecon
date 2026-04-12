@@ -61,7 +61,7 @@ from tqdm import tqdm
 
 from depth_fm.depthfm_adapter import (
     DepthFMHiRISEAdapterCached,
-    estimate_sun_vector_ols,
+    estimate_sun_vector_ols, fill_invalid_smooth_diffusion,
 )
 from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
 from depth_fm.visualization import (
@@ -184,15 +184,100 @@ def visualize_loss_components(dataloader, output_dir, num_samples=4):
 
 
 @torch.no_grad()
-def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
+def visualize_invalid_fill(dataloader, output_dir: Path, num_samples: int = 4, iterations=64):
+    """
+    Visualizes the smooth diffusion infilling process for VAE optimization.
+    Layout: [Mask] | [Ortho Masked] | [Ortho Smooth Fill] | [DTM Masked] | [DTM Smooth Fill]
+    """
+    logger.info(f"Generating Smooth Infilling visualization for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(num_samples, 5, figsize=(20, 4 * num_samples))
+    plt.subplots_adjust(wspace=0.1, hspace=0.1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    count = 0
+    with tqdm(total=num_samples) as pbar:
+        for batch in dataloader:
+            if count >= num_samples:
+                break
+            B = batch["image"].shape[0]
+
+            for i in range(B):
+                if count >= num_samples:
+                    break
+
+                img = batch["image"][i: i + 1].to(device)
+                dtm = batch["dtm"][i: i + 1, :1].to(device)
+                mask = batch["confidence"][i: i + 1].to(device)
+
+                if not (mask == 0).any():
+                    continue
+
+                # 1. Force mask the inputs (in case dataset already filled them)
+                img_masked = img * mask
+                dtm_masked = dtm * mask
+
+                # 2. Apply smooth diffusion
+                img_filled = fill_invalid_smooth_diffusion(img_masked, mask, iterations=iterations)
+                dtm_filled = fill_invalid_smooth_diffusion(dtm_masked, mask, iterations=iterations)
+
+                # 3. Prepare for plotting (Denormalize [-1, 1] to [0, 1])
+                mask_np = mask[0, 0].cpu().numpy()
+
+                img_masked_np = np.clip((np.transpose(img_masked[0].cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+                img_filled_np = np.clip((np.transpose(img_filled[0].cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+
+                dtm_masked_np = np.clip((dtm_masked[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                dtm_filled_np = np.clip((dtm_filled[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+
+                # Set masked regions to NaN for the "Masked" plots so they show up clear white/blank
+                bool_mask = mask_np.astype(bool)
+                img_masked_np[~bool_mask] = np.nan
+                dtm_masked_np[~bool_mask] = np.nan
+
+                # Plot
+                axes[count, 0].imshow(mask_np, cmap="gray")
+                axes[count, 1].imshow(img_masked_np)
+                axes[count, 2].imshow(img_filled_np)
+                axes[count, 3].imshow(dtm_masked_np, cmap="terrain")
+                axes[count, 4].imshow(dtm_filled_np, cmap="terrain")
+
+                for ax in axes[count]:
+                    ax.axis("off")
+
+                if count == 0:
+                    titles = ["Confidence Mask", "Masked Ortho", "Smooth Fill Ortho", "Masked DTM", "Smooth Fill DTM"]
+                    for ax, t in zip(axes[0], titles):
+                        ax.set_title(t)
+
+                count += 1
+                pbar.update()
+
+    save_path = output_dir / "smooth_fill_inspection.png"
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    plt.close(fig)
+    logger.info(f"Smooth filling visualization saved to: {save_path}")
+
+
+@torch.no_grad()
+def visualize_loss_physics(
+        dataloader,
+        output_dir: Path,
+        num_samples: int = 6,
+        lunar_lambert_weight: float = 0.5
+):
     """
     Visualizes the internal physics of the Photoclinometric Loss.
-    Layout: [Real Ortho (Gray)] | [GT DTM] | [Surface Normals] | [Lambertian Render] | [Lambertian GT]
+    Layout: [Real Ortho] | [GT DTM] | [Surface Normals] | [Lunar-Lambert Render] | [Lunar-Lambert GT Check]
     """
-    logger.info(f"Generating Loss Physics visualization for {num_samples} samples...")
+    logger.info(f"Generating Loss Physics visualization for {num_samples} samples (L={lunar_lambert_weight:.2f})...")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Sobel filters for surface normals
     sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=device) / 8.0
     sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=device) / 8.0
     kx = sobel_x.view(1, 1, 3, 3)
@@ -213,6 +298,7 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
                 if count >= num_samples:
                     break
 
+                # Extract inputs
                 img = batch["image"][i: i + 1].to(device)
                 dtm = batch["dtm"][i: i + 1, :1].to(device)
                 mask = batch["confidence"][i: i + 1].to(device)
@@ -220,47 +306,76 @@ def visualize_loss_physics(dataloader, output_dir: Path, num_samples: int = 6):
                 intensity = batch["intensity"][i: i + 1].to(device)
                 ambient = batch["ambient"][i: i + 1].to(device)
 
+                # Estimate GT parameters via OLS
                 sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
 
                 ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
                 _, _, H, W = dtm.shape
                 spatial_scale = max(H, W) / 2.0
 
+                # Compute Normals
                 padded_dtm = F.pad(dtm, (1, 1, 1, 1), mode="replicate")
                 n_x = -F.conv2d(padded_dtm, kx) * spatial_scale
                 n_y = -F.conv2d(padded_dtm, ky) * spatial_scale
                 n_z = torch.ones_like(n_x)
                 normals = F.normalize(torch.cat([n_x, n_y, n_z], dim=1), p=2, dim=1)
 
-                render_gt = torch.sum(normals * sun_vec_gt.view(1, 3, 1, 1), dim=1,
-                                      keepdim=True) * intensity_gt + ambient_gt
-                render = torch.sum(normals * sun_vec.view(1, 3, 1, 1), dim=1, keepdim=True) * intensity + ambient
+                # Emission angle is simply the Z-normal for a top-down (Nadir) satellite view
+                cos_e = normals[:, 2:3, :, :]
 
+                # --- 1. LUNAR-LAMBERT RENDER (GT Parameters) ---
+                cos_i_gt = torch.sum(normals * sun_vec_gt.view(1, 3, 1, 1), dim=1, keepdim=True)
+                cos_i_clamped_gt = torch.clamp(cos_i_gt, min=0.0)
+
+                lambert_comp_gt = cos_i_clamped_gt
+                ls_comp_gt = cos_i_clamped_gt / (cos_i_clamped_gt + cos_e + 1e-6)
+
+                render_blend_gt = (lunar_lambert_weight * lambert_comp_gt) + ((1.0 - lunar_lambert_weight) * ls_comp_gt)
+                render_gt = (render_blend_gt * intensity_gt) + ambient_gt
+
+                # --- 2. LUNAR-LAMBERT RENDER (Batch Parameters) ---
+                cos_i = torch.sum(normals * sun_vec.view(1, 3, 1, 1), dim=1, keepdim=True)
+                cos_i_clamped = torch.clamp(cos_i, min=0.0)
+
+                lambert_comp = cos_i_clamped
+                ls_comp = cos_i_clamped / (cos_i_clamped + cos_e + 1e-6)
+
+                render_blend = (lunar_lambert_weight * lambert_comp) + ((1.0 - lunar_lambert_weight) * ls_comp)
+                render = (render_blend * intensity) + ambient
+
+                # --- 3. CLIPPING & MASKING ---
                 img_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
                 dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
                 mask_np = mask[0, 0].cpu().numpy().astype(bool)
-                normals_disp = (normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0
-                render_disp = render[0, 0].cpu().numpy()
-                render_disp_gt = render_gt[0, 0].cpu().numpy()
+                normals_disp = np.clip((normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0, 0.0, 1.0)
+                render_disp = np.clip(render[0, 0].cpu().numpy(), 0.0, 1.0)
+                render_disp_gt = np.clip(render_gt[0, 0].cpu().numpy(), 0.0, 1.0)
 
                 for arr in (img_disp, dtm_disp, render_disp, render_disp_gt):
                     arr[~mask_np] = np.nan
                 normals_disp[~mask_np] = np.nan
 
-                axes[count, 0].imshow(img_disp, cmap="gray")
+                # --- 4. PLOTTING ---
+                axes[count, 0].imshow(img_disp, cmap="gray", vmin=0, vmax=1)
                 axes[count, 1].imshow(dtm_disp, cmap="terrain")
                 axes[count, 2].imshow(normals_disp)
-                axes[count, 3].imshow(render_disp, cmap="gray")
-                axes[count, 4].imshow(render_disp_gt, cmap="gray")
+                axes[count, 3].imshow(render_disp, cmap="gray", vmin=0, vmax=1)
+                axes[count, 4].imshow(render_disp_gt, cmap="gray", vmin=0, vmax=1)
+
                 for ax in axes[count]:
                     ax.axis("off")
+
                 if count == 0:
-                    for ax, t in zip(
-                            axes[0],
-                            ["Real Ortho (Gray)", "GT DTM", "Calculated Surface Normals", "Lambertian Render (Shadows)",
-                             "Lambertian Render check (Shadows)"],
-                    ):
+                    titles = [
+                        "Real Ortho (Gray)",
+                        "GT DTM",
+                        "Surface Normals",
+                        f"Lunar-Lambert Render (L={lunar_lambert_weight:.2f})",
+                        f"Lunar-Lambert GT Check"
+                    ]
+                    for ax, t in zip(axes[0], titles):
                         ax.set_title(t)
+
                 count += 1
                 pbar.update()
 
@@ -1044,6 +1159,7 @@ def main():
     parser.add_argument("--view_thumbnails", action="store_true")
     parser.add_argument("--view_loss_physics", action="store_true")
     parser.add_argument("--view_loss_components", action="store_true")
+    parser.add_argument("--view_invalid_fill", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
@@ -1065,7 +1181,7 @@ def main():
                     _WORKERS_PER_GPU)
 
     # Inspection modes
-    inspection = args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components
+    inspection = args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components or args.view_invalid_fill
     if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
@@ -1084,6 +1200,8 @@ def main():
                 visualize_loss_physics(loaders["val"], output_dir=output_path, num_samples=8)
             if args.view_loss_components:
                 visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
+            if args.view_invalid_fill:
+                visualize_invalid_fill(loaders["val"], output_dir=output_path, num_samples=8)
 
             logger.info("Data inspection complete. Exiting without training.")
         return

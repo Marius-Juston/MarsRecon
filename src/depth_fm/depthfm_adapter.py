@@ -167,6 +167,127 @@ def _safe_resize(tensor: torch.Tensor, size: int, is_mask: bool = False, has_nan
     return F.interpolate(tensor.unsqueeze(0), size=(size, size), mode='bilinear', align_corners=False).squeeze(0)
 
 
+import torch
+import numpy as np
+from scipy import ndimage
+
+
+def fill_invalid_nearest_neighbor(
+        tensor: torch.Tensor,
+        valid_mask: torch.Tensor
+) -> torch.Tensor:
+    """
+    Fill invalid regions using nearest-neighbor propagation via EDT.
+
+    Supports:
+        (H, W)
+        (C, H, W)
+        (B, C, H, W)
+    """
+    device = tensor.device
+    dtype = tensor.dtype
+
+    arr_np = tensor.cpu().numpy()
+    mask_np = valid_mask.squeeze().cpu().numpy() > 0  # (H, W)
+
+    # Degenerate cases
+    if mask_np.all() or not mask_np.any():
+        return tensor
+
+    # Get nearest valid pixel indices
+    indices = ndimage.distance_transform_edt(
+        ~mask_np,
+        return_distances=False,
+        return_indices=True
+    )
+    # indices: (2, H, W)
+
+    H, W = mask_np.shape
+    iy, ix = indices  # each (H, W)
+
+    # --------------------------------------------------
+    # CASE 1: (H, W)
+    # --------------------------------------------------
+    if arr_np.ndim == 2:
+        filled_np = arr_np[iy, ix]
+
+    # --------------------------------------------------
+    # CASE 2: (C, H, W)
+    # --------------------------------------------------
+    elif arr_np.ndim == 3:
+        C = arr_np.shape[0]
+
+        c_idx = np.arange(C)[:, None, None]  # (C,1,1)
+        iy_b = iy[None, :, :]  # (1,H,W)
+        ix_b = ix[None, :, :]  # (1,H,W)
+
+        filled_np = arr_np[c_idx, iy_b, ix_b]  # (C,H,W)
+
+    # --------------------------------------------------
+    # CASE 3: (B, C, H, W)
+    # --------------------------------------------------
+    elif arr_np.ndim == 4:
+        B, C = arr_np.shape[:2]
+
+        b_idx = np.arange(B)[:, None, None, None]  # (B,1,1,1)
+        c_idx = np.arange(C)[None, :, None, None]  # (1,C,1,1)
+
+        iy_b = iy[None, None, :, :]  # (1,1,H,W)
+        ix_b = ix[None, None, :, :]  # (1,1,H,W)
+
+        filled_np = arr_np[b_idx, c_idx, iy_b, ix_b]  # (B,C,H,W)
+
+    else:
+        raise ValueError(f"Unsupported tensor dimension: {arr_np.ndim}")
+
+    return torch.from_numpy(filled_np).to(device=device, dtype=dtype)
+
+def fill_invalid_smooth_diffusion(
+        tensor: torch.Tensor,
+        valid_mask: torch.Tensor,
+        iterations: int = 64
+) -> torch.Tensor:
+    """
+    Fills invalid regions using Laplacian diffusion (solving the heat equation).
+    Creates a perfectly smooth gradient from the valid boundaries down to the global mean.
+    """
+    is_3d = tensor.ndim == 3
+    if is_3d:
+        tensor = tensor.unsqueeze(0)
+        valid_mask = valid_mask.unsqueeze(0)
+
+    B, C, H, W = tensor.shape
+    device = tensor.device
+    dtype = tensor.dtype
+
+    # 1. Sanitize the inputs to destroy any hidden NaNs that could poison the convolution
+    tensor = torch.nan_to_num(tensor, nan=0.0)
+    valid_bool = valid_mask > 0.5
+
+    # 2. Calculate the global mean of the valid pixels ONLY
+    valid_sum = (tensor * valid_bool.to(dtype)).sum(dim=[-2, -1], keepdim=True)
+    valid_count = valid_bool.sum(dim=[-2, -1], keepdim=True).clamp(min=1.0)
+    global_mean = valid_sum / valid_count
+
+    # 3. Initialize the working tensor.
+    # Valid pixels keep their real values, invalid empty space starts as the flat global mean.
+    filled = torch.where(valid_bool, tensor, global_mean)
+
+    # 4. Create a simple normalized 3x3 averaging kernel
+    kernel = torch.ones((C, 1, 3, 3), device=device, dtype=dtype) / 9.0
+
+    # 5. Laplacian Diffusion (Jacobi method)
+    for _ in range(iterations):
+        # Blur the entire canvas
+        blurred = F.conv2d(filled, kernel, padding=1, groups=C)
+
+        # Re-clamp the original valid regions back to their ground-truth values
+        filled = torch.where(valid_bool, tensor, blurred)
+
+    if is_3d:
+        return filled.squeeze(0)
+    return filled
+
 def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.15) -> bool:
     """
     Detects artificial TIN (Triangular Irregular Network) interpolation in DTMs.
@@ -219,7 +340,10 @@ def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: 
         return default_sun, torch.tensor(1.0, device=device), torch.tensor(0.3, device=device)
 
     # Ensure 3D (C, H, W)
-    if dtm.ndim == 4: dtm = dtm[0]
+    if dtm.ndim == 4:
+        assert dtm.shape[
+                   0] == 1, "The batch size should be 1. estimate_sun_vector_ols currently only works for a batch size of 1"
+        dtm = dtm[0]
     if ortho.ndim == 4: ortho = ortho[0]
     if valid_mask.ndim == 4: valid_mask = valid_mask[0]
 
@@ -272,7 +396,6 @@ def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: 
 
     sun_vec = F.normalize(k, p=2, dim=0)
 
-    # Return all 3 parameters
     return sun_vec, intensity, ambient
 
 
@@ -690,9 +813,14 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
         # 4. Normalization
         dtm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
-        dtm = _to_3ch(dtm)
-
         image = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
+
+        # --- PRE-VAE NEAREST NEIGHBOR FILL ---
+        # Fills regions outside the valid mask so the VAE doesn't encode sharp black boundaries
+        dtm = fill_invalid_smooth_diffusion(dtm, valid_mask_resized)
+        image = fill_invalid_smooth_diffusion(image, valid_mask_resized)
+
+        dtm = _to_3ch(dtm)
         image = _to_3ch(image)
 
         # 5. Synchronised Augmentation
