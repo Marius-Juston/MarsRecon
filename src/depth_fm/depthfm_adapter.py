@@ -314,6 +314,99 @@ def fill_invalid_smooth_diffusion(
     return filled
 
 
+def fill_dtm_smart_diffusion(
+        tensor: torch.Tensor,
+        valid_mask: torch.Tensor,
+        iterations: int = 64,
+        erode_pixels: int = 1,  # How many bad boundary pixels to permanently delete
+        blend_pixels: int = 3  # How many pixels INWARD to create the smooth slope transition
+) -> torch.Tensor:
+    """
+    Fills voids strictly respecting valid data.
+    Maximum inward intrusion is strictly limited to (erode_pixels + blend_pixels).
+    """
+    is_3d = tensor.ndim == 3
+    if is_3d:
+        tensor = tensor.unsqueeze(0)
+        valid_mask = valid_mask.unsqueeze(0)
+
+    B, C, H, W = tensor.shape
+    device = tensor.device
+    dtype = tensor.dtype
+
+    tensor = torch.nan_to_num(tensor, nan=0.0)
+
+    # -------------------------------------------------------------------------
+    # 1. STRICT EROSION (Kill the hot pixels)
+    # -------------------------------------------------------------------------
+    if erode_pixels > 0:
+        kernel_size = 2 * erode_pixels + 1
+        eroded_mask = -F.max_pool2d(-valid_mask.to(dtype), kernel_size=kernel_size, stride=1, padding=erode_pixels)
+    else:
+        eroded_mask = valid_mask.to(dtype)
+
+    # -------------------------------------------------------------------------
+    # 2. STRICT SOFT MASK (The 4-pixel limit)
+    # -------------------------------------------------------------------------
+    soft_mask = eroded_mask.clone()
+    if blend_pixels > 0:
+        mask_blur_kernel = torch.ones((1, 1, 3, 3), device=device, dtype=dtype) / 9.0
+        soft_mask_expanded = soft_mask[:, :1, :, :]
+
+        # Create a gradient
+        for _ in range(blend_pixels):
+            soft_mask_expanded = F.conv2d(soft_mask_expanded, mask_blur_kernel, padding=1)
+        soft_mask = soft_mask_expanded.expand(-1, C, -1, -1)
+
+        # CRITICAL FIX: Clamp the soft mask so it NEVER expands outward into the void.
+        # This ensures we don't accidentally multiply the void (which is 0.0)
+        # into the transition zone.
+        soft_mask = torch.min(soft_mask, eroded_mask)
+
+    # -------------------------------------------------------------------------
+    # 3. EDGE CLONING (Outward Flooding)
+    # Smear the exact edge pixels outward to initialize the void
+    # -------------------------------------------------------------------------
+    with torch.no_grad():
+        working_tensor = tensor * eroded_mask
+        working_mask = eroded_mask
+
+        # Use pooling to act as a smooth "nearest valid neighbor" outward clone
+        for k in [3, 7, 15, 31, 63]:
+            pad = k // 2
+            masked_t = working_tensor * working_mask
+            blurred_t = F.avg_pool2d(masked_t, kernel_size=k, stride=1, padding=pad)
+            blurred_m = F.avg_pool2d(working_mask, kernel_size=k, stride=1, padding=pad)
+
+            local_avg = blurred_t / (blurred_m + 1e-6)
+            working_tensor = torch.where(working_mask > 0.5, working_tensor, local_avg)
+            working_mask = F.max_pool2d(working_mask, kernel_size=3, stride=1, padding=1)
+
+        # Fallback for massively huge voids
+        valid_sum = (tensor * eroded_mask).sum(dim=[-2, -1], keepdim=True)
+        valid_count = eroded_mask.sum(dim=[-2, -1], keepdim=True).clamp(min=1.0)
+        global_mean = valid_sum / valid_count
+
+        filled = torch.where(working_mask > 0.5, working_tensor, global_mean)
+
+    # -------------------------------------------------------------------------
+    # 4. CONSTRAINED DIFFUSION
+    # -------------------------------------------------------------------------
+    kernel = torch.ones((C, 1, 3, 3), device=device, dtype=dtype) / 9.0
+
+    for _ in range(iterations):
+        blurred = F.conv2d(filled, kernel, padding=1, groups=C)
+
+        # Because soft_mask is strictly clamped, this LERP only alters
+        # the inner pixels up to `blend_pixels` deep. The rest of the valid
+        # data is multiplied by 1.0 (untouched).
+        filled = tensor * soft_mask + blurred * (1.0 - soft_mask)
+
+    if is_3d:
+        return filled.squeeze(0)
+    return filled
+
+
 def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.15) -> bool:
     """
     Detects artificial TIN (Triangular Irregular Network) interpolation in DTMs.
