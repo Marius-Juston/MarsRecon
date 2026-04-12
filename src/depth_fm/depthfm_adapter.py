@@ -246,11 +246,18 @@ def fill_invalid_nearest_neighbor(
 def fill_invalid_smooth_diffusion(
         tensor: torch.Tensor,
         valid_mask: torch.Tensor,
-        iterations: int = 64
+        iterations: int = 64,
+        erode_radius: int = 2
 ) -> torch.Tensor:
     """
     Fills invalid regions using Laplacian diffusion (solving the heat equation).
     Creates a perfectly smooth gradient from the valid boundaries down to the global mean.
+
+    Args:
+        tensor: The input image/DTM tensor [B, C, H, W]
+        valid_mask: The confidence mask [B, 1, H, W]
+        iterations: Number of diffusion steps
+        erode_radius: How many pixels to shrink the valid mask by to remove noisy edge artifacts.
     """
     is_3d = tensor.ndim == 3
     if is_3d:
@@ -261,28 +268,45 @@ def fill_invalid_smooth_diffusion(
     device = tensor.device
     dtype = tensor.dtype
 
-    # 1. Sanitize the inputs to destroy any hidden NaNs that could poison the convolution
+    # 1. Sanitize the inputs to destroy any hidden NaNs
     tensor = torch.nan_to_num(tensor, nan=0.0)
-    valid_bool = valid_mask > 0.5
 
-    # 2. Calculate the global mean of the valid pixels ONLY
+    # -------------------------------------------------------------------------
+    # 2. MASK EROSION (The Fix)
+    # Shrink the valid mask to discard noisy boundary pixels.
+    # We use negative max-pooling as a highly efficient way to do 2D erosion.
+    # -------------------------------------------------------------------------
+    if erode_radius > 0:
+        kernel_size = 2 * erode_radius + 1
+        # If any 0 exists in the neighborhood, the whole neighborhood becomes 0
+        eroded_mask = -F.max_pool2d(
+            -valid_mask.to(dtype),
+            kernel_size=kernel_size,
+            stride=1,
+            padding=erode_radius
+        )
+        valid_bool = eroded_mask > 0.5
+    else:
+        valid_bool = valid_mask > 0.5
+
+    # 3. Calculate the global mean of the *clean* valid pixels ONLY
     valid_sum = (tensor * valid_bool.to(dtype)).sum(dim=[-2, -1], keepdim=True)
     valid_count = valid_bool.sum(dim=[-2, -1], keepdim=True).clamp(min=1.0)
     global_mean = valid_sum / valid_count
 
-    # 3. Initialize the working tensor.
-    # Valid pixels keep their real values, invalid empty space starts as the flat global mean.
+    # 4. Initialize the working tensor.
+    # Eroded noisy pixels and empty space start as the flat global mean.
     filled = torch.where(valid_bool, tensor, global_mean)
 
-    # 4. Create a simple normalized 3x3 averaging kernel
+    # 5. Create a simple normalized 3x3 averaging kernel
     kernel = torch.ones((C, 1, 3, 3), device=device, dtype=dtype) / 9.0
 
-    # 5. Laplacian Diffusion (Jacobi method)
+    # 6. Laplacian Diffusion (Jacobi method)
     for _ in range(iterations):
         # Blur the entire canvas
         blurred = F.conv2d(filled, kernel, padding=1, groups=C)
 
-        # Re-clamp the original valid regions back to their ground-truth values
+        # Re-clamp ONLY the safely eroded valid regions back to ground-truth
         filled = torch.where(valid_bool, tensor, blurred)
 
     if is_3d:
