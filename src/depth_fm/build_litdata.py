@@ -1,11 +1,10 @@
 """
 Preprocess MarsHiRISEDTM into LitData optimized streaming format.
 
-Replaces build_webdataset.py. Run ONCE per configuration.
-
 Uses a two-phase approach to avoid spawn/pickle incompatibility:
   Phase 1: Fork-based DataLoader extracts samples to temp .npz files
            (GDAL/rasterio require fork — spawn can't pickle them)
+           *Also recomputes robust OLS sun vectors on-the-fly*
   Phase 2: litdata.optimize repacks .npz files into optimized chunks
            (litdata forces spawn — but .npz reading is trivially picklable)
 
@@ -29,8 +28,8 @@ os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
 os.environ["OMP_NUM_THREADS"] = "2"
 
 import rasterio
-
 import numpy as np
+import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -39,7 +38,7 @@ from litdata import optimize
 from dataset.mars_hirise_dtm import MarsHiRISEDTM
 from dataset.hirise_sampler import HiRISEGeoSampler
 from torchgeo.samplers import Units
-from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached
+from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_ols
 
 import torch.multiprocessing as mp
 
@@ -167,6 +166,7 @@ def build_litdata_for_split(config, split: str, cache_hash: str, workers: int = 
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1: Extract with fork-based DataLoader → temp .npz files
+    #          Includes on-the-fly sun vector estimation & patching
     # ═══════════════════════════════════════════════════════════════════
 
     tmp_dir = dataset_root / f"_litdata_tmp_{cache_hash}_{split}"
@@ -191,15 +191,28 @@ def build_litdata_for_split(config, split: str, cache_hash: str, workers: int = 
     npz_paths = []
 
     for i, sample in enumerate(tqdm(loader, total=num_samples, desc=f"Extract {split}")):
+
+        # Ensure we have float32 tensors for the OLS math
+        image_fp32 = sample["image"].float()      # (3, H, W)
+        dtm_fp32 = sample["dtm"].float()          # (3, H, W)
+        conf_fp32 = sample["confidence"].float()  # (1, H, W)
+
+        # Recompute sun vectors using single-channel DTM and the image
+        dtm_1ch = dtm_fp32[:1]  # (1, H, W)
+        sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_1ch, image_fp32, conf_fp32)
+
+        # Normalize to strict unit vector
+        sun_vec = torch.nn.functional.normalize(sun_vec, p=2, dim=0)
+
         npz_path = str(tmp_dir / f"{i:08d}.npz")
         np.savez(
             npz_path,
             image=sample["image"].numpy().astype(np.float16),
             dtm=sample["dtm"].numpy().astype(np.float16),
             confidence=sample["confidence"].numpy().astype(np.float16),
-            sun_vector=sample["sun_vector"].numpy(),
-            intensity=sample["intensity"].numpy(),
-            ambient=sample["ambient"].numpy(),
+            sun_vector=sun_vec.numpy(),
+            intensity=intensity.numpy(),
+            ambient=ambient.numpy(),
         )
         npz_paths.append(npz_path)
 
