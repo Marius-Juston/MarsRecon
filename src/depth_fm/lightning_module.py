@@ -16,19 +16,38 @@ from __future__ import annotations
 
 import gc
 import logging
-import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait, FIRST_EXCEPTION
+from pathlib import Path
 from typing import Any
 
 import lightning as L
+import matplotlib as mpl
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 
 from depth_fm.losses import CombinedLoss
+from depth_fm.metrics import affine_align
 from depth_fm.metrics import compute_depth_metrics, compute_photo_consistency, MetricsAggregator
 from depth_fm.model import build_model
 from depth_fm.noise import q_sample
+from depth_fm.visualization import plot_patch_gallery
+from depth_fm.visualization import (
+    plot_prediction_triptych,
+    plot_cross_sections,
+    plot_error_heatmap,
+    plot_flow_evolution,
+    plot_normal_maps,
+    plot_elevation_scatter,
+    plot_lunar_lambert_comparison,
+)
+
+mpl.use("Agg")
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +73,9 @@ class DepthFMLightningModule(L.LightningModule):
         self.config = config
 
         # Build model
+        torch.backends.cudnn.benchmark = True
         self.model = build_model(config)
+        self.model = self.model.to(memory_format=torch.channels_last)
 
         # Loss
         lc = config.training.losses
@@ -98,12 +119,65 @@ class DepthFMLightningModule(L.LightningModule):
         # Resolved lazily from trainer.default_root_dir once training starts.
         self._vector_fig_dir: str | None = None
 
+        # Background thread pool for non-blocking figure generation & upload.
+        # matplotlib (Agg backend) + wandb.Image upload are CPU/IO-bound;
+        # offloading them frees the GPU to resume training immediately.
+
+        self._vis_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="vis"
+        )
+        self._vis_futures: list = []
+
     def _trace(self, msg: str):
         """Helper to print explicit DDP synchronization trace logs."""
         # Using INFO level so it passes standard logging filters.
         # You can grep for "[DDP TRACE]" in your console output.
         step = getattr(self, "global_step", "N/A")
         logger.debug(f"[DDP TRACE | Rank {self.global_rank} | Step {step}] {msg}")
+
+    # ------------------------------------------------------------------
+    # Async visualisation helpers
+    # ------------------------------------------------------------------
+
+    def _submit_vis_task(self, fn, *args, **kwargs):
+        """Submit a visualisation task to the background thread pool.
+
+        Training resumes immediately while figures render on CPU threads.
+        """
+        # Prune completed futures to avoid unbounded list growth
+        self._vis_futures = [f for f in self._vis_futures if not f.done()]
+        future = self._vis_executor.submit(fn, *args, **kwargs)
+        # Log exceptions from the thread (otherwise they're silently lost)
+        future.add_done_callback(self._vis_future_callback)
+        self._vis_futures.append(future)
+
+    @staticmethod
+    def _vis_future_callback(future):
+        """Log any exception from a background vis task."""
+        exc = future.exception()
+        if exc is not None:
+            logger.exception("Background visualisation task failed: %s", exc)
+
+    def _flush_vis_tasks(self, timeout: float = 300.0):
+        """Block until all pending vis tasks complete.
+
+        Called before checkpointing (to ensure PDFs are on disk) and at
+        the end of training.
+        """
+        if not self._vis_futures:
+            return
+        n = len(self._vis_futures)
+        self._trace(f"Flushing {n} pending vis tasks...")
+
+        done, not_done = wait(self._vis_futures, timeout=timeout, return_when=FIRST_EXCEPTION)
+        for f in done:
+            exc = f.exception()
+            if exc is not None:
+                logger.exception("Vis task failed during flush: %s", exc)
+        if not_done:
+            logger.warning("%d vis tasks did not complete within %.0fs timeout", len(not_done), timeout)
+        self._vis_futures.clear()
+        self._trace("Vis flush complete")
 
     # ------------------------------------------------------------------
     # Flow matching core
@@ -267,17 +341,25 @@ class DepthFMLightningModule(L.LightningModule):
             with torch.no_grad():
                 img_pix_vis = self._decode(z_img[:1])
             if self.global_rank == 0 and self.logger and hasattr(self.logger, "experiment"):
-                self._trace("training_step: rank 0 logging train visuals")
-                start_vis = time.perf_counter()
-                self._log_training_visuals(
-                    img_pix_vis=img_pix_vis,
-                    v_target=v_target,
-                    v_pred=v_pred,
-                    confidence=batch.get("confidence"),
-                    step=step
-                )
-                vis_dur = time.perf_counter() - start_vis
-                self._trace(f"training_step: rank 0 finished train visuals in {vis_dur:.2f}s")
+                # Snapshot to CPU for background thread
+                img_snap = img_pix_vis.detach().cpu()
+                vt_snap = v_target.detach().cpu()
+                vp_snap = v_pred.detach().cpu()
+                conf_snap = batch.get("confidence")
+                if conf_snap is not None:
+                    conf_snap = conf_snap.detach().cpu()
+                step_snap = step
+
+                def _train_vis():
+                    self._log_training_visuals(
+                        img_pix_vis=img_snap,
+                        v_target=vt_snap,
+                        v_pred=vp_snap,
+                        confidence=conf_snap,
+                        step=step_snap,
+                    )
+
+                self._submit_vis_task(_train_vis)
 
         self._trace(f"Exiting training_step for batch {batch_idx}")
 
@@ -300,6 +382,9 @@ class DepthFMLightningModule(L.LightningModule):
     # ------------------------------------------------------------------
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # Ensure all background vis tasks are done before saving,
+        # so vector PDFs are on disk alongside the checkpoint.
+        self._flush_vis_tasks(timeout=120.0)
         checkpoint["ema_shadow"] = self._ema_shadow
         checkpoint["ema_initialised"] = self._ema_initialised
 
@@ -363,7 +448,7 @@ class DepthFMLightningModule(L.LightningModule):
 
             # Compute photometric consistency if sun data is available
             if "sun_vector" in batch and "intensity" in batch and "ambient" in batch:
-                from depth_fm.metrics import affine_align
+
                 pred_aligned_i, _, _ = affine_align(pred_pix[i], gt_raw[i])
                 img_i = batch["image"][i].float().cpu().numpy()
                 if img_i.shape[0] == 3:
@@ -384,7 +469,7 @@ class DepthFMLightningModule(L.LightningModule):
                     )
                     metrics.photo_consistency = photo_score
                 except Exception:
-                    pass
+                    logger.exception("Problem computing phot consistency")
 
             self._val_aggregator.add(metrics, tile_id)
 
@@ -472,23 +557,26 @@ class DepthFMLightningModule(L.LightningModule):
 
         if self.global_rank == 0 and self._val_vis_data is not None:
             if self.logger and hasattr(self.logger, "experiment"):
-                self._trace("on_validation_epoch_end: Rank 0 starting visual logging uploads")
-                start_vis = time.perf_counter()
+                self._trace("on_validation_epoch_end: Rank 0 submitting visual logging to background thread")
+
+                # Snapshot all data for the background thread.
+                # The closure captures these local variables, so clearing
+                # self._val_vis_data below is safe — the thread has its own refs.
                 vd = self._val_vis_data
-                self._log_validation_visuals(
-                    vd["batch"], vd["z_img"], vd["z_depth"],
-                    vd["pred_pix"], vd["gt_raw"], vd["conf_mask"],
-                    flow_intermediates=vd.get("flow_intermediates"),
-                )
+                gallery_snapshot = dict(self._val_gallery_data)
+                worst_snapshot = list(worst)
+                best_snapshot = list(best)
 
-                # Log worst/best 5 gallery for val
-                self._log_gallery("val", worst, best)
+                def _vis_work():
+                    self._log_validation_visuals(
+                        vd["batch"], vd["z_img"], vd["z_depth"],
+                        vd["pred_pix"], vd["gt_raw"], vd["conf_mask"],
+                        flow_intermediates=vd.get("flow_intermediates"),
+                    )
+                    self._log_gallery("val", worst_snapshot, best_snapshot, gallery_snapshot)
+                    self._upload_vector_figures_artifact(prefix="val")
 
-                vis_dur = time.perf_counter() - start_vis
-                self._trace(f"on_validation_epoch_end: Rank 0 finished visual logging uploads in {vis_dur:.2f}s")
-
-            # Upload all vector PDFs as a downloadable wandb artifact
-            self._upload_vector_figures_artifact(prefix="val")
+                self._submit_vis_task(_vis_work)
 
         self._val_vis_data = None
         self._val_gallery_data = {}
@@ -503,16 +591,6 @@ class DepthFMLightningModule(L.LightningModule):
             return
 
         try:
-            from depth_fm.visualization import (
-                plot_prediction_triptych,
-                plot_cross_sections,
-                plot_error_heatmap,
-                plot_flow_evolution,
-                plot_normal_maps,
-                plot_elevation_scatter,
-                plot_lunar_lambert_comparison,
-            )
-            import matplotlib.pyplot as plt
 
             img_np = batch["image"][0].float().cpu().numpy()
             if img_np.shape[0] == 3:
@@ -530,7 +608,6 @@ class DepthFMLightningModule(L.LightningModule):
             self._log_figure("val/cross_sections", fig, step)
             plt.close(fig)
 
-            from depth_fm.metrics import affine_align
             pred_aligned, _, _ = affine_align(pred, gt)
             fig = plot_error_heatmap(pred_aligned, gt, title=f"Error map (step {step})")
             self._log_figure("val/error_map", fig, step)
@@ -541,7 +618,6 @@ class DepthFMLightningModule(L.LightningModule):
             ambient = batch.get("ambient")
 
             if sun_vec is not None:
-                from depth_fm.metrics import affine_align
                 pred_aligned, _, _ = affine_align(pred, gt)
 
                 sv = sun_vec[0].cpu().numpy()
@@ -591,8 +667,6 @@ class DepthFMLightningModule(L.LightningModule):
             return
 
         try:
-            import matplotlib.pyplot as plt
-            import matplotlib.gridspec as gridspec
 
             with torch.no_grad():
                 img_np = img_pix_vis[0].float().cpu().numpy()
@@ -661,7 +735,6 @@ class DepthFMLightningModule(L.LightningModule):
     def _get_vector_fig_dir(self) -> str:
         """Return (and create) the directory for vector-format PDF figures."""
         if self._vector_fig_dir is None:
-            from pathlib import Path
             root = getattr(self.trainer, "default_root_dir", "outputs")
             d = Path(root) / "vector_figures"
             d.mkdir(parents=True, exist_ok=True)
@@ -680,8 +753,6 @@ class DepthFMLightningModule(L.LightningModule):
         The PDFs are additionally bundled into a wandb Artifact at the end
         of each validation/test epoch for bulk download.
         """
-        from pathlib import Path
-
         if self.logger is None and self.global_rank != 0:
             return
 
@@ -695,7 +766,7 @@ class DepthFMLightningModule(L.LightningModule):
                 str(pdf_path),
                 format="pdf",
                 bbox_inches="tight",
-                dpi=300,           # embedded raster elements (images) at 300 DPI
+                dpi=300,  # embedded raster elements (images) at 300 DPI
                 metadata={"Creator": "Mars DepthFM", "Subject": tag},
             )
         except Exception:
@@ -706,7 +777,7 @@ class DepthFMLightningModule(L.LightningModule):
             if self.logger is not None and hasattr(self.logger, "experiment"):
                 exp = self.logger.experiment
                 if hasattr(exp, "log"):
-                    import wandb
+
                     exp.log({tag: wandb.Image(fig)}, step=step)
                 elif hasattr(exp, "add_figure"):
                     exp.add_figure(tag, fig, global_step=step)
@@ -721,7 +792,6 @@ class DepthFMLightningModule(L.LightningModule):
 
         Navigate to:  Artifacts → "figures-{prefix}" → Files tab → Download
         """
-        from pathlib import Path
 
         if self.global_rank != 0:
             return
@@ -734,7 +804,6 @@ class DepthFMLightningModule(L.LightningModule):
             return
 
         try:
-            import wandb
             exp = self.logger.experiment
             if not hasattr(exp, "log_artifact"):
                 return
@@ -755,24 +824,25 @@ class DepthFMLightningModule(L.LightningModule):
         except Exception:
             logger.exception("Failed to upload vector figures artifact")
 
-    def _log_gallery(self, prefix: str, worst: list, best: list):
+    def _log_gallery(self, prefix: str, worst: list, best: list, gallery_data: dict = None):
         """Log worst/best 5 gallery plots to wandb for troubleshooting.
 
         Args:
             prefix: "val" or "test"
             worst: list of (tile_id, rmse_value) for worst patches
             best: list of (tile_id, rmse_value) for best patches
+            gallery_data: dict of tile_id → {image, pred, gt, rmse}.
+                If None, falls back to self._{prefix}_gallery_data.
         """
         if self.global_rank != 0 or self.logger is None:
             return
 
-        gallery_data = getattr(self, f"_{prefix}_gallery_data", {})
+        if gallery_data is None:
+            gallery_data = getattr(self, f"_{prefix}_gallery_data", {})
         if not gallery_data:
             return
 
         try:
-            from depth_fm.visualization import plot_patch_gallery
-            import matplotlib.pyplot as plt
 
             step = self.global_step
 
@@ -857,7 +927,6 @@ class DepthFMLightningModule(L.LightningModule):
 
             # Compute photometric consistency if sun data available
             if "sun_vector" in batch and "intensity" in batch and "ambient" in batch:
-                from depth_fm.metrics import affine_align
                 pred_aligned_i, _, _ = affine_align(pred_pix[i], gt_raw[i])
                 img_i = batch["image"][i].float().cpu().numpy()
                 if img_i.shape[0] == 3:
@@ -877,7 +946,7 @@ class DepthFMLightningModule(L.LightningModule):
                     )
                     metrics.photo_consistency = photo_score
                 except Exception:
-                    pass
+                    logger.exception("Problem computing photo consistency")
 
             self._test_aggregator.add(metrics, tile_id)
 
@@ -924,7 +993,7 @@ class DepthFMLightningModule(L.LightningModule):
                 logger.info("  %-25s  %.4f ± %.4f", m, s["mean"], s["std"])
             logger.info("=" * 60)
 
-            # Log worst/best 5 gallery for test
+            # Log worst/best 5 gallery for test (async)
             worst = self._test_aggregator.worst_k("rmse", k=5)
             best = self._test_aggregator.best_k("rmse", k=5)
             if worst:
@@ -934,10 +1003,15 @@ class DepthFMLightningModule(L.LightningModule):
                 logger.info("Best 5 test patches by RMSE: %s",
                             ", ".join(f"{tid}={v:.2f}m" for tid, v in best))
 
-            self._log_gallery("test", worst, best)
+            gallery_snapshot = dict(self._test_gallery_data)
+            worst_snapshot = list(worst)
+            best_snapshot = list(best)
 
-            # Upload all vector PDFs as a downloadable wandb artifact
-            self._upload_vector_figures_artifact(prefix="test")
+            def _test_vis_work():
+                self._log_gallery("test", worst_snapshot, best_snapshot, gallery_snapshot)
+                self._upload_vector_figures_artifact(prefix="test")
+
+            self._submit_vis_task(_test_vis_work)
 
         self._test_gallery_data = {}
         self._trace("Exiting on_test_epoch_end")
@@ -1034,6 +1108,12 @@ class DepthFMLightningModule(L.LightningModule):
             n_hooks,
         )
         self._trace("Exited on_train_start")
+
+    def on_train_end(self) -> None:
+        """Flush all pending vis tasks and shut down the thread pool."""
+        self._flush_vis_tasks(timeout=300.0)
+        self._vis_executor.shutdown(wait=False)
+        self._trace("Vis executor shut down")
 
     # ------------------------------------------------------------------
     # Gradient norm logging — throttled to reduce overhead

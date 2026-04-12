@@ -73,6 +73,7 @@ from depth_fm.visualization import (
 logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
 
 # ---------------------------------------------------------------------------
 # Hardware-aware constants for 2×128-core Ryzen / 4×A6000 / 1 TB RAM
@@ -488,7 +489,9 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
             if len(images) == num_samples:
                 break
 
-    fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
+    n_cols = 7
+    scale = 4
+    fig, axes = plt.subplots(num_samples, n_cols, figsize=(scale * n_cols, scale * num_samples))
     plt.subplots_adjust(wspace=0.1, hspace=0.1)
     crop_size = 128
 
@@ -537,17 +540,18 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
         detrended_crop_norm = detrend_and_stretch(dtm_crop, mask_crop)
 
         axes[idx, 0].imshow(img_np)
-        axes[idx, 1].imshow(dtm_full_1ch, cmap="terrain")
-        axes[idx, 2].imshow(detrended_full_norm, cmap="terrain")
-        axes[idx, 3].imshow(img_crop)
-        axes[idx, 4].imshow(slope_norm, cmap="magma")
-        axes[idx, 5].imshow(detrended_crop_norm, cmap="terrain")
+        axes[idx, 1].imshow(mask_np, cmap="gray", vmin=0, vmax=1)
+        axes[idx, 2].imshow(dtm_full_1ch, cmap="terrain")
+        axes[idx, 3].imshow(detrended_full_norm, cmap="terrain")
+        axes[idx, 4].imshow(img_crop)
+        axes[idx, 5].imshow(slope_norm, cmap="magma")
+        axes[idx, 6].imshow(detrended_crop_norm, cmap="terrain")
         for ax in axes[idx]:
             ax.axis("off")
         if idx == 0:
             for ax, t in zip(
                     axes[0],
-                    ["Ortho (Full)", "DTM (Full)", "Detrended (Full)", f"Ortho Zoom ({crop_size}px)",
+                    ["Ortho (Full)", "Mask (Full)", "DTM (Full)", "Detrended (Full)", f"Ortho Zoom ({crop_size}px)",
                      f"Masked Slope ({crop_size}px)", f"Masked Detrend ({crop_size}px)"],
             ):
                 ax.set_title(t)
