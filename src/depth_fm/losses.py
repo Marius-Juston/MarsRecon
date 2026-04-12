@@ -29,7 +29,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#FIXME this has gradient issues causing nans, fix
+
+# FIXME this has gradient issues causing nans, fix
 # class PhotoclinometricLoss(nn.Module):
 #     def __init__(self):
 #         super().__init__()

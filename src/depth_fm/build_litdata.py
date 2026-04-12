@@ -191,10 +191,9 @@ def build_litdata_for_split(config, split: str, cache_hash: str, workers: int = 
     npz_paths = []
 
     for i, sample in enumerate(tqdm(loader, total=num_samples, desc=f"Extract {split}")):
-
         # Ensure we have float32 tensors for the OLS math
-        image_fp32 = sample["image"].float()      # (3, H, W)
-        dtm_fp32 = sample["dtm"].float()          # (3, H, W)
+        image_fp32 = sample["image"].float()  # (3, H, W)
+        dtm_fp32 = sample["dtm"].float()  # (3, H, W)
         conf_fp32 = sample["confidence"].float()  # (1, H, W)
 
         # Recompute sun vectors using single-channel DTM and the image

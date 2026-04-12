@@ -242,6 +242,7 @@ def fill_invalid_nearest_neighbor(
 
     return torch.from_numpy(filled_np).to(device=device, dtype=dtype)
 
+
 def fill_invalid_smooth_diffusion(
         tensor: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -287,6 +288,7 @@ def fill_invalid_smooth_diffusion(
     if is_3d:
         return filled.squeeze(0)
     return filled
+
 
 def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.15) -> bool:
     """

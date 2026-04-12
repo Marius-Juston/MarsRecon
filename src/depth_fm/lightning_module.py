@@ -473,7 +473,7 @@ class DepthFMLightningModule(L.LightningModule):
                     sun_vector=sv,
                     intensity=int_val,
                     ambient=amb_val,
-                    lunar_lambert_weight=0.5, #FIXME actually train using correct metric
+                    lunar_lambert_weight=0.5,  # FIXME actually train using correct metric
                     title=f"Lambertian Render (step {step})",
                 )
                 self._log_figure("val/lambertian_render", fig, step)
@@ -768,7 +768,6 @@ class DepthFMLightningModule(L.LightningModule):
         tc = self.config.training
         trainable = [p for p in self.model.backbone.parameters() if p.requires_grad]
         losses = [p for p in self.loss_fn.parameters() if p.requires_grad]
-
 
         logger.info("Number of trainable parameters parameters %d, loss function %d", len(trainable), len(losses))
         trainable += losses
