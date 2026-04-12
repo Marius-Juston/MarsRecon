@@ -243,6 +243,49 @@ def fill_invalid_nearest_neighbor(
     return torch.from_numpy(filled_np).to(device=device, dtype=dtype)
 
 
+def erode_valid_mask(valid_mask: torch.Tensor, erode_radius: int = 1) -> torch.Tensor:
+    """
+    Erodes a binary mask by a specified radius to permanently delete noisy boundary pixels.
+    """
+    if erode_radius <= 0:
+        return valid_mask
+
+    # max_pool2d requires 4D shape: (Batch, Channel, Height, Width)
+    is_3d = valid_mask.ndim == 3
+    if is_3d:
+        valid_mask = valid_mask.unsqueeze(0)
+
+    kernel_size = 2 * erode_radius + 1
+
+    # -------------------------------------------------------------------------
+    # FIX: Explicitly pad the outside of the tensor with 1.0 (valid).
+    # This prevents the physical edges of the image from being treated as
+    # boundaries that need to be eroded.
+    # -------------------------------------------------------------------------
+    padded_mask = F.pad(
+        valid_mask,
+        pad=(erode_radius, erode_radius, erode_radius, erode_radius),
+        mode='constant',
+        value=1.0
+    )
+
+    # By negating the mask (-1.0 and 0.0), a max-pool acts as a min-filter.
+    eroded_mask = -F.max_pool2d(
+        -padded_mask,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=0  # Padding is now handled manually above
+    )
+
+    # Clean up any potential float precision drift
+    eroded_mask = (eroded_mask > 0.5).float()
+
+    if is_3d:
+        return eroded_mask.squeeze(0)
+
+    return eroded_mask
+
+
 def fill_invalid_smooth_diffusion(
         tensor: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -276,18 +319,7 @@ def fill_invalid_smooth_diffusion(
     # Shrink the valid mask to discard noisy boundary pixels.
     # We use negative max-pooling as a highly efficient way to do 2D erosion.
     # -------------------------------------------------------------------------
-    if erode_radius > 0:
-        kernel_size = 2 * erode_radius + 1
-        # If any 0 exists in the neighborhood, the whole neighborhood becomes 0
-        eroded_mask = -F.max_pool2d(
-            -valid_mask.to(dtype),
-            kernel_size=kernel_size,
-            stride=1,
-            padding=erode_radius
-        )
-        valid_bool = eroded_mask > 0.5
-    else:
-        valid_bool = valid_mask > 0.5
+    valid_bool = erode_valid_mask(valid_mask, erode_radius) > 0.5
 
     # 3. Calculate the global mean of the *clean* valid pixels ONLY
     valid_sum = (tensor * valid_bool.to(dtype)).sum(dim=[-2, -1], keepdim=True)
@@ -318,12 +350,10 @@ def fill_dtm_smart_diffusion(
         tensor: torch.Tensor,
         valid_mask: torch.Tensor,
         iterations: int = 64,
-        erode_pixels: int = 1,  # How many bad boundary pixels to permanently delete
-        blend_pixels: int = 3  # How many pixels INWARD to create the smooth slope transition
+        erode_radius: int = 2
 ) -> torch.Tensor:
     """
-    Fills voids strictly respecting valid data.
-    Maximum inward intrusion is strictly limited to (erode_pixels + blend_pixels).
+    Fills invalid regions using Laplacian diffusion (solving the heat equation).
     """
     is_3d = tensor.ndim == 3
     if is_3d:
@@ -334,76 +364,39 @@ def fill_dtm_smart_diffusion(
     device = tensor.device
     dtype = tensor.dtype
 
+    # 1. Sanitize the inputs
     tensor = torch.nan_to_num(tensor, nan=0.0)
 
-    # -------------------------------------------------------------------------
-    # 1. STRICT EROSION (Kill the hot pixels)
-    # -------------------------------------------------------------------------
-    if erode_pixels > 0:
-        kernel_size = 2 * erode_pixels + 1
-        eroded_mask = -F.max_pool2d(-valid_mask.to(dtype), kernel_size=kernel_size, stride=1, padding=erode_pixels)
-    else:
-        eroded_mask = valid_mask.to(dtype)
+    # 2. Mask Erosion (Using the corrected function)
+    valid_bool = erode_valid_mask(valid_mask, erode_radius) > 0.5
 
-    # -------------------------------------------------------------------------
-    # 2. STRICT SOFT MASK (The 4-pixel limit)
-    # -------------------------------------------------------------------------
-    soft_mask = eroded_mask.clone()
-    if blend_pixels > 0:
-        mask_blur_kernel = torch.ones((1, 1, 3, 3), device=device, dtype=dtype) / 9.0
-        soft_mask_expanded = soft_mask[:, :1, :, :]
+    # 3. Calculate the global mean
+    valid_sum = (tensor * valid_bool.to(dtype)).sum(dim=[-2, -1], keepdim=True)
+    valid_count = valid_bool.sum(dim=[-2, -1], keepdim=True).clamp(min=1.0)
+    global_mean = valid_sum / valid_count
 
-        # Create a gradient
-        for _ in range(blend_pixels):
-            soft_mask_expanded = F.conv2d(soft_mask_expanded, mask_blur_kernel, padding=1)
-        soft_mask = soft_mask_expanded.expand(-1, C, -1, -1)
+    # 4. Initialize working tensor
+    filled = torch.where(valid_bool, tensor, global_mean)
 
-        # CRITICAL FIX: Clamp the soft mask so it NEVER expands outward into the void.
-        # This ensures we don't accidentally multiply the void (which is 0.0)
-        # into the transition zone.
-        soft_mask = torch.min(soft_mask, eroded_mask)
-
-    # -------------------------------------------------------------------------
-    # 3. EDGE CLONING (Outward Flooding)
-    # Smear the exact edge pixels outward to initialize the void
-    # -------------------------------------------------------------------------
-    with torch.no_grad():
-        working_tensor = tensor * eroded_mask
-        working_mask = eroded_mask
-
-        # Use pooling to act as a smooth "nearest valid neighbor" outward clone
-        for k in [3, 7, 15, 31, 63]:
-            pad = k // 2
-            masked_t = working_tensor * working_mask
-            blurred_t = F.avg_pool2d(masked_t, kernel_size=k, stride=1, padding=pad)
-            blurred_m = F.avg_pool2d(working_mask, kernel_size=k, stride=1, padding=pad)
-
-            local_avg = blurred_t / (blurred_m + 1e-6)
-            working_tensor = torch.where(working_mask > 0.5, working_tensor, local_avg)
-            working_mask = F.max_pool2d(working_mask, kernel_size=3, stride=1, padding=1)
-
-        # Fallback for massively huge voids
-        valid_sum = (tensor * eroded_mask).sum(dim=[-2, -1], keepdim=True)
-        valid_count = eroded_mask.sum(dim=[-2, -1], keepdim=True).clamp(min=1.0)
-        global_mean = valid_sum / valid_count
-
-        filled = torch.where(working_mask > 0.5, working_tensor, global_mean)
-
-    # -------------------------------------------------------------------------
-    # 4. CONSTRAINED DIFFUSION
-    # -------------------------------------------------------------------------
+    # 5. Create averaging kernel
     kernel = torch.ones((C, 1, 3, 3), device=device, dtype=dtype) / 9.0
 
+    # 6. Laplacian Diffusion
     for _ in range(iterations):
-        blurred = F.conv2d(filled, kernel, padding=1, groups=C)
+        # -------------------------------------------------------------------------
+        # FIX: Pad the image using 'replicate' instead of F.conv2d's default zeros.
+        # This stops the physical outside edges of the image tensor from dragging
+        # the boundary values down to 0.0 during the blur phase.
+        # -------------------------------------------------------------------------
+        padded_filled = F.pad(filled, pad=(1, 1, 1, 1), mode='replicate')
+        blurred = F.conv2d(padded_filled, kernel, padding=0, groups=C)
 
-        # Because soft_mask is strictly clamped, this LERP only alters
-        # the inner pixels up to `blend_pixels` deep. The rest of the valid
-        # data is multiplied by 1.0 (untouched).
-        filled = tensor * soft_mask + blurred * (1.0 - soft_mask)
+        # Re-clamp safely eroded regions back to ground-truth
+        filled = torch.where(valid_bool, tensor, blurred)
 
     if is_3d:
         return filled.squeeze(0)
+
     return filled
 
 
@@ -929,6 +922,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
         ortho_valid = (image_resized != 0.0).any(dim=0, keepdim=True)
         elev_valid = torch.isfinite(dtm_resized) & (dtm_resized != 0.0)
         valid_mask_resized = (ortho_valid & elev_valid).float()
+
+        # 2. Apply the strict erosion to kill the noisy boundary pixels
+        # An erode_radius of 1 deletes a 1-pixel border. Increase to 2 or 3 if your artifacts are thick.
+        valid_mask_resized = erode_valid_mask(valid_mask_resized, erode_radius=1)
 
         # 4. Normalization
         dtm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
