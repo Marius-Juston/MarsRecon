@@ -38,6 +38,7 @@ depthfm = [
     "omegaconf>=2.3.0",
     "pandas>=3.0.1",
     "pillow>=12.1.1",
+    "pykrige>=1.7.3",
     "rasterio>=1.5.0",
     "safetensors>=0.7.0",
     "scikit-image>=0.26.0",

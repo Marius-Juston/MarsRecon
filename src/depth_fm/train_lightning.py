@@ -61,7 +61,7 @@ from tqdm import tqdm
 
 from depth_fm.depthfm_adapter import (
     DepthFMHiRISEAdapterCached,
-    estimate_sun_vector_ols, fill_dtm_smart_diffusion, )
+    estimate_sun_vector_ols, fill_voids_gmrf, )
 from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
 from depth_fm.visualization import (
     plot_convergence_curves,
@@ -219,8 +219,7 @@ def visualize_invalid_fill(dataloader, output_dir: Path, num_samples: int = 4, i
                 dtm_masked = dtm * mask
 
                 # 2. Apply smooth diffusion
-                img_filled = fill_dtm_smart_diffusion(img_masked, mask, iterations=iterations)
-                dtm_filled = fill_dtm_smart_diffusion(dtm_masked, mask, iterations=iterations)
+                img_filled, dtm_filled, mask = fill_voids_gmrf(img_masked, dtm_masked, mask)
 
                 # 3. Prepare for plotting (Denormalize [-1, 1] to [0, 1])
                 mask_np = mask[0, 0].cpu().numpy()
