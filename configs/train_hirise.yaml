@@ -10,7 +10,7 @@ model:
   gradient_checkpointing: true
 
   torch_compile: false
-  torch_compile_mode: "default"
+  torch_compile_mode: "max-autotune-no-cudagraphs"
   full_graph: true
   use_checkpoint: true
 
@@ -30,6 +30,7 @@ data:
     reuse_cache: true
     target: null
     bbox: [60, 0, 90, 30]
+#    bbox: [-120, -30, 150, 30]
 
   sampler:
     size: 0.018
@@ -111,6 +112,8 @@ training:
 
   # Test: use more Euler steps for best quality
   test_euler_steps: 16
+  # What metric to evaluate the system on in the end
+  test_choice: "photo"
 
   # Early stopping (null = disabled)
   early_stopping_patience: null
