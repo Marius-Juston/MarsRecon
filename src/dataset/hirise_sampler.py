@@ -425,6 +425,7 @@ class HiRISEGeoSampler(GeoSampler):
         self.generator = generator
 
         # ── Compute or load split assignments ──
+        self.cache_hash = ''
         self._assignments = self._get_split_assignments(dataset, reuse_cache)
 
         # Log split distribution
@@ -496,7 +497,7 @@ class HiRISEGeoSampler(GeoSampler):
 
         ortho_types = getattr(dataset, "ortho_types", None)
 
-        cache_hash = _split_cache_key(
+        self.cache_hash = _split_cache_key(
             dataset_root=ds_root,
             dataset_target=ds_target,
             dataset_bbox=ds_bbox,
@@ -514,7 +515,7 @@ class HiRISEGeoSampler(GeoSampler):
         )
 
         cache_dir = _split_cache_dir(ds_root)
-        cache_path = cache_dir / f"split_{cache_hash}.json"
+        cache_path = cache_dir / f"split_{self.cache_hash}.json"
 
         # Try cache
         if reuse_cache:

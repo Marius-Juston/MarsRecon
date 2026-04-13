@@ -57,6 +57,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
 
+from dataset.hirise_sampler import HiRISEGeoSampler
+from dataset.mars_hirise_base import MarsHiRISEBase
+
 logger = logging.getLogger(__name__)
 
 # Hardcoded fallback quantiles derived from dataset_stats/dtm/dataset_stats.json
@@ -963,8 +966,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
     def __init__(
             self,
-            base_dataset,
-            sampler,
+            base_dataset: MarsHiRISEBase,
+            sampler: HiRISEGeoSampler,
             resolution: int = 512,
             dtm_normalization: Literal["relative", "log", "linear"] = "relative",
             random_flip: bool = True,
@@ -1015,7 +1018,9 @@ class DepthFMHiRISEAdapterCached(Dataset):
             "resolution": self.resolution,
             "sampler_length": len(self._raw_indices),
             "split": getattr(self.sampler, "split", "unknown"),
-            "seed": getattr(self.sampler, "seed", 0)
+            "seed": getattr(self.sampler, "seed", 0),
+            "dataset_hash": str(self.base.spatial_index_cache),
+            "sampler_hash": str(self.sampler.cache_hash)
         }
         raw = json.dumps(key_parts, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
