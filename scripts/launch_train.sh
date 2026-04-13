@@ -60,6 +60,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
+export TORCHINDUCTOR_CACHE_DIR="${HOME}/.cache/torch_compile"
+mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
+
+# Enable both cache tiers
+export TORCHINDUCTOR_FX_GRAPH_CACHE=1
+export TORCHINDUCTOR_AUTOGRAD_CACHE=1
+
+# Triton cache alongside inductor cache
+export TRITON_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR}/triton"
+
 # 3. Execute Python using torchrun
 uv run torchrun \
     --standalone \
