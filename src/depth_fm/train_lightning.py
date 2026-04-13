@@ -62,7 +62,7 @@ from tqdm import tqdm
 from depth_fm.depthfm_adapter import (
     DepthFMHiRISEAdapterCached,
     estimate_sun_vector_ols, fill_voids_gmrf, )
-from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
+from depth_fm.lightning_module import DepthFMLightningModule, FasterEMAWeightAveraging
 from depth_fm.visualization import (
     plot_convergence_curves,
     plot_metric_distributions,
@@ -827,7 +827,9 @@ def run_single_training(
 
     if config.training.get("use_ema", True):
         logger.info("EMA is ENABLED.")
-        callbacks.append(EMACallback())
+        callbacks.append(FasterEMAWeightAveraging(
+            decay=config.training.get("ema_decay", False)
+        ))
     else:
         logger.info("EMA is DISABLED.")
 

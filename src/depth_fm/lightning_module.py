@@ -14,7 +14,7 @@ in visualization runs on all ranks (only rank 0 logs figures).
 
 from __future__ import annotations
 
-import gc
+import itertools
 import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +22,7 @@ from concurrent.futures import wait, FIRST_EXCEPTION
 from pathlib import Path
 from typing import Any
 
+import lightning
 import lightning as L
 import matplotlib as mpl
 import matplotlib.gridspec as gridspec
@@ -30,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
+from lightning.pytorch.callbacks import EMAWeightAveraging
 
 from depth_fm.losses import CombinedLoss
 from depth_fm.metrics import affine_align
@@ -97,11 +99,6 @@ class DepthFMLightningModule(L.LightningModule):
         # Flow matching config
         self.fm = config.training.flow_matching
 
-        # EMA
-        self._ema_decay = config.training.get("ema_decay", 0.9999)
-        self._ema_shadow: dict[str, torch.Tensor] = {}
-        self._ema_initialised = False
-
         # Metric aggregators (reset each epoch)
         self._val_aggregator = MetricsAggregator()
         self._test_aggregator = MetricsAggregator()
@@ -123,10 +120,22 @@ class DepthFMLightningModule(L.LightningModule):
         # matplotlib (Agg backend) + wandb.Image upload are CPU/IO-bound;
         # offloading them frees the GPU to resume training immediately.
 
-        self._vis_executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="vis"
-        )
-        self._vis_futures: list = []
+        self._vis_executor = None
+        self._vis_futures = []
+
+    @property
+    def vis_executor(self):
+        if self._vis_executor is None:
+            self._vis_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="vis"
+            )
+        return self._vis_executor
+
+    def _submit_vis_task(self, fn, *args, **kwargs):
+        self._vis_futures = [f for f in self._vis_futures if not f.done()]
+        future = self.vis_executor.submit(fn, *args, **kwargs)
+        future.add_done_callback(self._vis_future_callback)
+        self._vis_futures.append(future)
 
     def _trace(self, msg: str):
         """Helper to print explicit DDP synchronization trace logs."""
@@ -138,18 +147,6 @@ class DepthFMLightningModule(L.LightningModule):
     # ------------------------------------------------------------------
     # Async visualisation helpers
     # ------------------------------------------------------------------
-
-    def _submit_vis_task(self, fn, *args, **kwargs):
-        """Submit a visualisation task to the background thread pool.
-
-        Training resumes immediately while figures render on CPU threads.
-        """
-        # Prune completed futures to avoid unbounded list growth
-        self._vis_futures = [f for f in self._vis_futures if not f.done()]
-        future = self._vis_executor.submit(fn, *args, **kwargs)
-        # Log exceptions from the thread (otherwise they're silently lost)
-        future.add_done_callback(self._vis_future_callback)
-        self._vis_futures.append(future)
 
     @staticmethod
     def _vis_future_callback(future):
@@ -385,13 +382,6 @@ class DepthFMLightningModule(L.LightningModule):
         # Ensure all background vis tasks are done before saving,
         # so vector PDFs are on disk alongside the checkpoint.
         self._flush_vis_tasks(timeout=120.0)
-        checkpoint["ema_shadow"] = self._ema_shadow
-        checkpoint["ema_initialised"] = self._ema_initialised
-
-    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        loaded_shadow = checkpoint.get("ema_shadow", {})
-        self._ema_shadow = {k: v.to(self.device) for k, v in loaded_shadow.items()}
-        self._ema_initialised = checkpoint.get("ema_initialised", False)
 
     def on_validation_epoch_start(self) -> None:
         self._trace("Entered on_validation_epoch_start")
@@ -406,21 +396,24 @@ class DepthFMLightningModule(L.LightningModule):
         signal_boost = self.config.data.get("signal_boost", 1.0)
 
         z_img = self._encode(batch["image"])
-        z_depth = self._encode(batch["dtm"]) * signal_boost
 
         self._trace(f"validation_step batch {batch_idx}: starting _predict_depth (DDP collective)")
         z_pred = self._predict_depth(z_img, num_steps=self.config.get("test_euler_steps", 4))
         self._trace(f"validation_step batch {batch_idx}: finished _predict_depth")
 
         z_pred_unboosted = z_pred / signal_boost
-        z_depth_unboosted = z_depth / signal_boost
 
-        pred_pix = self._decode(z_pred_unboosted)[:, 0].float().cpu().numpy()
-        gt_decoded = self._decode(z_depth_unboosted)[:, 0].float().cpu().numpy()
-        gt_raw = batch["dtm"][:, 0].float().cpu().numpy()
+        pred_pix_t = self._decode(z_pred_unboosted)[:, 0].float()
+        gt_raw_t = batch["dtm"][:, 0].float()
 
-        vae_reconstruction_error = float(np.abs(gt_decoded - gt_raw).mean())
-        self.log("val/vae_reconstruction_error", vae_reconstruction_error, sync_dist=False)
+        gt_raw = gt_raw_t.cpu().numpy()
+        pred_pix = pred_pix_t.cpu().numpy()
+
+        # TODO not really necessary since we test that we have good VAE reconstruction error (0.001)
+        # z_depth_unboosted = z_depth / signal_boost
+        # gt_decoded_t = self._decode(z_depth_unboosted)[:, 0].float()
+        # vae_reconstruction_error = (gt_decoded_t - gt_raw_t).abs().mean().item()
+        # self.log("val/vae_reconstruction_error", vae_reconstruction_error, sync_dist=True)
 
         if "confidence" in batch:
             conf_mask = batch["confidence"][:, 0].float().cpu().numpy()
@@ -428,6 +421,7 @@ class DepthFMLightningModule(L.LightningModule):
             conf_mask = np.ones_like(gt_raw)
 
         with torch.no_grad():
+            z_depth = self._encode(batch["dtm"]) * signal_boost
             x_source = self._get_x_source(z_img)
             v_target = z_depth - x_source
             t = self._sample_timesteps(z_img.shape[0])
@@ -439,7 +433,7 @@ class DepthFMLightningModule(L.LightningModule):
             self._trace(f"validation_step batch {batch_idx}: finished model.predict_velocity")
 
             vel_loss = F.mse_loss(v_pred, v_target)
-        self.log("val/loss", vel_loss, prog_bar=True, sync_dist=False)
+        self.log("val/loss", vel_loss, prog_bar=True, sync_dist=True)
 
         # Per-sample metrics (including photo consistency when sun data available)
         for i in range(pred_pix.shape[0]):
@@ -904,7 +898,7 @@ class DepthFMLightningModule(L.LightningModule):
     def test_step(self, batch: dict, batch_idx: int) -> None:
         self._trace(f"Entered test_step for batch {batch_idx}")
         z_img = self._encode(batch["image"])
-        z_depth = self._encode(batch["dtm"])
+        # z_depth = self._encode(batch["dtm"])
 
         num_steps = self.config.training.get("test_euler_steps", 4)
 
@@ -912,9 +906,12 @@ class DepthFMLightningModule(L.LightningModule):
         z_pred = self._predict_depth(z_img, num_steps=num_steps)
         self._trace(f"test_step batch {batch_idx}: finished _predict_depth")
 
-        pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
-        gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
-        gt_raw = batch["dtm"][:, 0].float().cpu().numpy()
+        # gt_pix = self._decode(z_depth)[:, 0].float().cpu().numpy()
+        pred_pix_t  = self._decode(z_pred)[:, 0].float()
+        gt_raw_t  = batch["dtm"][:, 0].float().cpu().numpy()
+
+        pred_pix = pred_pix_t.cpu().numpy()
+        gt_raw = gt_raw_t.cpu().numpy()
 
         if "confidence" in batch:
             conf_mask = batch["confidence"][:, 0].float().cpu().numpy()
@@ -1123,11 +1120,11 @@ class DepthFMLightningModule(L.LightningModule):
         if self.global_step % self._grad_norm_log_interval != 0:
             return
         self._trace("Entered on_before_optimizer_step (grad norm logging)")
-        total_norm_sq = 0.0
-        for p in self.model.backbone.parameters():
-            if p.grad is not None:
-                total_norm_sq += p.grad.detach().float().norm().item() ** 2
-        self.log("train/grad_norm", total_norm_sq ** 0.5, prog_bar=False, rank_zero_only=True)
+
+        grads = [p.grad for p in self.parameters() if p.grad is not None]
+        total_norm = torch.nn.utils.get_total_norm(grads)
+
+        self.log("train/grad_norm", total_norm, prog_bar=False, rank_zero_only=True)
         self._trace("Exited on_before_optimizer_step")
 
     # ------------------------------------------------------------------
@@ -1179,59 +1176,20 @@ class DepthFMLightningModule(L.LightningModule):
             },
         }
 
-    # ------------------------------------------------------------------
-    # EMA (manual, called by callback)
-    # ------------------------------------------------------------------
 
-    def ema_update(self):
-        if not self._ema_initialised:
-            for n, p in self.model.backbone.named_parameters():
-                if p.requires_grad:
-                    self._ema_shadow[n] = p.data.clone()
-            self._ema_initialised = True
-            return
-
-        for n, p in self.model.backbone.named_parameters():
-            if p.requires_grad and n in self._ema_shadow:
-                if self._ema_shadow[n].device != p.device:
-                    self._ema_shadow[n] = self._ema_shadow[n].to(p.device)
-                self._ema_shadow[n].mul_(self._ema_decay).add_(
-                    p.data, alpha=1.0 - self._ema_decay
-                )
-
-    def load_ema_weights(self):
-        self._ema_backup = {}
-        for n, p in self.model.backbone.named_parameters():
-            if n in self._ema_shadow:
-                self._ema_backup[n] = p.data.clone()
-                p.data.copy_(self._ema_shadow[n])
-
-    def restore_training_weights(self):
-        for n, p in self.model.backbone.named_parameters():
-            if n in self._ema_backup:
-                p.data.copy_(self._ema_backup[n])
-        self._ema_backup = {}
-        gc.collect()
-
-
-class EMACallback(L.Callback):
-    """Update EMA weights after each training step; use EMA for val/test."""
-
-    def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
-        pl_module.ema_update()
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        if pl_module._ema_initialised:
-            pl_module.load_ema_weights()
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if pl_module._ema_initialised:
-            pl_module.restore_training_weights()
-
-    def on_test_epoch_start(self, trainer, pl_module):
-        if pl_module._ema_initialised:
-            pl_module.load_ema_weights()
-
-    def on_test_epoch_end(self, trainer, pl_module):
-        if pl_module._ema_initialised:
-            pl_module.restore_training_weights()
+class FasterEMAWeightAveraging(EMAWeightAveraging):
+    def _swap_models(self, pl_module: lightning.LightningModule) -> None:
+        assert self._average_model is not None
+        average_params = itertools.chain(
+            self._average_model.module.parameters(), self._average_model.module.buffers()
+        )
+        current_params = itertools.chain(pl_module.parameters(), pl_module.buffers())
+        for average_param, current_param in zip(average_params, current_params):
+            if average_param.device == current_param.device:
+                # Zero-copy pointer swap
+                average_param.data, current_param.data = current_param.data, average_param.data
+            else:
+                # Cross-device: fall back to copy-based swap
+                tmp = average_param.data.clone()
+                average_param.data.copy_(current_param.data)
+                current_param.data.copy_(tmp)
