@@ -19,6 +19,7 @@ import os
 import shutil
 from pathlib import Path
 
+
 # GDAL / threading optimizations for the extraction phase
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
 os.environ["VSI_CACHE"] = "TRUE"
@@ -183,7 +184,7 @@ def build_litdata_for_split(config, split: str, cache_hash: str, workers: int = 
         prefetch_factor=2 if workers > 0 else None,
         drop_last=False,
         persistent_workers=True if workers > 0 else False,
-        multiprocessing_context="fork" if workers > 0 else None,
+        multiprocessing_context="spawn" if workers > 0 else None,
         worker_init_fn=_configure_worker_logger if workers > 0 else None,
     )
 
