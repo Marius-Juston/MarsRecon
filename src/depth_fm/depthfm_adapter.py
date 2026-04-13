@@ -682,38 +682,68 @@ def fill_voids_gmrf(
     return filled_img_t, filled_dtm_t, eroded
 
 
-def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.15) -> bool:
+import torch
+
+
+def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
+                              kernel_size: int = 32) -> float:
     """
-    Detects artificial TIN (Triangular Irregular Network) interpolation in DTMs.
-    TINs have perfectly planar facets, meaning their second derivative (Laplacian) is exactly 0.
+    Scale-invariant TIN artifact detection using Localized Maximum Density.
+
+    Args:
+        elevation: (H, W) or (1, 1, H, W) tensor of elevation data.
+        valid_mask: Boolean tensor of same shape indicating valid pixels.
+        kernel_size: The fixed physical size of the sliding window (e.g., 32x32 pixels).
+                     This should be sized to match the minimum physical area a TIN
+                     artifact is expected to cover.
     """
-    # 1. Prevent NaN poisoning in the convolution
+    # 1. Format tensors
+    if elevation.dim() == 2:
+        elevation = elevation.view(1, 1, elevation.shape[0], elevation.shape[1])
+        valid_mask = valid_mask.view(1, 1, valid_mask.shape[0], valid_mask.shape[1])
+
     safe_elev = elevation.clone()
     safe_elev[~valid_mask] = 0.0
 
-    elev_4d = safe_elev.view(1, 1, safe_elev.shape[-2], safe_elev.shape[-1])
+    # 2. Compute Laplacian (2nd derivative)
+    laplacian_kernel = torch.tensor([[[[0.0, 1.0, 0.0],
+                                       [1.0, -4.0, 1.0],
+                                       [0.0, 1.0, 0.0]]]], device=elevation.device)
+    laplacian = F.conv2d(safe_elev, laplacian_kernel, padding=1)
 
-    # 3x3 Laplacian kernel
-    kernel = torch.tensor([[[[0.0, 1.0, 0.0],
-                             [1.0, -4.0, 1.0],
-                             [0.0, 1.0, 0.0]]]], device=elevation.device)
+    # 3. Erode valid mask to remove 0-padding corruption at boundaries
+    invalid_mask = (~valid_mask).float()
+    dilated_invalid = F.max_pool2d(invalid_mask, kernel_size=3, stride=1, padding=1)
+    eroded_valid = (dilated_invalid == 0.0).float()
 
-    # Calculate 2nd derivative
-    laplacian = torch.nn.functional.conv2d(elev_4d, kernel, padding=1)
+    # 4. Generate the Boolean Indicator Tensor I(x,y)
+    # True (1.0) if curvature is approx 0 AND the pixel is deeply valid
+    zero_curvature_mask = ((laplacian.abs() < 1e-2) * eroded_valid.bool()).float()
 
-    # 2. Extract only valid pixels
-    # Note: Boundary pixels where NaNs were zeroed will have massive Laplacian values.
-    # This is fine, as they will safely fail the < 1e-2 check and not inflate our TIN count.
-    valid_laplacian = laplacian.view(-1)[valid_mask.view(-1).bool()]
+    # 5. Localized Maximum Density (The Scale-Invariant Step)
+    # We use average pooling with stride=1 to slide the window across every pixel.
+    # We must separately pool the valid mask to normalize edges properly.
 
-    if len(valid_laplacian) == 0:
-        return True
+    local_planar_sum = F.avg_pool2d(zero_curvature_mask, kernel_size=kernel_size, stride=1)
+    local_valid_sum = F.avg_pool2d(eroded_valid, kernel_size=kernel_size, stride=1)
 
-    # 3. Evaluate curvature
-    # 1e-2 accounts for float32 stepping limits at high Martian altitudes (e.g. 20,000m)
-    zero_curvature_ratio = (valid_laplacian.abs() < 1e-2).float().mean().item()
+    # Avoid division by zero in areas with no valid data
+    safe_valid_sum = torch.clamp(local_valid_sum, min=1e-6)
 
-    return zero_curvature_ratio > threshold
+    # Calculate density: planar pixels / valid pixels in the local window
+    local_density = local_planar_sum / safe_valid_sum
+
+    # Ignore windows that don't have enough valid data to make a statistically sound judgment
+    # (e.g., require the window to be at least 50% valid data)
+    valid_window_mask = local_valid_sum >= 0.5
+
+    if not valid_window_mask.any():
+        return False
+
+    # The scale-invariant statistic S
+    max_local_density = local_density[valid_window_mask].max().item()
+
+    return max_local_density
 
 
 import torch
@@ -1043,14 +1073,15 @@ class DepthFMHiRISEAdapterCached(Dataset):
         # You can easily adjust these thresholds in the future without rebuilding the cache!
         clean_df = df[
             (df['is_valid_data'] == True) &
-            (df['valid_ratio'] >= 0.85) &
+            (df['valid_ratio'] >= 0.5) &
             (df['residual'] >= 0.1) &
-            (df['is_tin'] == False)
+            (df['is_tin'] >= 0.15)
             ]
 
         # Convert to a list of dicts for O(1) lookup during training
         self.clean_records = clean_df.to_dict('records')
-        logger.info(f"Manifest ready: Filtered {len(df)} total patches down to {len(self.clean_records)} clean pairs.")
+        logger.info(
+            f"Manifest ready: Filtered {len(df)} total patches down to {len(self.clean_records)} clean pairs. Saving manifest to {manifest_path}")
 
     def _build_manifest_parallel(self, save_path: Path) -> pd.DataFrame:
         """Uses a temporary PyTorch DataLoader to build the cache at maximum speed."""
@@ -1134,10 +1165,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             # -------------------------------------------------------------
             # 2. Heavy Math Operations
             # -------------------------------------------------------------
-            residual = compute_topographic_residual(dtm_resized, valid_mask_resized) if valid_ratio >= 0.85 else 0.0
+            residual = compute_topographic_residual(dtm_resized, valid_mask_resized)
 
             elev_valid_native = torch.isfinite(elevation) & (elevation != 0.0)
-            is_tin = is_tin_artifact(elevation, elev_valid_native, threshold=0.15) if valid_ratio >= 0.85 else True
+            is_tin = is_tin_artifact(elevation, elev_valid_native)
 
             # -------------------------------------------------------------
             # 3. Sun Vector Math (Fixed)
