@@ -231,7 +231,7 @@ class MarsDepthFMDataModule(L.LightningDataModule):
             num_workers=min(self.tc.num_workers, 4),
             pin_memory=self.tc.pin_memory,
             drop_last=True,
-            persistent_workers=False,  # must be False when recreating
+            persistent_workers=True,
         )
 
     def test_dataloader(self):
@@ -242,7 +242,7 @@ class MarsDepthFMDataModule(L.LightningDataModule):
             num_workers=min(self.tc.num_workers, 4),
             pin_memory=self.tc.pin_memory,
             drop_last=True,
-            persistent_workers=False,
+            persistent_workers=True,
         )
 
 
