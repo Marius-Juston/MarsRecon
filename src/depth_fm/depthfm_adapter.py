@@ -978,8 +978,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             manifest_workers: int = 16,  # Set this high to build the cache fast
             manifest_dir: str = ".cache/manifests",
             erode_radius: int = 2,
+            multiprocessing_context='fork'
     ):
         super().__init__()
+        self.multiprocessing_context = multiprocessing_context
         self.erode_radius = erode_radius
         self.base = base_dataset
         self.sampler = sampler
@@ -1070,7 +1072,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
             batch_size=1,  # Process one by one
             num_workers=self.manifest_workers,
             collate_fn=lambda x: x[0],  # Prevent PyTorch from batching dicts into tensors
-            shuffle=False
+            shuffle=False,
+            multiprocessing_context=self.multiprocessing_context
         )
 
         records = []
