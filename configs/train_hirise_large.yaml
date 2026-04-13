@@ -1,0 +1,134 @@
+# Mars DepthFM — Lightning Training with MarsHiRISEDTM
+# SD 2.1 + DepthFM checkpoint | 4x A6000 + 128 cores
+
+model:
+  backend: "sd21"
+  depthfm_checkpoint: "checkpoints/depthfm-v1.ckpt"
+  vae_id: "runwayml/stable-diffusion-v1-5"
+  use_lora: false
+  freeze_encoder: false
+  gradient_checkpointing: true
+
+  torch_compile: false
+  torch_compile_mode: "max-autotune-no-cudagraphs"
+  full_graph: true
+  use_checkpoint: true
+
+  model_type: "depthfm" # none for depthfm, modulated for other
+
+data:
+  source: "hirise"
+  parallel_load: false
+  use_wds: true
+
+  hirise:
+    root: "/scratch/mars_hirise_dtm"
+    include_ortho: true
+    ortho_type: "RED"
+    ortho_scale: null
+    download: false
+    reuse_cache: true
+    target: null
+#    bbox: [60, 0, 90, 30]
+    bbox: [-120, -30, 150, 30]
+
+  sampler:
+    size: 0.018
+    length: null   # patches per epoch (null = all available)
+
+  # Train/val/test split
+  split_fractions: [0.8, 0.1, 0.1]
+  split_method: "geographic"   # "geographic" or "random"
+  split_axis: "longitude"
+
+  # K-fold (set from CLI: --n_folds 5 --fold_idx 0)
+  n_folds: null
+  fold_idx: 0
+
+  # Pre-computed latents (null = encode on-the-fly)
+  latent_dir: null
+
+  resolution: 512
+  dtm_normalization: "relative"
+  stats_path: "dataset_stats/dtm/dataset_stats.json"
+  random_flip: true
+  brightness_jitter: 0.0
+
+  signal_boost: 1.0
+
+training:
+  enable: true
+
+  per_gpu_batch_size: 4
+  gradient_accumulation_steps: 4
+  num_gpus: 4
+  max_steps: 1000
+  show_train_vis: true
+
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 50
+
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+
+  random_jitter: false
+
+  flow_matching:
+    timestep_sampling: "logit_normal"
+    logit_normal_mean: 0.0
+    logit_normal_std: 1.0
+    noise_augmentation_alpha: 0.997
+    sigma_min: 1.0e-4
+
+  losses:
+    velocity_weight: 1.0
+    normals_weight: 1.0
+    normals_start_step: 0
+    grad_weight: 500.0         # multi-scale gradient loss (no extra install)
+    grad_start_step: 0
+    grad_scales: [1, 2, 4]
+    # Focal Frequency Loss (requires: pip install focal-frequency-loss)
+    freq_weight: 0.0
+    freq_start_step: 1000
+    freq_alpha: 1.0
+    photo_weight: 50.0
+    photo_start_step: 0
+
+    use_confidence_weighting: true
+
+  # Validation and checkpointing
+  val_every_steps: 1.0
+  save_every_steps: 5
+  log_every_steps: 10
+  num_val_samples: 8
+  flow_vis_every_steps: 1
+  train_vis_every_steps: 80
+
+  # Test: use more Euler steps for best quality
+  test_euler_steps: 16
+  # What metric to evaluate the system on in the end
+  test_choice: "photo"
+
+  # Early stopping (null = disabled)
+  early_stopping_patience: null
+
+  # Logging
+  logger: "wandb"
+  project_name: "mars-depthfm"
+  run_name: "sd21-hirise-v1"
+  output_dir: "outputs/mars_depthfm_hirise"
+  resume_from: null
+
+  use_ema: true
+  ema_decay: 0.99
+
+  # 128 cores / 4 GPUs = 32 workers per process
+  num_workers: 24
+  pin_memory: true
+  prefetch_factor: 4
