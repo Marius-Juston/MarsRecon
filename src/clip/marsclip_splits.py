@@ -174,6 +174,24 @@ def load_patch_split_manifest(path: pathlib.Path | str) -> pd.DataFrame:
     return manifest
 
 
+def align_manifest_to_patch_records(
+    manifest: pd.DataFrame,
+    patch_records: pd.DataFrame,
+) -> pd.DataFrame:
+    """Restrict a manifest to patch ids that exist in the current dataset."""
+    if "patch_id" not in manifest.columns:
+        raise ValueError("manifest must include a 'patch_id' column.")
+    if "patch_id" not in patch_records.columns:
+        raise ValueError("patch_records must include a 'patch_id' column.")
+
+    available_ids = set(patch_records["patch_id"].astype(str))
+    aligned = manifest.loc[manifest["patch_id"].astype(str).isin(available_ids)].copy()
+    aligned["patch_id"] = aligned["patch_id"].astype(str)
+    if "fold" in aligned.columns:
+        aligned["fold"] = aligned["fold"].astype("Int64")
+    return aligned.reset_index(drop=True)
+
+
 def save_split_summary(summary: dict[str, Any], path: pathlib.Path | str) -> pathlib.Path:
     """Persist split summary metadata as JSON."""
     out = pathlib.Path(path)

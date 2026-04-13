@@ -536,6 +536,7 @@ class MarsCLIPPatchDataset(Dataset):
         patch_records: pd.DataFrame | None = None,
         dataset_normalize: bool = False,
         dataset_normalization_path: pathlib.Path | str | None = None,
+        use_dominant_obs_only: bool = False,
         transforms: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         if geo_dataset is None:
@@ -590,6 +591,14 @@ class MarsCLIPPatchDataset(Dataset):
                 patch_records,
                 allowed_obs_ids=allowed_obs_ids,
             )
+        if max_patches is not None and max_patches < len(patch_records):
+            if generator is None:
+                patch_records = patch_records.iloc[:max_patches].copy()
+            else:
+                selected = torch.randperm(len(patch_records), generator=generator).tolist()[
+                    :max_patches
+                ]
+                patch_records = patch_records.iloc[selected].copy()
 
         if patch_records.empty:
             raise ValueError("Patch record table is empty.")
@@ -605,10 +614,58 @@ class MarsCLIPPatchDataset(Dataset):
         self.dataset_normalization_path = (
             str(dataset_normalization_path) if dataset_normalization_path is not None else None
         )
+        self.use_dominant_obs_only = bool(use_dominant_obs_only)
+        self._obs_index_by_id = None
+        if self.use_dominant_obs_only:
+            if not hasattr(self.geo_dataset, "index") or getattr(self.geo_dataset, "index") is None:
+                raise ValueError("geo_dataset must expose an index to use dominant_obs_only mode.")
+            obs_index = self.geo_dataset.index.copy()
+            if "obs_id" not in obs_index.columns:
+                raise ValueError("geo_dataset.index must include an 'obs_id' column.")
+            obs_index["obs_id"] = obs_index["obs_id"].astype(str)
+            self._obs_index_by_id = obs_index.set_index("obs_id", drop=False)
         self.transforms = transforms
 
     def __len__(self) -> int:
         return len(self.patch_records)
+
+    def _load_patch_sample(
+        self,
+        patch_row: pd.Series,
+        x_step: float,
+        y_step: float,
+    ) -> dict[str, Any]:
+        x_slice = slice(float(patch_row["x_start"]), float(patch_row["x_stop"]), x_step)
+        y_slice = slice(float(patch_row["y_start"]), float(patch_row["y_stop"]), y_step)
+        t_slice = slice(pd.Timestamp(patch_row["t_start"]), pd.Timestamp(patch_row["t_stop"]), 1)
+
+        if self.use_dominant_obs_only and self._obs_index_by_id is not None:
+            obs_id = str(patch_row["dominant_obs_id"])
+            obs_entry = self._obs_index_by_id.loc[obs_id]
+            cp = obs_entry["color_path"]
+            rp = obs_entry["red_path"]
+            tile = self.geo_dataset._load_tile(
+                color_path=pathlib.Path(cp) if isinstance(cp, str) else None,
+                red_path=pathlib.Path(rp) if isinstance(rp, str) else None,
+                x=x_slice,
+                y=y_slice,
+            )
+            if tile is not None:
+                image = tile
+                if self.geo_dataset.normalize and self.geo_dataset._normalizer is not None:
+                    nodata_mask = image == 0.0
+                    image = self.geo_dataset._normalizer(image)
+                    image[nodata_mask] = 0.0
+                return {
+                    "image": image,
+                    "bounds": self.geo_dataset._slice_to_tensor((x_slice, y_slice, t_slice)),
+                    "crs": self.geo_dataset.crs.to_wkt(),
+                    "loaded_from_dominant_obs_only": True,
+                }
+
+        sample = self.geo_dataset[(x_slice, y_slice, t_slice)]
+        sample["loaded_from_dominant_obs_only"] = False
+        return sample
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         patch_row = self.patch_records.iloc[index]
@@ -618,13 +675,7 @@ class MarsCLIPPatchDataset(Dataset):
         x_step = (float(patch_row["x_stop"]) - float(patch_row["x_start"])) / float(out_w)
         y_step = (float(patch_row["y_stop"]) - float(patch_row["y_start"])) / float(out_h)
 
-        sample = self.geo_dataset[
-            (
-                slice(float(patch_row["x_start"]), float(patch_row["x_stop"]), x_step),
-                slice(float(patch_row["y_start"]), float(patch_row["y_stop"]), y_step),
-                slice(pd.Timestamp(patch_row["t_start"]), pd.Timestamp(patch_row["t_stop"]), 1),
-            )
-        ]
+        sample = self._load_patch_sample(patch_row, x_step=x_step, y_step=y_step)
 
         image: torch.Tensor = sample["image"]
         valid_mask = (image > 1e-6).any(dim=0)
@@ -685,6 +736,9 @@ class MarsCLIPPatchDataset(Dataset):
                 "image_size": self.image_size,
                 "start_time": obs_row["start_time"],
                 "stop_time": obs_row["stop_time"],
+                "loaded_from_dominant_obs_only": bool(
+                    sample.get("loaded_from_dominant_obs_only", False)
+                ),
                 "has_rationale_expanded": bool(obs_row.get("has_rationale_expanded", False)),
                 "expansion_model": obs_row.get("expansion_model"),
                 "prompt_version": obs_row.get("prompt_version"),

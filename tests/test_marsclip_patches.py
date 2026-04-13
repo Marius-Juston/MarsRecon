@@ -232,6 +232,37 @@ class _FakeGeoDataset:
         }
 
 
+class _DominantObsGeoDataset(_FakeGeoDataset):
+    def __init__(self, image: torch.Tensor):
+        super().__init__(image)
+        self.normalize = False
+        self._normalizer = None
+        self.crs = types.SimpleNamespace(to_wkt=lambda: "mars")
+        self.index = pd.DataFrame(
+            [
+                {
+                    "obs_id": "obs_0",
+                    "color_path": "/tmp/fake_color.jp2",
+                    "red_path": None,
+                }
+            ]
+        )
+        self.load_tile_calls = 0
+        self.getitem_calls = 0
+
+    def _load_tile(self, color_path, red_path, x, y):
+        del color_path, red_path, x, y
+        self.load_tile_calls += 1
+        return self.image.clone()
+
+    def _slice_to_tensor(self, _):
+        return torch.tensor([-1.0, 0.0, 1.0, 2.0], dtype=torch.float32)
+
+    def __getitem__(self, _: object) -> dict[str, object]:
+        self.getitem_calls += 1
+        return super().__getitem__(_)
+
+
 def test_patch_dataset_returns_expected_keys_and_quality_flags():
     image = torch.zeros(3, 4, 4, dtype=torch.float32)
     image[1, :2, :2] = 0.4
@@ -951,6 +982,47 @@ def test_patch_dataset_raises_when_patch_records_empty():
             patch_records=pd.DataFrame(),  # empty
             image_size=4,
         )
+
+
+def test_patch_dataset_applies_max_patches_to_provided_patch_records():
+    image = torch.zeros(3, 4, 4, dtype=torch.float32)
+    fake = _FakeGeoDataset(image)
+    patch_records = pd.concat(
+        [
+            _minimal_patch_records("obs_0").assign(patch_id=f"patch_{idx:06d}")
+            for idx in range(4)
+        ],
+        ignore_index=True,
+    )
+
+    ds = MarsCLIPPatchDataset(
+        geo_dataset=fake,
+        observation_metadata=_minimal_obs_metadata("obs_0"),
+        patch_records=patch_records,
+        max_patches=2,
+        image_size=4,
+    )
+
+    assert len(ds) == 2
+    assert ds.patch_records["patch_id"].tolist() == ["patch_000000", "patch_000001"]
+
+
+def test_patch_dataset_can_load_from_dominant_observation_only():
+    image = torch.full((3, 4, 4), 0.3, dtype=torch.float32)
+    fake = _DominantObsGeoDataset(image)
+
+    ds = MarsCLIPPatchDataset(
+        geo_dataset=fake,
+        observation_metadata=_minimal_obs_metadata("obs_0"),
+        patch_records=_minimal_patch_records("obs_0"),
+        use_dominant_obs_only=True,
+        image_size=4,
+    )
+    sample = ds[0]
+
+    assert fake.load_tile_calls == 1
+    assert fake.getitem_calls == 0
+    assert bool(sample["metadata"]["loaded_from_dominant_obs_only"]) is True
 
 
 def test_patch_dataset_builds_patch_records_when_not_provided(mars_crs):

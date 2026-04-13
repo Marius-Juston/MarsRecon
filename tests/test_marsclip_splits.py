@@ -14,6 +14,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from clip.marsclip_splits import (
+    align_manifest_to_patch_records,
     build_patch_split_manifest,
     build_dataset_subsets,
     compute_split_counts,
@@ -120,6 +121,16 @@ def test_resolve_manifest_indices_raises_when_manifest_is_misaligned():
 
     with pytest.raises(ValueError, match="not present in current dataset"):
         resolve_manifest_indices(patch_records, manifest, role="train", mode="holdout")
+
+
+def test_align_manifest_to_patch_records_restricts_to_available_patch_ids():
+    patch_records = _patch_records(5)
+    manifest = build_patch_split_manifest(_patch_records(10), split_seed=0, num_folds=2)
+
+    aligned = align_manifest_to_patch_records(manifest, patch_records)
+
+    assert set(aligned["patch_id"]) == set(patch_records["patch_id"])
+    assert len(aligned) == 5
 
 
 # --- Additional tests for uncovered validation paths ---
