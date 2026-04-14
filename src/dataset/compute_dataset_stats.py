@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-PATCH_SIZE_DEG: float = 0.005  # ~0.005° ≈ 590 m at Mars equator
+PATCH_SIZE_DEG: float = 0.018  # ~0.005° ≈ 590 m at Mars equator
 CHANNELS: list[str] = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
 DTM_CHANNELS: list[str] = ["RED"]
 N_HIST_BINS: int = 1024
@@ -245,7 +245,7 @@ def _worker_fn(rank: int, args: dict) -> None:
         "persistent_workers": WORKERS_PER_GPU > 0,
     }
     if WORKERS_PER_GPU > 0:
-        loader_kwargs["prefetch_factor"] = 4
+        loader_kwargs["prefetch_factor"] = 64
 
     loader = DataLoader(dataset, sampler=subset_sampler, **loader_kwargs)
 
