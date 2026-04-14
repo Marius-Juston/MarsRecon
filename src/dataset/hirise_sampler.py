@@ -109,8 +109,8 @@ def _compute_split_assignments(
         # Random permutation
         order = rng.permutation(n_pairs)
 
-    n_test = max(1, int(round(n_pairs * test_fraction)))
-    n_val = max(1, int(round(n_pairs * val_fraction)))
+    n_test = max(0, int(round(n_pairs * test_fraction)))
+    n_val = max(0, int(round(n_pairs * val_fraction)))
     n_train = n_pairs - n_test - n_val
 
     if n_train < 1:
