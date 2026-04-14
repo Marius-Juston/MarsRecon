@@ -380,6 +380,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
         output_dir=output_dir,
         num_workers=min(workers, 32),
         chunk_bytes="256MB",
+        compression="zstd"
     )
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
