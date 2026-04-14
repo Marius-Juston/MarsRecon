@@ -938,15 +938,12 @@ def run_single_training(
 
     # Timestep ablation
     logger.info("Running timestep ablation...")
-    if config.training.get("use_ema", True):
-        module.load_ema_weights()
+
     timestep_results = module.run_timestep_ablation(
         loaders["test"],
         step_counts=[1, 2, 4, 8, 10, 20],
         max_batches=config.training.get("ablation_max_batches"),
     )
-    if config.training.get("use_ema", True):
-        module.restore_training_weights()
 
     if trainer.is_global_zero:
         with open(output_dir / "timestep_ablation.json", "w") as f:

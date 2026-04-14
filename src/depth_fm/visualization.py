@@ -486,7 +486,7 @@ def plot_patch_gallery(
             axes[i, 0].imshow(np.clip(img, 0, 1))
         else:
             axes[i, 0].imshow(img, cmap=CMAP_IMAGE)
-        axes[i, 0].set_ylabel(f"{tile_id}\nRMSE={rmse_val:.2f}m", fontsize=8, rotation=0,
+        axes[i, 0].set_ylabel(f"{tile_id}\nPhoto Consistency={rmse_val:.2f}m", fontsize=8, rotation=0,
                               labelpad=60, va="center")
 
         # Predicted
