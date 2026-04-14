@@ -998,6 +998,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             self.elev_scale,
         ) = _load_quantiles(stats_path)
 
+        # TODO instead of local patch ortho normalizer, it should be a per-strip normalization. Sadly infrastructure does not handle this well yet
         self.ortho_normalizer = LocalStripOrthoNormalizer(self.img_p02, self.img_p98)
         self.evel_normalizer = GlobalLogNormalizer(self.elev_scale)
 
