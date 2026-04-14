@@ -71,7 +71,7 @@ _DEFAULT_IMG_P98 = 0.24805250879347127  # average of left_red / right_red p98
 # Scale factor for relative-topography mode: 98th-percentile of patch-centred
 # elevation distribution (metres).  98 % of patches stay within [-1, 1] before
 # clamping while physical slope magnitudes remain consistent across the dataset.
-_DEFAULT_ELEV_SCALE = 11.520286464892173  # centered_p98[elevation] from Olympus stats
+_DEFAULT_ELEV_SCALE = 45.90752235993998  # centered_p98[elevation] from Olympus stats
 
 
 def _load_quantiles(

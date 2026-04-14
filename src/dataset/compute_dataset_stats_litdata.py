@@ -19,17 +19,19 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import os
 import pathlib
 import sys
 
 import numpy as np
 from litdata import StreamingDataset, StreamingDataLoader
+from matplotlib import pyplot as plt
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from dataset.compute_dataset_stats import _save_stats
 # Assuming this exists in your codebase for the hash key
 from depth_fm.build_litdata_raw import get_litdata_cache_key
 
@@ -315,6 +317,114 @@ def _calculate_percentile_from_hist(hist_counts, bin_edges, percentile: float) -
     return bin_edges[-1]
 
 
+def _save_stats(combined: dict, channels: list[str], output_dir: pathlib.Path, args: dict) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    C = len(channels)
+
+    count = combined["count"].tolist()
+    mean_vals = combined["mean"].tolist()
+    M2_vals = combined["M2"].tolist()
+    ch_min = combined["ch_min"].tolist()
+    ch_max = combined["ch_max"].tolist()
+    hist_counts = combined["hist"].tolist()
+    std_vals = [math.sqrt(M2_vals[c] / count[c]) if count[c] > 1 else 0.0 for c in range(C)]
+
+    c_count = combined["c_count"].tolist()
+    c_mean_vals = combined["c_mean"].tolist()
+    c_M2_vals = combined["c_M2"].tolist()
+    c_min_vals = combined["c_min"].tolist()
+    c_max_vals = combined["c_max"].tolist()
+    c_hist_counts = combined["c_hist"].tolist()
+    c_std_vals = [math.sqrt(c_M2_vals[c] / c_count[c]) if c_count[c] > 1 else 0.0 for c in range(C)]
+
+    bin_edges_all, c_bin_edges_all = [], []
+    p02_vals, p98_vals = [], []
+    c_p02_vals, c_p98_vals = [], []
+
+    for c, ch_name in enumerate(channels):
+        range_key = "dtm" if ch_name == "elevation" else "image"
+
+        min_x, max_x = HIST_RANGE[range_key]["min"], HIST_RANGE[range_key]["max"]
+        edges = np.linspace(min_x, max_x, N_HIST_BINS + 1).tolist()
+        bin_edges_all.append(edges)
+        p02_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.02))
+        p98_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.98))
+
+        c_min_x, c_max_x = CENTERED_HIST_RANGE[range_key]["min"], CENTERED_HIST_RANGE[range_key]["max"]
+        c_edges = np.linspace(c_min_x, c_max_x, N_HIST_BINS + 1).tolist()
+        c_bin_edges_all.append(c_edges)
+        c_p02_vals.append(_calculate_percentile_from_hist(c_hist_counts[c], c_edges, 0.02))
+        c_p98_vals.append(_calculate_percentile_from_hist(c_hist_counts[c], c_edges, 0.98))
+
+    stats = {
+        "channels": channels,
+        "n_valid_patches": combined["n_patches"],
+        "n_valid_pixels_per_channel": count,
+        "mean": mean_vals, "std": std_vals, "min": ch_min, "max": ch_max,
+        "p02": p02_vals, "p98": p98_vals,
+        "histogram_bin_edges": bin_edges_all,
+        "histogram_counts": hist_counts,
+        "centered_mean": c_mean_vals, "centered_std": c_std_vals,
+        "centered_min": c_min_vals, "centered_max": c_max_vals,
+        "centered_p02": c_p02_vals, "centered_p98": c_p98_vals,
+        "centered_histogram_bin_edges": c_bin_edges_all,
+        "centered_histogram_counts": c_hist_counts,
+    }
+
+    with open(output_dir / "dataset_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+    # Plot both sets of histograms
+    for is_centered in [False, True]:
+        prefix = "centered_" if is_centered else ""
+
+        for c, ch_name in enumerate(channels):
+            edges = c_bin_edges_all[c] if is_centered else bin_edges_all[c]
+            counts = c_hist_counts[c] if is_centered else hist_counts[c]
+            mean_v = c_mean_vals[c] if is_centered else mean_vals[c]
+            std_v = c_std_vals[c] if is_centered else std_vals[c]
+            p02 = c_p02_vals[c] if is_centered else p02_vals[c]
+            p98 = c_p98_vals[c] if is_centered else p98_vals[c]
+
+            bin_centers = [(edges[i] + edges[i + 1]) / 2.0 for i in range(N_HIST_BINS)]
+            bar_width = (edges[-1] - edges[0]) / N_HIST_BINS
+
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(
+                bin_centers, counts, width=bar_width,
+                align="center", color="steelblue", edgecolor="none",
+            )
+            ax.set_xscale("symlog")
+
+            ax.axvline(p02, color='red', linestyle='--', linewidth=1, label='2% / 98%')
+            ax.axvline(p98, color='red', linestyle='--', linewidth=1)
+
+            x_label = "Elevation (m)" if ch_name == "elevation" else "Calibrated I/F value"
+            if is_centered:
+                x_label += " (Centered)"
+
+            ax.set_xlabel(x_label)
+            ax.set_ylabel("Pixel count")
+            title_prefix = f"[Centered] " if is_centered else ""
+            ax.set_title(f"{title_prefix}{ch_name}  |  mean={mean_v:.4f}  std={std_v:.4f}")
+            ax.set_xlim(edges[0], edges[-1])
+
+            safe_name = ch_name.replace(" ", "_").replace("/", "-")
+            png_path = output_dir / f"{prefix}histogram_{safe_name}.png"
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
+
+            png_path = output_dir / f"{prefix}histogram_{safe_name}.pdf"
+            logger.info("Saving histogram to %s", png_path)
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
+
+    print("\nNormalization parameters for MAE:")
+    for c, ch_name in enumerate(channels):
+        print(f"  {ch_name}: raw_std={std_vals[c]:.6f}, centered_std={c_std_vals[c]:.6f}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -365,7 +475,7 @@ def main(argv=None) -> None:
         partials.append(np.load(path, allow_pickle=True).item())
 
     combined = _combine_welford(partials)
-    _save_stats(combined, stats_channels, config.data.sampler.size, output_dir, vars(args))
+    _save_stats(combined, stats_channels, output_dir, vars(args))
 
     # Cleanup temp files
     # for p in split_paths:
