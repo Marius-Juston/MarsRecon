@@ -240,19 +240,8 @@ def _repack_npz(npz_path: str) -> dict:
     Top-level function with no closures — trivially picklable.
     """
     import numpy as np
-    data = np.load(npz_path)
-    return {
-        "image": data["image"],  # float16 (3, H, W)
-        "dtm": data["dtm"],  # float16 (3, H, W)
-        "confidence": data["confidence"],  # float16 (1, H, W)
-        "sun_vector": data["sun_vector"],  # float32 (3,)
-        "intensity": data["intensity"],  # float32 scalar
-        "ambient": data["ambient"],  # float32 scalar
-        "original_dtm": data["original_dtm"],
-        "trend_params": data["trend_params"],
-        "original_image": data["original_image"],
-        "strip_id": data["dtm_product_id"]
-    }
+    data = np.load(npz_path, allow_pickle=True)
+    return dict(data)
 
 
 def build_litdata_for_split(
@@ -406,7 +395,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
                 original_dtm=sample["original_dtm"].numpy().astype(np.float16),
                 trend_params=sample["trend_params"].numpy().astype(np.float16),
                 original_image=sample["original_image"].numpy().astype(np.float16),
-                strip_id=sample["dtm_product_id"].numpy(),
+                meta=sample["meta"],
                 dtm=sample["dtm"].numpy().astype(np.float16),
                 confidence=sample["confidence"].numpy().astype(np.float16),
                 sun_vector=sun_vec.numpy(),

@@ -58,7 +58,8 @@ from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
 
 from dataset.hirise_sampler import HiRISEGeoSampler
-from dataset.mars_hirise_base import MarsHiRISEBase
+from dataset.mars_hirise_dtm import MarsHiRISEDTM
+from depth_fm.scalers import StripOrthoNormalizer, GlobalLogNormalizer, TrainingNormResult
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,8 @@ logger = logging.getLogger(__name__)
 # (Olympus Mons region, 52 k patches)
 _DEFAULT_ELEV_P02 = -4396.5664071121255
 _DEFAULT_ELEV_P98 = 20757.65899590482
-_DEFAULT_IMG_P02 = 0.049661101862306406  # average of left_red / right_red p02
-_DEFAULT_IMG_P98 = 0.24805250879347127  # average of left_red / right_red p98
+_DEFAULT_IMG_P02 = 0.06526107076433259  # average of left_red / right_red p02
+_DEFAULT_IMG_P98 = 0.1828855234319496  # average of left_red / right_red p98
 # Scale factor for relative-topography mode: 98th-percentile of patch-centred
 # elevation distribution (metres).  98 % of patches stay within [-1, 1] before
 # clamping while physical slope magnitudes remain consistent across the dataset.
@@ -686,7 +687,7 @@ import torch
 
 
 def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
-                              kernel_size: int = 32) -> float:
+                    kernel_size: int = 32) -> float:
     """
     Scale-invariant TIN artifact detection using Localized Maximum Density.
 
@@ -904,8 +905,10 @@ def _normalize_ortho(
     # Instead of using self.img_p02 and self.img_p98 from the global JSON
     valid_pixels = ortho[ortho > 0.0]  # Ignore pure black nodata
     if len(valid_pixels) > 0:
-        local_p02 = torch.quantile(valid_pixels, 0.02)
-        local_p98 = torch.quantile(valid_pixels, 0.98)
+        # local_p02 = torch.quantile(valid_pixels, 0.02)
+        # local_p98 = torch.quantile(valid_pixels, 0.98)
+        local_p02 = p02
+        local_p98 = p98
 
         # Avoid divide-by-zero if the patch is perfectly uniform
         if local_p98 > local_p02:
@@ -996,7 +999,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
     def __init__(
             self,
-            base_dataset: MarsHiRISEBase,
+            base_dataset: MarsHiRISEDTM,
             sampler: HiRISEGeoSampler,
             resolution: int = 512,
             dtm_normalization: Literal["relative", "log", "linear"] = "relative",
@@ -1032,6 +1035,9 @@ class DepthFMHiRISEAdapterCached(Dataset):
             self.img_p02, self.img_p98,
             self.elev_scale,
         ) = _load_quantiles(stats_path)
+
+        self.ortho_normalizer = StripOrthoNormalizer(self.img_p02, self.img_p98)
+        self.evel_normalizer = GlobalLogNormalizer(self.elev_scale)
 
         # Pre-materialise sampler indices
         self._raw_indices = list(sampler)
@@ -1176,10 +1182,11 @@ class DepthFMHiRISEAdapterCached(Dataset):
             # We MUST normalize the data before computing the OLS sun vector because
             # the loss function renders shadows in the [-1, 1] normalized latent space.
             # Physical metadata is incompatible because local scaling distorts Z geometry.
-            dtm_norm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
-            image_norm = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
+            dtm_norm: TrainingNormResult = self.evel_normalizer.normalize_for_training(dtm_resized, valid_mask_resized)
+            image_norm = self.ortho_normalizer.normalize(image_resized)
 
-            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_norm, image_norm, valid_mask_resized)
+            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_norm.normed_residual, image_norm,
+                                                                  valid_mask_resized)
 
             sun_x = sun_vec[0].item()
             sun_y = sun_vec[1].item()
@@ -1210,7 +1217,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             return len(self.clean_records)
         return len(self._raw_indices)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | float]:
         """Lightning fast __getitem__. No retries, no heavy math."""
         if not self.use_manifest:
             raise NotImplementedError(
@@ -1244,8 +1251,9 @@ class DepthFMHiRISEAdapterCached(Dataset):
         valid_mask_resized = (ortho_valid & elev_valid).float()
 
         # 4. Normalization
-        dtm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
-        image = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
+        dtm_res: TrainingNormResult = self.evel_normalizer.normalize_for_training(dtm_resized, valid_mask_resized)
+        dtm = dtm_res.normed_residual
+        image = self.ortho_normalizer.normalize(image_resized)
 
         # --- PRE-VAE NEAREST NEIGHBOR FILL ---
         # Fills regions outside the valid mask so the VAE doesn't encode sharp black boundaries
@@ -1293,11 +1301,22 @@ class DepthFMHiRISEAdapterCached(Dataset):
             intensity *= factor
             ambient *= factor
 
-        return {
+        res = {
             "image": image,
             "dtm": dtm,
             "confidence": valid_mask_resized,
             "sun_vector": sun_vector,
             "intensity": intensity,
-            "ambient": ambient
+            "ambient": ambient,
+            "original_dtm": dtm_resized,
+            "original_image": image_resized,
+            "trend_params": dtm_res.trend_params,
+            "residual_scale": dtm_res.residual_scale,
+            "raw_residual_p98": dtm_res.raw_residual_p98,
+            "key": key,
         }
+
+        if 'meta' in sample:
+            res['meta'] = sample['meta']
+
+        return res
