@@ -350,9 +350,9 @@ def visualize_loss_physics(
                 render_disp = np.clip(render[0, 0].cpu().numpy(), 0.0, 1.0)
                 render_disp_gt = np.clip(render_gt[0, 0].cpu().numpy(), 0.0, 1.0)
 
-                for arr in (img_disp, dtm_disp, render_disp, render_disp_gt):
-                    arr[~mask_np] = np.nan
-                normals_disp[~mask_np] = np.nan
+                # for arr in (img_disp, dtm_disp, render_disp, render_disp_gt):
+                #     arr[~mask_np] = np.nan
+                # normals_disp[~mask_np] = np.nan
 
                 # --- 4. PLOTTING ---
                 axes[count, 0].imshow(img_disp, cmap="gray", vmin=0, vmax=1)
@@ -507,15 +507,15 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
             normed = np.clip((detrended - dp2) / (dp98 - dp2), 0.0, 1.0) if dp98 > dp2 else np.zeros_like(detrended)
         else:
             normed = np.zeros_like(z_data)
-        normed[~mask] = np.nan
+        # normed[~mask] = np.nan
         return normed
 
     for idx in tqdm(range(num_samples), desc="Generating thumbnails"):
         img_np = np.clip((np.transpose(images[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
         dtm_np = np.clip((np.transpose(dtms[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
         mask_np = masks[idx][0].astype(bool)
-        img_np[~mask_np] = np.nan
-        dtm_np[~mask_np] = np.nan
+        # img_np[~mask_np] = np.nan
+        # dtm_np[~mask_np] = np.nan
 
         dtm_full_1ch = dtm_np[..., 0]
         detrended_full_norm = detrend_and_stretch(dtm_full_1ch, mask_np)
@@ -536,7 +536,7 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
             slope_norm = np.clip((slope_mag - p2) / (p98 - p2), 0.0, 1.0) if p98 > p2 else np.zeros_like(slope_mag)
         else:
             slope_norm = np.zeros_like(slope_mag)
-        slope_norm[~mask_crop] = np.nan
+        # slope_norm[~mask_crop] = np.nan
         detrended_crop_norm = detrend_and_stretch(dtm_crop, mask_crop)
 
         axes[idx, 0].imshow(img_np)
