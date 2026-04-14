@@ -395,7 +395,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
                 original_dtm=sample["original_dtm"].numpy().astype(np.float16),
                 trend_params=sample["trend_params"].numpy().astype(np.float16),
                 original_image=sample["original_image"].numpy().astype(np.float16),
-                meta=sample["meta"],
+                # meta=sample["meta"],
                 dtm=sample["dtm"].numpy().astype(np.float16),
                 confidence=sample["confidence"].numpy().astype(np.float16),
                 sun_vector=sun_vec.numpy(),
