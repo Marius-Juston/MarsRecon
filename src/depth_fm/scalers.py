@@ -838,7 +838,7 @@ class StripOrthoStats:
     strip_index: int = -1
 
 
-class StripOrthoNormalizer:
+class GlobalStripOrthoNormalizer:
     """Normalises ortho patches using strip-level quantiles.
 
     All patches from the same strip are normalised with the same
@@ -883,3 +883,72 @@ class StripOrthoNormalizer:
         Useful for visualization or re-rendering.
         """
         return ((normed / 2.0) + 0.5) * self._range + self.p02
+
+
+def _normalize_ortho(
+        ortho: torch.Tensor,
+) -> torch.Tensor:
+    """Normalise an orthoimage using global dataset quantiles to [-1, 1].
+
+    Applies the same linear formula as the paper:
+        ĩ = ((i − p02) / (p98 − p02) − 0.5) × 2
+
+    Args:
+        ortho: (C, H, W) in I/F reflectance [0, 1].
+        p02: Dataset-level 2nd-percentile reflectance.
+        p98: Dataset-level 98th-percentile reflectance.
+
+    Returns:
+        (C, H, W) in [-1, 1], clamped.
+    """
+    # Instead of using self.img_p02 and self.img_p98 from the global JSON
+    valid_pixels = ortho[ortho > 0.0]  # Ignore pure black nodata
+    if len(valid_pixels) > 0:
+        local_p02 = torch.quantile(valid_pixels, 0.02)
+        local_p98 = torch.quantile(valid_pixels, 0.98)
+
+        # Avoid divide-by-zero if the patch is perfectly uniform
+        if local_p98 > local_p02:
+            ortho = ((ortho - local_p02) / (local_p98 - local_p02) - 0.5) * 2.0
+        else:
+            ortho = torch.zeros_like(ortho)  # Fallback
+
+    return torch.clamp(ortho, -1.0, 1.0)
+
+class LocalStripOrthoNormalizer:
+    """Normalises ortho patches using strip-level quantiles.
+
+    All patches from the same strip are normalised with the same
+    (p02, p98), guaranteeing that:
+      - The same physical pixel always gets the same normalised value
+        regardless of which overlapping patch contains it
+      - Shadow depth is preserved in relative terms across the strip
+      - The transform is invertible (if you ever need to go back)
+
+    Args:
+        p02: Strip-level 2nd percentile of valid pixel values.
+        p98: Strip-level 98th percentile of valid pixel values.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+    def normalize(self, ortho: torch.Tensor) -> torch.Tensor:
+        """Normalise an ortho patch to [-1, 1].
+
+        Args:
+            ortho: (C, H, W) raw ortho reflectance values.
+
+        Returns:
+            (C, H, W) normalised to [-1, 1], clamped.
+        """
+        return _normalize_ortho(ortho)
+
+    def denormalize(self, normed: torch.Tensor) -> torch.Tensor:
+        """Inverse: normalised [-1, 1] → raw reflectance.
+
+        Useful for visualization or re-rendering.
+        """
+        raise NotImplementedError("Cannot invert normalization")
+

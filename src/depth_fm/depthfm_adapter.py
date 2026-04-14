@@ -59,7 +59,8 @@ from tqdm import tqdm  # Highly recommended to see progress during the one-time 
 
 from dataset.hirise_sampler import HiRISEGeoSampler
 from dataset.mars_hirise_dtm import MarsHiRISEDTM
-from depth_fm.scalers import StripOrthoNormalizer, GlobalLogNormalizer, TrainingNormResult
+from depth_fm.scalers import GlobalLogNormalizer, TrainingNormResult, \
+    LocalStripOrthoNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -880,45 +881,6 @@ def _normalize_dtm_relative(
     return normed
 
 
-def _normalize_ortho(
-        ortho: torch.Tensor,
-        p02: float,
-        p98: float,
-) -> torch.Tensor:
-    """Normalise an orthoimage using global dataset quantiles to [-1, 1].
-
-    Applies the same linear formula as the paper:
-        ĩ = ((i − p02) / (p98 − p02) − 0.5) × 2
-
-    Args:
-        ortho: (C, H, W) in I/F reflectance [0, 1].
-        p02: Dataset-level 2nd-percentile reflectance.
-        p98: Dataset-level 98th-percentile reflectance.
-
-    Returns:
-        (C, H, W) in [-1, 1], clamped.
-    """
-    # range_ = p98 - p02
-    # normed = ((ortho - p02) / range_ - 0.5) * 2.0
-    # return torch.clamp(normed, -1.0, 1.0)
-
-    # Instead of using self.img_p02 and self.img_p98 from the global JSON
-    valid_pixels = ortho[ortho > 0.0]  # Ignore pure black nodata
-    if len(valid_pixels) > 0:
-        # local_p02 = torch.quantile(valid_pixels, 0.02)
-        # local_p98 = torch.quantile(valid_pixels, 0.98)
-        local_p02 = p02
-        local_p98 = p98
-
-        # Avoid divide-by-zero if the patch is perfectly uniform
-        if local_p98 > local_p02:
-            ortho = ((ortho - local_p02) / (local_p98 - local_p02) - 0.5) * 2.0
-        else:
-            ortho = torch.zeros_like(ortho)  # Fallback
-
-    return torch.clamp(ortho, -1.0, 1.0)
-
-
 def _to_3ch(tensor: torch.Tensor) -> torch.Tensor:
     """Replicate a (1, H, W) tensor to (3, H, W) for VAE compatibility."""
     if tensor.shape[0] == 1:
@@ -1036,7 +998,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             self.elev_scale,
         ) = _load_quantiles(stats_path)
 
-        self.ortho_normalizer = StripOrthoNormalizer(self.img_p02, self.img_p98)
+        self.ortho_normalizer = LocalStripOrthoNormalizer(self.img_p02, self.img_p98)
         self.evel_normalizer = GlobalLogNormalizer(self.elev_scale)
 
         # Pre-materialise sampler indices
