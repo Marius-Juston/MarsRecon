@@ -32,6 +32,8 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
+from matplotlib.figure import Figure
+
 from depth_fm.litdata_datamodule import _build_litdata_loaders
 
 # ---------------------------------------------------------------------------
@@ -44,9 +46,6 @@ os.environ["GDAL_CACHEMAX"] = "10%"
 os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
 
 import lightning as L
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
 import torch.fft
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import (
@@ -70,6 +69,11 @@ from depth_fm.visualization import (
     set_neurips_style,
 )
 
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import seaborn as sns
+
 logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision("high")
@@ -87,10 +91,87 @@ _NUM_GPUS_DEFAULT = torch.cuda.device_count() if torch.cuda.is_available() else 
 _WORKERS_PER_GPU = min(24, max(4, (_TOTAL_CORES - 16) // max(_NUM_GPUS_DEFAULT, 1)))
 _VAL_WORKERS = min(4, _WORKERS_PER_GPU)
 
+DPI = 300
+
 
 # ---------------------------------------------------------------------------
 # Visualization helpers (unchanged from original)
 # ---------------------------------------------------------------------------
+
+def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"), **kwargs):
+    for f in formats:
+        new_path = path.with_suffix(f)
+        fig.savefig(new_path, **kwargs)
+
+
+@torch.no_grad()
+def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int = 50):
+    """
+    Visualizes solar physics and saves individual plots for publication.
+    """
+    logger.info("Generating and saving individual solar distribution plots...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    set_neurips_style()
+
+    sun_vecs, intensities, ambients = [], [], []
+
+    for i, batch in enumerate(dataloader):
+        if i >= num_batches: break
+        sun_vecs.append(batch["sun_vector"].cpu().numpy())
+        intensities.append(batch["intensity"].cpu().numpy())
+        ambients.append(batch["ambient"].cpu().numpy())
+
+    sv = np.concatenate(sun_vecs, axis=0)
+    it = np.concatenate(intensities, axis=0).flatten()
+    am = np.concatenate(ambients, axis=0).flatten()
+
+    # CRITICAL: Fix for the RuntimeWarning (Negative sizes)
+    # We clip ambient at a tiny positive value so the sqrt doesn't fail
+    viz_ambient_sizes = np.clip(am, 1e-6, None) * 500
+
+    azimuth = np.arctan2(sv[:, 1], sv[:, 0])
+    elevation = np.degrees(np.arcsin(sv[:, 2]))
+
+    # --- 1. Standalone 3D Solar Compass ---
+    fig_3d = plt.figure(figsize=(8, 8))
+    ax1 = fig_3d.add_subplot(111, projection='3d')
+    # Wireframe hemisphere
+    u, v = np.mgrid[0:2 * np.pi:30j, 0:np.pi / 2:15j]
+    ax1.plot_wireframe(np.cos(u) * np.sin(v), np.sin(u) * np.sin(v), np.cos(v),
+                       color='gray', alpha=0.1, linewidth=0.5)
+
+    p3d = ax1.scatter(sv[:, 0], sv[:, 1], sv[:, 2],
+                      c=it, cmap='plasma', s=viz_ambient_sizes,
+                      alpha=0.8, edgecolors='w', linewidth=0.2)
+    ax1.set_title("3D Solar Vector Compass")
+    fig_3d.colorbar(p3d, ax=ax1, shrink=0.6, label='Intensity')
+    save_fig(fig_3d, output_dir / "solar_compass_3d.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig_3d)
+
+    # --- 2. Standalone Polar Sky-Map ---
+    fig_polar = plt.figure(figsize=(8, 8))
+    ax2 = fig_polar.add_subplot(111, projection='polar')
+    ax2.set_theta_zero_location("N")
+    ax2.set_theta_direction(-1)
+    sc2 = ax2.scatter(azimuth, elevation, c=it, cmap='plasma', alpha=0.7)
+    ax2.set_ylim(0, 90)
+    ax2.set_title("Solar Sky-Map (Azimuth vs Elevation)")
+    save_fig(fig_polar, output_dir / "solar_sky_map_polar.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig_polar)
+
+    # --- 3. Standalone Illumination Coupling ---
+    fig_corr = plt.figure(figsize=(8, 8))
+    ax3 = fig_corr.add_subplot(111)
+
+    sns.regplot(x=it, y=am, ax=ax3, scatter_kws={'alpha': 0.4, 's': 20}, line_kws={'color': 'red'})
+    ax3.set_title("Illumination Coupling (Intensity vs Ambient)")
+    ax3.set_xlabel("Solar Intensity")
+    ax3.set_ylabel("Ambient (Sky) Light")
+    save_fig(fig_corr, output_dir / "solar_coupling_regression.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig_corr)
+
+    logger.info(f"Individual solar figures saved to {output_dir}")
+
 
 @torch.no_grad()
 def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 1000):
@@ -197,7 +278,7 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 10
                             va='center', ha='right', color='red' if count < half else 'green')
 
     save_path = output_dir / "seam_artifact_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     plt.close(fig)
     logger.info(f"Seam artifact visualization saved to: {save_path}")
 
@@ -330,7 +411,7 @@ def visualize_tin_artifacts(dataloader, output_dir: Path, num_samples: int = 8, 
                             va='center', ha='right', color='red' if count < half else 'green')
 
     save_path = output_dir / "tin_artifact_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     plt.close(fig)
     logger.info(f"TIN artifact visualization saved to: {save_path}")
 
@@ -420,7 +501,7 @@ def visualize_loss_components(dataloader, output_dir, num_samples=4):
                 pbar.update()
 
     save_path = output_dir / "loss_components_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     plt.close(fig)
     logger.info(f"Loss components visualization saved to: {save_path}")
 
@@ -497,7 +578,7 @@ def visualize_invalid_fill(dataloader, output_dir: Path, num_samples: int = 4, i
                 pbar.update()
 
     save_path = output_dir / "smooth_fill_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     plt.close(fig)
     logger.info(f"Smooth filling visualization saved to: {save_path}")
 
@@ -621,7 +702,7 @@ def visualize_loss_physics(
                 pbar.update()
 
     save_path = output_dir / "loss_physics_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     plt.close(fig)
     logger.info(f"Loss physics visualization saved to: {save_path}")
 
@@ -799,7 +880,7 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
                 ax.set_title(t)
 
     save_path = output_dir / "dataset_thumbnails_detailed.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, transparent=False, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, transparent=False, facecolor="white")
     plt.close(fig)
     logger.info(f"Detailed thumbnails successfully saved to: {save_path}")
 
@@ -1375,7 +1456,7 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
     ax.set_xlabel("RMSE (m)")
     ax.set_ylabel("Count")
     ax.set_title("Test RMSE distribution with worst patches")
-    fig.savefig(fig_dir / "rmse_distribution.pdf", bbox_inches="tight")
+    save_fig(fig, fig_dir / "rmse_distribution.pdf", bbox_inches="tight")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -1385,7 +1466,7 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
         ax.set_ylabel("Elevation RMSE (m)")
         ax.set_title("Error vs terrain complexity")
         fig.colorbar(ax.collections[0], label="Normal error (°)")
-        fig.savefig(fig_dir / "error_vs_complexity.pdf", bbox_inches="tight")
+        save_fig(fig, fig_dir / "error_vs_complexity.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1456,6 +1537,7 @@ def main():
     parser.add_argument("--view_invalid_fill", action="store_true")
     parser.add_argument("--view_seam_artifacts", action="store_true")
     parser.add_argument("--view_tin_artifacts", action="store_true")
+    parser.add_argument("--view_solar_distribution", action="store_true")
     parser.add_argument("--all_viz", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -1487,6 +1569,7 @@ def main():
                   args.view_loss_components or
                   args.view_invalid_fill or
                   args.view_tin_artifacts or
+                  args.view_solar_distribution or
                   args.view_seam_artifacts)
     if inspection:
         if is_global_zero:
@@ -1520,6 +1603,8 @@ def main():
                 visualize_seam_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_tin_artifacts:
                 visualize_tin_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+            if all_viz or args.view_solar_distribution:
+                visualize_solar_distribution(loaders["train"], output_dir=output_path)
 
             logger.info("Data inspection complete. Exiting without training.")
         return
