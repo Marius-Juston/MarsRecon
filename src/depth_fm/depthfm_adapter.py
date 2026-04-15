@@ -42,6 +42,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import random
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -51,8 +53,10 @@ import pandas as pd
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
+import torch.nn.functional as F
 from pykrige.ok import OrdinaryKriging
 from pykrige.uk import UniversalKriging
+from scipy import ndimage
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
@@ -176,10 +180,6 @@ def _safe_resize(tensor: torch.Tensor, size: int, is_mask: bool = False, has_nan
 
     # Standard orthoimage resizing
     return F.interpolate(tensor.unsqueeze(0), size=(size, size), mode='bilinear', align_corners=False).squeeze(0)
-
-
-import torch
-from scipy import ndimage
 
 
 def fill_invalid_nearest_neighbor(
@@ -683,8 +683,99 @@ def fill_voids_gmrf(
 
     return filled_img_t, filled_dtm_t, eroded
 
+#TODO not relaly necessary thanks to the meta data num tiles data
+def detect_dtm_seam_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
+                             line_length: int = 35,
+                             num_angles: int = 8,
+                             min_valid_ratio: float = 0.5) -> float:
+    """
+    Detects artificial merge seams at arbitrary angles using valid-masked
+    directional convolutions.
 
-import torch
+    Args:
+        elevation: (H, W) or (1, 1, H, W) tensor of elevation data.
+        valid_mask: Boolean tensor indicating valid pixels.
+        line_length: The length of the straight line kernel used to detect seams.
+        num_angles: How many discrete angles to check (e.g., 8 = every 22.5 degrees).
+        min_valid_ratio: The line must cover at least this percentage of valid
+                         pixels relative to `line_length` to be considered.
+
+    Returns:
+        float: Seam score representing how severe the sharpest straight-line
+               gradient is compared to the background terrain.
+    """
+    if elevation.dim() == 2:
+        elevation = elevation.view(1, 1, elevation.shape[0], elevation.shape[1])
+        valid_mask = valid_mask.view(1, 1, valid_mask.shape[0], valid_mask.shape[1])
+
+    device = elevation.device
+    dtype = elevation.dtype
+
+    # 1. Gradient Magnitude (Normalized Sobel)
+    safe_elev = elevation.clone()
+    safe_elev[~valid_mask] = 0.0
+
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device, dtype=dtype).view(1, 1, 3,
+                                                                                                           3) / 8.0
+    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device, dtype=dtype).view(1, 1, 3,
+                                                                                                           3) / 8.0
+
+    grad_x = F.conv2d(safe_elev, sobel_x, padding=1)
+    grad_y = F.conv2d(safe_elev, sobel_y, padding=1)
+    grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+
+    # 2. Erode mask aggressively to ignore physical edges of the DTM
+    invalid_mask = (~valid_mask).float()
+    dilated_invalid = F.max_pool2d(invalid_mask, kernel_size=7, stride=1, padding=3)
+    eroded_valid = (dilated_invalid == 0.0).float()
+
+    grad_mag = grad_mag * eroded_valid
+
+    # 3. Global background terrain roughness
+    valid_pixel_count = eroded_valid.sum().clamp(min=1)
+    bg_grad = (grad_mag.sum() / valid_pixel_count).clamp(min=1e-5)
+
+    # 4. Generate Multi-Angle Kernels dynamically
+    k_center = line_length // 2
+    dir_kernels = torch.zeros((num_angles, 1, line_length, line_length), device=device, dtype=dtype)
+
+    for i in range(num_angles):
+        angle = math.pi * i / num_angles
+        # Draw a line through the center of the kernel
+        for r in range(line_length):
+            t = r - k_center
+            x = int(round(k_center + t * math.cos(angle)))
+            y = int(round(k_center + t * math.sin(angle)))
+            if 0 <= x < line_length and 0 <= y < line_length:
+                dir_kernels[i, 0, y, x] = 1.0
+
+    # 5. Convolve over both Gradient Map and Valid Mask
+    # This gives us the sum of gradients AND the exact count of valid pixels for every line
+    line_grad_sum = F.conv2d(grad_mag, dir_kernels, padding=k_center)
+    line_valid_count = F.conv2d(eroded_valid, dir_kernels, padding=k_center)
+
+    # 6. Calculate Average Gradient strictly over valid pixels
+    # Avoid div by zero
+    line_avg_grad = line_grad_sum / line_valid_count.clamp(min=1.0)
+
+    # 7. Valid-Mask Constraint Filter
+    # Only consider line segments that have enough valid data points.
+    # E.g., if line_length is 35, and min_valid_ratio is 0.5, the line must
+    # hit at least 17.5 valid pixels to be scored. This prevents false positives
+    # where a kernel just grazes a jagged 3-pixel corner of the valid mask.
+    valid_line_mask = line_valid_count >= (min_valid_ratio * line_length)
+
+    if not valid_line_mask.any():
+        return 0.0  # No lines long enough fit inside the valid area
+
+    # 8. Final Score Calculation
+    # Get the max average gradient from lines that passed the validity check
+    max_line_response = line_avg_grad[valid_line_mask].max().item()
+
+    # Seam score: Max directional average gradient vs background average gradient
+    seam_score = max_line_response / bg_grad.item()
+
+    return seam_score
 
 
 def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
@@ -746,10 +837,6 @@ def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
     max_local_density = local_density[valid_window_mask].max().item()
 
     return max_local_density
-
-
-import torch
-import torch.nn.functional as F
 
 
 def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: torch.Tensor) -> tuple[
@@ -1044,7 +1131,9 @@ class DepthFMHiRISEAdapterCached(Dataset):
             (df['is_valid_data'] == True) &
             (df['valid_ratio'] >= 0.5) &
             (df['residual'] >= 0.1) &
-            (df['is_tin'] >= 0.15)
+            (df[
+                 'is_tin'] <= 0.95) &  # High TIN values means 2nd derivative (Laplacian) is nearly zero, which indicates perfectly flat planes.
+            (df["num_merges"] == 1)  # Currently tile merges have issues for DTM estimation
             ]
 
         # Convert to a list of dicts for O(1) lookup during training
@@ -1168,7 +1257,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
                 "sun_y": sun_y,
                 "sun_z": sun_z,
                 "intensity": intensity_val,
-                "ambient": ambient_val
+                "ambient": ambient_val,
+                "num_merges": len(sample['meta'])
             }
 
         except Exception as e:
@@ -1256,7 +1346,6 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
         # Brightness jitter
         if getattr(self, 'is_train', False) and getattr(self, 'bright_jitter', 0) > 0:
-            import random
             factor = 1.0 + random.uniform(-self.bright_jitter, self.bright_jitter)
             image = (image * factor).clamp(-1.0, 1.0)
 

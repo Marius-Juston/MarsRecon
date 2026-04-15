@@ -92,6 +92,248 @@ _VAL_WORKERS = min(4, _WORKERS_PER_GPU)
 # Visualization helpers (unchanged from original)
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
+def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 1000):
+    """
+    Scans a buffer of patches, scores them for seam artifacts, and plots
+    the worst (highest score) vs the best (lowest score) for visual validation.
+    Layout: [Ortho] | [GT DTM] | [Confidence Mask] | [Gradient Map]
+    """
+    from depth_fm.depthfm_adapter import detect_dtm_seam_artifact
+
+    logger.info(f"Generating Seam Artifact validation for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    evaluated_samples = []
+    scan_limit = len(dataloader.dataset)  # Scan a larger buffer to find actual seams
+
+    with tqdm(total=scan_limit, desc="Scanning for seams") as pbar:
+        for batch in dataloader:
+            B = batch["image"].shape[0]
+            for i in range(B):
+                if len(evaluated_samples) >= scan_limit:
+                    break
+
+                img = batch["image"][i: i + 1].to(device)
+                dtm = batch["dtm"][i: i + 1, :1].to(device)
+                mask = batch["confidence"][i: i + 1].to(device) > 0.5
+
+                # Skip empty masks
+                # if not mask.any() or not (~mask).any():
+                #     continue
+
+                score = detect_dtm_seam_artifact(dtm, mask)
+
+                # Compute normalized gradient magnitude for visualization
+                sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device).view(1, 1, 3,
+                                                                                                          3) / 8.0
+                sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device).view(1, 1, 3,
+                                                                                                          3) / 8.0
+
+                safe_dtm = dtm.clone()
+                safe_dtm[~mask.bool()] = 0.0
+                grad_x = F.conv2d(safe_dtm, sobel_x, padding=1)
+                grad_y = F.conv2d(safe_dtm, sobel_y, padding=1)
+                grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+
+                evaluated_samples.append({
+                    "score": score,
+                    "img": img[0].cpu().numpy(),
+                    "dtm": dtm[0, 0].cpu().numpy(),
+                    "mask": mask[0, 0].cpu().numpy(),
+                    "grad_mag": grad_mag[0, 0].cpu().numpy()
+                })
+                pbar.update(1)
+
+            if len(evaluated_samples) >= scan_limit:
+                break
+
+    # Sort by score descending
+    evaluated_samples.sort(key=lambda x: x["score"], reverse=True)
+
+    num_samples = len(evaluated_samples)
+
+    # Select the Top N (Most severe seams) and Bottom N (Cleanest terrain)
+    selected = evaluated_samples
+    half = len(selected) // 2
+
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+    plt.subplots_adjust(wspace=0.1, hspace=0.3)
+
+    for count, item in enumerate(selected):
+        img_disp = np.clip((np.transpose(item["img"], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+        dtm_disp = np.clip((item["dtm"] + 1.0) / 2.0, 0.0, 1.0)
+        mask_np = item["mask"].astype(bool)
+        grad_np = item["grad_mag"]
+
+        # Mask out invalid areas purely for plotting clarity
+        img_disp[~mask_np] = np.nan
+        dtm_disp[~mask_np] = np.nan
+        grad_np[~mask_np] = np.nan
+
+        axes[count, 0].imshow(img_disp, vmin=0, vmax=1)
+        axes[count, 1].imshow(dtm_disp, cmap="terrain", vmin=0, vmax=1)
+        axes[count, 2].imshow(item["mask"], cmap="gray", vmin=0, vmax=1)
+
+        # Stretch gradient map for visibility
+        p2, p98 = np.nanpercentile(grad_np, [2, 98]) if np.any(~np.isnan(grad_np)) else (0, 1)
+        grad_disp = np.clip((grad_np - p2) / (p98 - p2 + 1e-8), 0, 1)
+        axes[count, 3].imshow(grad_disp, cmap="magma")
+
+        for ax in axes[count]:
+            ax.axis("off")
+
+        if count == 0:
+            titles = ["Masked Ortho", "Masked GT DTM", "Confidence Mask", "Gradient Map"]
+            for ax, t in zip(axes[0], titles):
+                ax.set_title(t)
+
+        # Add side-label indicating Seam Score
+        label = "High Score\n(Likely Seam)" if count < half else "Low Score\n(Clean Terrain)"
+        axes[count, 0].text(-0.1, 0.5, f"Score: {item['score']:.2f}\n{label}",
+                            transform=axes[count, 0].transAxes, fontsize=12, fontweight='bold',
+                            va='center', ha='right', color='red' if count < half else 'green')
+
+    save_path = output_dir / "seam_artifact_inspection.png"
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    plt.close(fig)
+    logger.info(f"Seam artifact visualization saved to: {save_path}")
+
+
+@torch.no_grad()
+def visualize_tin_artifacts(dataloader, output_dir: Path, num_samples: int = 8, kernel_size: int = 32):
+    """
+    Visualizes TIN artifacts by finding patches with high local planar density.
+    Layout: [Ortho] | [GT DTM] | [Laplacian Magnitude] | [TIN Density Map]
+    """
+    logger.info(f"Generating TIN Artifact visualization for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    evaluated_samples = []
+    scan_limit = len(dataloader.dataset)  # Scan a larger buffer to find actual TINs
+
+    laplacian_kernel = torch.tensor([[[[0.0, 1.0, 0.0],
+                                       [1.0, -4.0, 1.0],
+                                       [0.0, 1.0, 0.0]]]], device=device)
+
+    with tqdm(total=scan_limit, desc="Scanning for TIN artifacts") as pbar:
+        for batch in dataloader:
+            B = batch["image"].shape[0]
+            for i in range(B):
+                if len(evaluated_samples) >= scan_limit:
+                    break
+
+                img = batch["image"][i: i + 1].to(device)
+                dtm = batch["dtm"][i: i + 1, :1].to(device)
+                mask = batch["confidence"][i: i + 1].to(device)
+
+                # --- Extract TIN Logic for Spatial Mapping ---
+                safe_elev = dtm.clone()
+                safe_elev[~mask.bool()] = 0.0
+
+                laplacian = F.conv2d(safe_elev, laplacian_kernel, padding=1)
+
+                invalid_mask = (~mask.bool()).float()
+                dilated_invalid = F.max_pool2d(invalid_mask, kernel_size=3, stride=1, padding=1)
+                eroded_valid = (dilated_invalid == 0.0).float()
+
+                zero_curvature_mask = ((laplacian.abs() < 1e-2) * eroded_valid.bool()).float()
+
+                local_planar_sum = F.avg_pool2d(zero_curvature_mask, kernel_size=kernel_size, stride=1)
+                local_valid_sum = F.avg_pool2d(eroded_valid, kernel_size=kernel_size, stride=1)
+
+                safe_valid_sum = torch.clamp(local_valid_sum, min=1e-6)
+                local_density = local_planar_sum / safe_valid_sum
+
+                valid_window_mask = local_valid_sum >= 0.5
+
+                if valid_window_mask.any():
+                    score = local_density[valid_window_mask].max().item()
+                else:
+                    score = 0.0
+
+                # Interpolate density map back to original size for side-by-side visualization
+                # (avg_pool2d with stride=1 shrinks size by kernel_size - 1)
+                pad_top = kernel_size // 2
+                pad_bottom = kernel_size - 1 - pad_top
+                density_map = F.pad(local_density, (pad_top, pad_bottom, pad_top, pad_bottom), mode='constant',
+                                    value=0.0)
+
+                evaluated_samples.append({
+                    "score": score,
+                    "img": img[0].cpu().numpy(),
+                    "dtm": dtm[0, 0].cpu().numpy(),
+                    "mask": mask[0, 0].cpu().numpy(),
+                    "laplacian": laplacian[0, 0].cpu().numpy(),
+                    "density": density_map[0, 0].cpu().numpy()
+                })
+                pbar.update(1)
+
+            if len(evaluated_samples) >= scan_limit:
+                break
+
+    # Sort by TIN score descending
+    evaluated_samples.sort(key=lambda x: x["score"], reverse=True)
+
+    # Select the Top N (Severe TINs) and Bottom N (Clean terrain)
+    num_samples = min(num_samples, len(evaluated_samples))
+    if num_samples == 0:
+        logger.warning("No valid samples found for TIN visualization.")
+        return
+
+    half = num_samples // 2
+    selected = evaluated_samples[:half] + evaluated_samples[-half:]
+
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+    plt.subplots_adjust(wspace=0.1, hspace=0.3)
+
+    for count, item in enumerate(selected):
+        img_disp = np.clip((np.transpose(item["img"], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+        dtm_disp = np.clip((item["dtm"] + 1.0) / 2.0, 0.0, 1.0)
+        mask_np = item["mask"].astype(bool)
+        lap_np = np.abs(item["laplacian"])
+        density_np = item["density"]
+
+        # Mask invalid areas purely for visual clarity
+        img_disp[~mask_np] = np.nan
+        dtm_disp[~mask_np] = np.nan
+        lap_np[~mask_np] = np.nan
+        density_np[~mask_np] = np.nan
+
+        axes[count, 0].imshow(img_disp, vmin=0, vmax=1)
+        axes[count, 1].imshow(dtm_disp, cmap="terrain", vmin=0, vmax=1)
+
+        # Stretch Laplacian for visibility (highlighting sharp edges)
+        p98 = np.nanpercentile(lap_np, 98) if np.any(~np.isnan(lap_np)) else 1.0
+        lap_disp = np.clip(lap_np / (p98 + 1e-8), 0, 1)
+        axes[count, 2].imshow(lap_disp, cmap="magma")
+
+        # Local Density Map (0 to 1 heatmap)
+        axes[count, 3].imshow(density_np, cmap="jet", vmin=0, vmax=1)
+
+        for ax in axes[count]:
+            ax.axis("off")
+
+        if count == 0:
+            titles = ["Masked Ortho", "Masked GT DTM", "Laplacian Magnitude", "TIN Density Map"]
+            for ax, t in zip(axes[0], titles):
+                ax.set_title(t)
+
+        # Add side-label indicating TIN Score
+        label = "High Score\n(TIN Suspected)" if count < half else "Low Score\n(Clean Terrain)"
+        axes[count, 0].text(-0.1, 0.5, f"Score: {item['score']:.2f}\n{label}",
+                            transform=axes[count, 0].transAxes, fontsize=12, fontweight='bold',
+                            va='center', ha='right', color='red' if count < half else 'green')
+
+    save_path = output_dir / "tin_artifact_inspection.png"
+    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    plt.close(fig)
+    logger.info(f"TIN artifact visualization saved to: {save_path}")
+
 
 @torch.no_grad()
 def visualize_loss_components(dataloader, output_dir, num_samples=4):
@@ -1212,6 +1454,8 @@ def main():
     parser.add_argument("--view_loss_physics", action="store_true")
     parser.add_argument("--view_loss_components", action="store_true")
     parser.add_argument("--view_invalid_fill", action="store_true")
+    parser.add_argument("--view_seam_artifacts", action="store_true")
+    parser.add_argument("--view_tin_artifacts", action="store_true")
     parser.add_argument("--all_viz", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -1235,11 +1479,27 @@ def main():
 
     all_viz = args.all_viz
     # Inspection modes
-    inspection = all_viz or args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components or args.view_invalid_fill
+    inspection = (all_viz or
+                  args.analyze_masks or
+                  args.view_thumbnails or
+                  args.analyze_topography or
+                  args.view_loss_physics or
+                  args.view_loss_components or
+                  args.view_invalid_fill or
+                  args.view_tin_artifacts or
+                  args.view_seam_artifacts)
     if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
             L.seed_everything(args.seed, workers=True)
+            # For the visualisation we do not want to use the distributed setup, just GPU 0, as such to trick the
+            # creation for the dataloaders we want to have it look at the full dataset; however, it splits per
+            # rank using the WORLD_SIZE environment variable
+            if "WORLD_SIZE" in os.environ:
+                del os.environ["WORLD_SIZE"]
+                logger.warning(
+                    "Because we are running in a distributed environment and we are planning to run visualisation, we disable the other GPUs")
+
             loaders = build_dataloaders(config, split_seed=args.seed, parallel=config.data.get("parallel_load", False))
             output_path = Path(config.training.output_dir) / "inspection"
 
@@ -1256,6 +1516,10 @@ def main():
                 visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_invalid_fill:
                 visualize_invalid_fill(loaders["train"], output_dir=output_path, num_samples=16)
+            if all_viz or args.view_seam_artifacts:
+                visualize_seam_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+            if all_viz or args.view_tin_artifacts:
+                visualize_tin_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
 
             logger.info("Data inspection complete. Exiting without training.")
         return
