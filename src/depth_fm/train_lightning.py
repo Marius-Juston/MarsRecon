@@ -1212,6 +1212,7 @@ def main():
     parser.add_argument("--view_loss_physics", action="store_true")
     parser.add_argument("--view_loss_components", action="store_true")
     parser.add_argument("--view_invalid_fill", action="store_true")
+    parser.add_argument("--all_viz", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
@@ -1232,8 +1233,9 @@ def main():
         logger.info("Hardware: %d CPU cores detected, %d GPUs, workers/GPU=%d", _TOTAL_CORES, _NUM_GPUS_DEFAULT,
                     _WORKERS_PER_GPU)
 
+    all_viz = args.all_viz
     # Inspection modes
-    inspection = args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components or args.view_invalid_fill
+    inspection = all_viz or args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components or args.view_invalid_fill
     if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
@@ -1246,13 +1248,13 @@ def main():
             if args.analyze_masks:
                 for split_name, loader in loaders.items():
                     compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
-            if args.view_thumbnails:
+            if all_viz or args.view_thumbnails:
                 generate_thumbnail_grids(loaders["val"], output_dir=output_path, num_samples=8)
-            if args.view_loss_physics:
+            if all_viz or args.view_loss_physics:
                 visualize_loss_physics(loaders["val"], output_dir=output_path, num_samples=8)
-            if args.view_loss_components:
+            if all_viz or args.view_loss_components:
                 visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
-            if args.view_invalid_fill:
+            if all_viz or args.view_invalid_fill:
                 visualize_invalid_fill(loaders["train"], output_dir=output_path, num_samples=16)
 
             logger.info("Data inspection complete. Exiting without training.")
