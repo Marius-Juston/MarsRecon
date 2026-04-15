@@ -107,26 +107,30 @@ print(sample["original_image"].shape) # (C, H, W) float16
 print(sample["original_dtm"].shape)   # (1, H, W) float16
 print(sample["trend_params"].shape)   # (3,)      float16
 
-# Metadata
-print(sample["strip_id"])           # str
+# Normalization / Processing Metadata
+print(sample["residual_scale"])     # float32
+print(sample["raw_residual_p98"])   # float32
+print(sample["key"])                # str (e.g., "left_red")
 ```
 
 ## Fields
 
 During extraction, model inputs are quantized to `float16` to optimize streaming bandwidth. Physical lighting parameters remain `float32`.
 
-| Key              | Dtype   | Shape      | Description                                    |
-|------------------|---------|------------|------------------------------------------------|
-| `image`          | float16 | (3, H, W)  | Normalized HiRISE orthoimage [-1, 1]           |
-| `dtm`            | float16 | (3, H, W)  | Normalized DTM elevation                       |
-| `confidence`     | float16 | (1, H, W)  | Binary valid data mask (eroded/cleaned)        |
-| `sun_vector`     | float32 | (3,)       | Estimated sun direction (OLS, unit-normalized) |
-| `intensity`      | float32 | scalar     | Estimated sun intensity                        |
-| `ambient`        | float32 | scalar     | Estimated ambient light                        |
-| `original_image` | float16 | (C, H, W)  | Unnormalized resized orthoimage                |
-| `original_dtm`   | float16 | (1, H, W)  | Unnormalized resized DTM elevation             |
-| `trend_params`   | float16 | (3,)       | LSQR detrend parameters for the DTM plane      |
-| `strip_id`       | string  | scalar     | PDS Product ID of the DTM                      |
+| Key                | Dtype   | Shape      | Description                                    |
+|--------------------|---------|------------|------------------------------------------------|
+| `image`            | float16 | (3, H, W)  | Normalized HiRISE orthoimage [-1, 1]           |
+| `dtm`              | float16 | (3, H, W)  | Normalized DTM elevation                       |
+| `confidence`       | float16 | (1, H, W)  | Binary valid data mask (eroded/cleaned)        |
+| `sun_vector`       | float32 | (3,)       | Estimated sun direction (OLS, unit-normalized) |
+| `intensity`        | float32 | scalar     | Estimated sun intensity                        |
+| `ambient`          | float32 | scalar     | Estimated ambient light                        |
+| `original_image`   | float16 | (C, H, W)  | Unnormalized resized orthoimage                |
+| `original_dtm`     | float16 | (1, H, W)  | Unnormalized resized DTM elevation             |
+| `trend_params`     | float16 | (3,)       | LSQR detrend parameters for the DTM plane      |
+| `residual_scale`   | float32 | scalar     | Normalization scale applied to the DTM residual|
+| `raw_residual_p98` | float32 | scalar     | 98th percentile of the raw topographic residual|
+| `key`              | string  | scalar     | Orthoimage source used (e.g., left_red)        |
 
 
 ## Preprocessing Configuration
@@ -433,7 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="configs/train_hirise.yaml")
     parser.add_argument("--workers", type=int, default=96 * 2)
     parser.add_argument(
-        "--hf-repo", type=str, default=None,
+        "--hf-repo", type=str, default="SuperComputer/mars_hirise_dtm_processed",
         help="Base HuggingFace repo id to upload to (e.g. your-org/mars-hirise-dtm). "
              "The config hash will be automatically appended.",
     )
