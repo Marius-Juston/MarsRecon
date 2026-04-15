@@ -244,8 +244,22 @@ def _repack_npz(npz_path: str) -> dict:
     Top-level function with no closures — trivially picklable.
     """
     import numpy as np
+    import json
+
     data = np.load(npz_path, allow_pickle=True)
-    return dict(data)
+    out_dict = dict(data)
+
+    # Decode the JSON payload back into a list of dicts
+    if "meta" in out_dict:
+        meta_val = out_dict["meta"]
+        # Extract string from 0-d numpy array if necessary
+        if isinstance(meta_val, np.ndarray):
+            meta_val = meta_val.item()
+
+        # Reconstruct the native Python list of dicts for LitData
+        out_dict["meta"] = json.loads(meta_val)
+
+    return out_dict
 
 
 def build_litdata_for_split(
@@ -399,7 +413,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
                 original_dtm=sample["original_dtm"].numpy().astype(np.float16),
                 trend_params=sample["trend_params"].numpy().astype(np.float16),
                 original_image=sample["original_image"].numpy().astype(np.float16),
-                # meta=sample["meta"],
+                meta=json.dumps(sample["meta"]),
                 dtm=sample["dtm"].numpy().astype(np.float16),
                 confidence=sample["confidence"].numpy().astype(np.float16),
                 sun_vector=sun_vec.numpy(),
