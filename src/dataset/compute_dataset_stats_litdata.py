@@ -59,6 +59,7 @@ CENTERED_HIST_RANGE = {
     "image": {"min": -0.22, "max": 0.22}
 }
 
+PERCENTILE = 0.995
 
 # ---------------------------------------------------------------------------
 # Core Math & Stats Functions (NumPy)
@@ -348,13 +349,13 @@ def _save_stats(combined: dict, channels: list[str], output_dir: pathlib.Path, a
         edges = np.linspace(min_x, max_x, N_HIST_BINS + 1).tolist()
         bin_edges_all.append(edges)
         p02_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.02))
-        p98_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, 0.98))
+        p98_vals.append(_calculate_percentile_from_hist(hist_counts[c], edges, PERCENTILE))
 
         c_min_x, c_max_x = CENTERED_HIST_RANGE[range_key]["min"], CENTERED_HIST_RANGE[range_key]["max"]
         c_edges = np.linspace(c_min_x, c_max_x, N_HIST_BINS + 1).tolist()
         c_bin_edges_all.append(c_edges)
         c_p02_vals.append(_calculate_percentile_from_hist(c_hist_counts[c], c_edges, 0.02))
-        c_p98_vals.append(_calculate_percentile_from_hist(c_hist_counts[c], c_edges, 0.98))
+        c_p98_vals.append(_calculate_percentile_from_hist(c_hist_counts[c], c_edges, PERCENTILE))
 
     stats = {
         "channels": channels,
