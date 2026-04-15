@@ -105,7 +105,7 @@ def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"
 
 
 @torch.no_grad()
-def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int = 50):
+def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int = -1):
     """
     Visualizes solar physics and saves individual plots for publication.
     """
@@ -115,8 +115,8 @@ def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int 
 
     sun_vecs, intensities, ambients = [], [], []
 
-    for i, batch in enumerate(dataloader):
-        if i >= num_batches: break
+    for i, batch in tqdm(enumerate(dataloader), total=len(dataloader), desc="Extracting sun vectors"):
+        if 0 < num_batches <= i: break
         sun_vecs.append(batch["sun_vector"].cpu().numpy())
         intensities.append(batch["intensity"].cpu().numpy())
         ambients.append(batch["ambient"].cpu().numpy())
@@ -174,7 +174,7 @@ def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int 
 
 
 @torch.no_grad()
-def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 1000):
+def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16):
     """
     Scans a buffer of patches, scores them for seam artifacts, and plots
     the worst (highest score) vs the best (lowest score) for visual validation.
@@ -234,13 +234,15 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 10
     # Sort by score descending
     evaluated_samples.sort(key=lambda x: x["score"], reverse=True)
 
-    num_samples = len(evaluated_samples)
+    num_samples = min(len(evaluated_samples), num_samples)
 
     # Select the Top N (Most severe seams) and Bottom N (Cleanest terrain)
-    selected = evaluated_samples
+    selected = evaluated_samples[:num_samples] + evaluated_samples[-num_samples:]
     half = len(selected) // 2
 
-    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+    total_rows = len(selected)
+
+    fig, axes = plt.subplots(total_rows, 4, figsize=(16, 4 * total_rows))
     plt.subplots_adjust(wspace=0.1, hspace=0.3)
 
     for count, item in enumerate(selected):
