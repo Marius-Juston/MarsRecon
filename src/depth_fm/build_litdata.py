@@ -244,22 +244,9 @@ def _repack_npz(npz_path: str) -> dict:
     Top-level function with no closures — trivially picklable.
     """
     import numpy as np
-    import json
 
     data = np.load(npz_path, allow_pickle=True)
-    out_dict = dict(data)
-
-    # Decode the JSON payload back into a list of dicts
-    if "meta" in out_dict:
-        meta_val = out_dict["meta"]
-        # Extract string from 0-d numpy array if necessary
-        if isinstance(meta_val, np.ndarray):
-            meta_val = meta_val.item()
-
-        # Reconstruct the native Python list of dicts for LitData
-        out_dict["meta"] = json.loads(meta_val)
-
-    return out_dict
+    return dict(data)
 
 
 def build_litdata_for_split(
