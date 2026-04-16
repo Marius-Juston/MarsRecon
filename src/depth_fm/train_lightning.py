@@ -1093,7 +1093,28 @@ def run_single_training(
         logger.info(f"Run {run_idx} at {output_dir} is already complete. Skipping.")
         with open(summary_path, "r") as f:
             test_summary = json.load(f)
-        return {"test_summary": test_summary, "output_dir": output_dir, "skipped": True}
+
+        # Load the saved dataframe so downstream plotting doesn't crash
+        import pandas as pd
+        test_df_path = output_dir / "test_results.csv"
+        test_df = pd.read_csv(test_df_path) if test_df_path.exists() else None
+
+        # Load the timestep ablation if it exists
+        ablation_path = output_dir / "timestep_ablation.json"
+        timestep_ablation = {}
+        if ablation_path.exists():
+            with open(ablation_path, "r") as f:
+                timestep_ablation = json.load(f)
+
+        return {
+            "test_summary": test_summary,
+            "test_df": test_df,
+            "timestep_ablation": timestep_ablation,
+            "output_dir": output_dir,
+            "skipped": True,
+            "val_history": [],  # Empty list to prevent KeyError in multi-run convergence plots
+            "test_aggregator": None  # Object is not in memory; requires a guard in the plotting function
+        }
 
     # Build data
     # FIXME
@@ -1438,7 +1459,12 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
 
 def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
     """Generate detailed per-patch analysis from the best run."""
-    aggregator = best_run["test_aggregator"]
+    aggregator = best_run.get("test_aggregator")
+    if aggregator is None:
+        logger.warning("Test aggregator not found in memory (run was skipped). Skipping patch analysis plotting.")
+        return
+
+
     worst = aggregator.worst_k("rmse", k=5)
     best = aggregator.best_k("rmse", k=5)
     logger.info("Worst 5 test patches: %s", worst)
@@ -1524,6 +1550,10 @@ def dataload_switch_test(config, args):
             for b in tqdm(loader):
                 pass
 
+def hash_config(config: OmegaConf):
+    raw = json.dumps(OmegaConf.to_container(config, resolve=True), sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:4]
+
 
 def main():
     import warnings
@@ -1561,7 +1591,9 @@ def main():
         config.data.fold_idx = args.fold_idx
 
     is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
-    config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type", "depthfm")
+    config_hash = hash_config(config)
+
+    config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type", "depthfm") / config_hash
 
     # Log hardware info
     if is_global_zero:
