@@ -329,7 +329,11 @@ class DepthFMLightningModule(L.LightningModule):
         # Build model
         torch.backends.cudnn.benchmark = True
         self.model = build_model(config)
-        self.model = self.model.to(memory_format=torch.channels_last)
+
+        if config.training.get("optimizer", "adamw") != "shampoo":
+            self.model = self.model.to(memory_format=torch.channels_last)
+        else:
+            logger.warning("Disabled channels_last memory format for shampoo training")
 
         # Loss
         lc = config.training.losses
@@ -1646,36 +1650,98 @@ class DepthFMLightningModule(L.LightningModule):
         trainable = [p for p in self.model.backbone.parameters() if p.requires_grad]
         losses = [p for p in self.loss_fn.parameters() if p.requires_grad]
 
-        logger.info("Number of trainable parameters parameters %d, loss function %d", len(trainable), len(losses))
+        logger.info("Number of trainable parameters %d, loss function %d", len(trainable), len(losses))
         trainable += losses
 
-        optimizer = torch.optim.AdamW(
-            trainable,
-            lr=tc.learning_rate,
-            betas=(tc.adam_beta1, tc.adam_beta2),
-            eps=tc.adam_epsilon,
-            weight_decay=tc.weight_decay,
-        )
+        # 1. Determine Optimizer Strategy
+        optimizer_type = tc.get("optimizer", "adamw").lower()
 
-        warmup_steps = tc.lr_warmup_steps
-        cosine_steps = tc.max_steps - warmup_steps
+        optim = tc.shampoo if optimizer_type == "shampoo" else tc.adamw
 
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=1.0 / max(warmup_steps, 1),
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(cosine_steps, 1),
-            eta_min=tc.learning_rate * 0.01,
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_steps],
-        )
+        if optimizer_type == "shampoo":
+            # Deferred import so non-Shampoo environments don't crash
+            from distributed_shampoo import (
+                DistributedShampoo,
+                DDPDistributedConfig,
+                DefaultEigenvalueCorrectedShampooConfig
+            )
+            import torch.distributed as dist
+
+            # Extract DDP metadata safely
+            if dist.is_available() and dist.is_initialized():
+                world_size = dist.get_world_size()
+                # Default to BF16 comms for efficiency, fallback to FP32 if specified
+                comm_dtype = torch.bfloat16 if tc.get("mixed_precision") == "bf16" else torch.float32
+            else:
+                world_size = 1
+                comm_dtype = torch.float32
+
+            # Typically 8 GPUs per node. If running on a 4-GPU node, set to 4.
+            trainers_per_group = min(tc.get("num_gpus", 4), world_size)
+
+            logger.info("Initializing Distributed Shampoo (SOAP) for %d DDP ranks", world_size)
+
+            optimizer = DistributedShampoo(
+                trainable,
+                lr=optim.learning_rate,
+                betas=(optim.adam_beta1, optim.adam_beta2),
+                epsilon=1e-12,  # Crucial: Must be extremely small for Shampoo
+                weight_decay=optim.weight_decay,
+
+                # --- Preconditioning Engine (SOAP) ---
+                max_preconditioner_dim=optim.get("shampoo_max_dim", 4096),
+                precondition_frequency=optim.get("shampoo_freq", 100),
+                start_preconditioning_step=optim.get("shampoo_start", 100),
+                preconditioner_config=DefaultEigenvalueCorrectedShampooConfig,
+
+                # --- DDP Synchronization Engine ---
+                distributed_config=DDPDistributedConfig(
+                    communication_dtype=comm_dtype,
+                    num_trainers_per_group=trainers_per_group,
+                    communicate_params=False,
+                ),
+            )
+        else:
+            # Fallback to standard AdamW
+            logger.info("Initializing standard AdamW")
+            optimizer = torch.optim.AdamW(
+                trainable,
+                lr=optim.learning_rate,
+                betas=(optim.adam_beta1, optim.adam_beta2),
+                eps=optim.adam_epsilon,
+                weight_decay=optim.weight_decay,
+            )
+
+        # 2. Corrected Scheduler Logic (Flat + Delayed Cosine)
+        warmup_steps = optim.lr_warmup_steps
+
+        if optim.get("lr_scheduler", "constant") == "constant":
+            # Flat learning rate after warmup (Highly recommended for Flow Matching)
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0 / max(warmup_steps, 1),
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+        else:
+            # Traditional Cosine
+            cosine_steps = tc.max_steps - warmup_steps
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0 / max(warmup_steps, 1),
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(cosine_steps, 1),
+                eta_min=optim.learning_rate * 0.01,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps],
+            )
 
         return {
             "optimizer": optimizer,

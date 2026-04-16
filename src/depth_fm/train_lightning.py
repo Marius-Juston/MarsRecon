@@ -1174,7 +1174,8 @@ def run_single_training(
     if config.training.get("use_ema", True):
         logger.info("EMA is ENABLED.")
         callbacks.append(FasterEMAWeightAveraging(
-            decay=config.training.get("ema_decay", False)
+            decay=config.training.get("ema_decay", False),
+            device=config.training.get("ema_device", None)
         ))
     else:
         logger.info("EMA is DISABLED.")
