@@ -66,7 +66,7 @@ from depth_fm.visualization import (
     plot_convergence_curves,
     plot_metric_distributions,
     plot_multi_run_summary_table,
-    set_neurips_style,
+    set_neurips_style, plot_pareto_frontier,
 )
 
 import matplotlib.pyplot as plt
@@ -1295,6 +1295,13 @@ def run_single_training(
             secondary_metrics=["delta_1", "normal_angular_error"],
             title="Mars DTM: inference quality vs Euler steps",
             save_path=fig_dir / "timestep_ablation_rmse.pdf",
+        )
+        plt.close(fig)
+
+        fig = plot_pareto_frontier(
+            metrics_per_step=timestep_results,
+            primary_metric="rmse",
+            save_path=fig_dir / "pareto_frontier_rmse.pdf",
         )
         plt.close(fig)
 

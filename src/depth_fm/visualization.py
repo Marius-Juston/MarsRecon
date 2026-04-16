@@ -958,3 +958,270 @@ def plot_timestep_ablation(
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
     return fig
+
+def plot_uncertainty_map(
+        pred_dtm: np.ndarray,
+        var_dtm: np.ndarray,
+        img: np.ndarray,
+        title: str = "Epistemic Uncertainty",
+        save_path: str | Path | None = None,
+) -> plt.Figure:
+    """Triptych: Input Image | Predicted DTM | Epistemic Variance (Uncertainty)."""
+    set_neurips_style()
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    # Panel 1: Input image
+    if img.ndim == 3 and img.shape[-1] == 3:
+        axes[0].imshow(np.clip(img, 0, 1), interpolation="nearest")
+    else:
+        axes[0].imshow(img, cmap=CMAP_IMAGE, interpolation="nearest")
+    axes[0].set_title("Input Orthoimage")
+    axes[0].axis("off")
+
+    # Panel 2: Mean Prediction
+    valid = np.isfinite(pred_dtm)
+    vmin, vmax = _valid_stats(pred_dtm, valid)
+    im_pred = axes[1].imshow(
+        np.where(valid, pred_dtm, np.nan),
+        cmap=CMAP_ELEVATION, vmin=vmin, vmax=vmax, interpolation="nearest",
+    )
+    axes[1].set_title("Expected Topography")
+    axes[1].axis("off")
+
+    # Panel 3: Variance (Uncertainty)
+    # Using 'inferno' to highlight highly uncertain regions (yellow/white)
+    var_vmax = np.nanpercentile(var_dtm, 98)
+    im_var = axes[2].imshow(
+        var_dtm, cmap="inferno", vmin=0, vmax=var_vmax, interpolation="nearest"
+    )
+    axes[2].set_title(r"Epistemic Variance ($\sigma^2$)")
+    axes[2].axis("off")
+
+    # Colorbars
+    cbar1 = fig.colorbar(im_pred, ax=axes[1], shrink=0.8, label="Elevation (m)")
+    cbar2 = fig.colorbar(im_var, ax=axes[2], shrink=0.8, label="Variance (m$^2$)")
+
+    if title:
+        fig.suptitle(title, fontweight="bold")
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig
+
+
+def plot_geomorphometric_analysis(
+        pred_dtm: np.ndarray,
+        gt_dtm: np.ndarray,
+        title: str = "Geomorphometric Analysis: Edges & Curvature",
+        save_path: str | Path | None = None,
+) -> plt.Figure:
+    """Triptych: Edge Boundaries | Predicted Laplacian | Error in Laplacian."""
+    from scipy.ndimage import gaussian_filter
+    set_neurips_style()
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+
+    # 1. Edge Boundaries Plot (DBF Visualization)
+    dy_p, dx_p = np.gradient(pred_dtm)
+    dy_g, dx_g = np.gradient(gt_dtm)
+    grad_p = np.sqrt(dx_p ** 2 + dy_p ** 2)
+    grad_g = np.sqrt(dx_g ** 2 + dy_g ** 2)
+
+    thresh = np.nanpercentile(grad_g, 85)
+    # Map edges: GT = Blue, Pred = Red, Overlap = Purple
+    edge_viz = np.ones((*pred_dtm.shape, 3))
+    edge_viz[grad_g > thresh] = [0.2, 0.4, 0.8]  # GT edges (Blue)
+    edge_viz[grad_p > thresh] = [0.8, 0.2, 0.2]  # Pred edges (Red)
+    edge_viz[(grad_g > thresh) & (grad_p > thresh)] = [0.6, 0.1, 0.6]  # Overlap (Purple)
+
+    axes[0].imshow(edge_viz, interpolation="nearest")
+    axes[0].set_title("Structural Edges\n(Blue: GT, Red: Pred, Purple: Match)")
+    axes[0].axis("off")
+
+    # 2. Laplacian (Curvature)
+    pred_s = gaussian_filter(pred_dtm, sigma=1.0)
+    d2y, _ = np.gradient(np.gradient(pred_s)[0])
+    _, d2x = np.gradient(np.gradient(pred_s)[1])
+    laplacian_p = d2x + d2y
+
+    v_lim = np.nanpercentile(np.abs(laplacian_p), 98)
+    im_lap = axes[1].imshow(
+        laplacian_p, cmap="coolwarm", vmin=-v_lim, vmax=v_lim, interpolation="nearest"
+    )
+    axes[1].set_title("Predicted Curvature (Laplacian)")
+    axes[1].axis("off")
+    fig.colorbar(im_lap, ax=axes[1], shrink=0.8, label=r"$\nabla^2 z$")
+
+    # 3. Laplacian Error (TIN Artifact / Terracing Identifier)
+    gt_s = gaussian_filter(gt_dtm, sigma=1.0)
+    d2y_g, _ = np.gradient(np.gradient(gt_s)[0])
+    _, d2x_g = np.gradient(np.gradient(gt_s)[1])
+    laplacian_g = d2x_g + d2y_g
+
+    lap_error = np.abs(laplacian_p - laplacian_g)
+    err_lim = np.nanpercentile(lap_error, 95)
+
+    im_err = axes[2].imshow(
+        lap_error, cmap="magma", vmin=0, vmax=err_lim, interpolation="nearest"
+    )
+    axes[2].set_title("Curvature Absolute Error")
+    axes[2].axis("off")
+    fig.colorbar(im_err, ax=axes[2], shrink=0.8, label=r"$|\Delta \nabla^2 z|$")
+
+    if title:
+        fig.suptitle(title, fontweight="bold")
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig
+
+
+def plot_radial_psd_curves(
+        pred_dtm: np.ndarray,
+        gt_dtm: np.ndarray,
+        valid_mask: np.ndarray | None = None,
+        title: str = "Radial Power Spectral Density",
+        save_path: str | Path | None = None,
+) -> plt.Figure:
+    """Log-log plot of radial PSD comparing synthetic vs true terrain frequencies."""
+    set_neurips_style()
+
+    if valid_mask is None:
+        valid_mask = np.isfinite(pred_dtm) & np.isfinite(gt_dtm)
+
+    # Impute missing values with mean to avoid FFT artifacts
+    p_fill = np.where(valid_mask, pred_dtm, np.nanmean(pred_dtm))
+    g_fill = np.where(valid_mask, gt_dtm, np.nanmean(gt_dtm))
+
+    def _get_radial_psd(z):
+        H, W = z.shape
+        z_detrend = z - np.mean(z)  # Remove DC offset
+        fft = np.fft.fft2(z_detrend)
+        psd_2d = np.abs(fft) ** 2 / (H * W)
+        psd_2d = np.fft.fftshift(psd_2d)
+
+        cy, cx = H // 2, W // 2
+        y, x = np.ogrid[-cy:H - cy, -cx:W - cx]
+        r = np.sqrt(x ** 2 + y ** 2).astype(int)
+
+        radial = np.bincount(r.ravel(), psd_2d.ravel())
+        counts = np.bincount(r.ravel())
+        valid_bins = counts > 0
+        radial[valid_bins] /= counts[valid_bins]
+        return radial
+
+    psd_pred = _get_radial_psd(p_fill)
+    psd_gt = _get_radial_psd(g_fill)
+
+    # Truncate to the Nyquist limit (min of half-dimensions)
+    max_freq = min(pred_dtm.shape[0] // 2, pred_dtm.shape[1] // 2)
+    freqs = np.arange(1, max_freq)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+
+    # Log-Log plotting
+    ax.loglog(freqs, psd_gt[1:max_freq], label="Ground Truth", color="black", linewidth=2)
+    ax.loglog(freqs, psd_pred[1:max_freq], label="Predicted (Flow-Matched)",
+              color=sns.color_palette("flare")[2], linewidth=1.5, linestyle="--")
+
+    # Reference slope typical for Mars (-2.5 to -3.0 power law)
+    ref_y = psd_gt[1] * (freqs / freqs[0]) ** -2.5
+    ax.loglog(freqs, ref_y, label="Reference $f^{-2.5}$", color="gray", linestyle=":", alpha=0.7)
+
+    ax.set_xlabel("Spatial Frequency (cycles/pixel)")
+    ax.set_ylabel("Power Density")
+    ax.set_title(title)
+    ax.legend(loc="lower left", frameon=True)
+    ax.grid(True, which="both", ls="--", alpha=0.3)
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig
+
+
+def plot_pareto_frontier(
+        metrics_per_step: dict[int, dict[str, dict[str, float]]],
+        primary_metric: str = "rmse",
+        title: str = "Compute vs. Accuracy Pareto Frontier",
+        save_path: str | Path | None = None,
+) -> plt.Figure:
+    """Plots Error against Number of Function Evaluations (NFE)."""
+    set_neurips_style()
+
+    step_counts = sorted(metrics_per_step.keys())
+    means = [metrics_per_step[s][primary_metric]["mean"] for s in step_counts]
+    stds = [metrics_per_step[s][primary_metric]["std"] for s in step_counts]
+
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    palette = sns.color_palette("flare", 3)
+
+    # Plot the curve
+    ax.plot(step_counts, means, marker="o", color=palette[1], linewidth=2, label="Mars DepthFM")
+    ax.fill_between(step_counts, np.array(means) - np.array(stds),
+                    np.array(means) + np.array(stds), alpha=0.2, color=palette[1])
+
+    # Annotate Pareto efficiency points
+    ax.annotate("Optimal 1-Step\nZero-Shot",
+                xy=(step_counts[0], means[0]),
+                xytext=(step_counts[0] + 2, means[0] + (max(means) - min(means)) * 0.1),
+                arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=5))
+
+    ax.set_xlabel("Compute Overhead (Number of Function Evaluations / NFE)")
+    ax.set_ylabel(f"{primary_metric.upper()} Error (Lower is Better)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(step_counts)
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig
+
+def plot_slope_error_map(
+        pred_dtm: np.ndarray,
+        gt_dtm: np.ndarray,
+        img: np.ndarray,
+        title: str = "Geomorphometric DoD (Slope Error)",
+        save_path: str | Path | None = None,
+) -> plt.Figure:
+    """Triptych: Ortho | GT Slope | Absolute Slope Error."""
+    set_neurips_style()
+
+    def _compute_slope(z):
+        dy, dx = np.gradient(z)
+        return np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
+
+    slope_pred = _compute_slope(pred_dtm)
+    slope_gt = _compute_slope(gt_dtm)
+    slope_error = np.abs(slope_pred - slope_gt)
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    # Input
+    if img.ndim == 3 and img.shape[-1] == 3:
+        axes[0].imshow(np.clip(img, 0, 1), interpolation="nearest")
+    else:
+        axes[0].imshow(img, cmap=CMAP_IMAGE, interpolation="nearest")
+    axes[0].set_title("Input Orthoimage")
+    axes[0].axis("off")
+
+    # GT Slope
+    vmax_s = np.nanpercentile(slope_gt, 98)
+    im_gt = axes[1].imshow(slope_gt, cmap="viridis", vmin=0, vmax=vmax_s)
+    axes[1].set_title("Ground Truth Slope ($\theta^\circ$)")
+    axes[1].axis("off")
+    fig.colorbar(im_gt, ax=axes[1], shrink=0.8, label="Degrees")
+
+    # Slope Error
+    vmax_e = np.nanpercentile(slope_error, 95)
+    im_err = axes[2].imshow(slope_error, cmap="magma", vmin=0, vmax=vmax_e)
+    axes[2].set_title("Absolute Slope Error ($|\Delta\theta|^\circ$)")
+    axes[2].axis("off")
+    fig.colorbar(im_err, ax=axes[2], shrink=0.8, label="Error Degrees")
+
+    if title:
+        fig.suptitle(title, fontweight="bold")
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig

@@ -162,6 +162,10 @@ def _vis_worker_main(task_queue: mp.SimpleQueue, staging_dir: str, rank: int):
         plot_elevation_scatter as _scatter,
         plot_lunar_lambert_comparison as _lambert,
         plot_patch_gallery as _gallery,
+        plot_uncertainty_map as _uncertainty,
+        plot_geomorphometric_analysis as geomorphometric,
+        plot_radial_psd_curves as _radial_psd,
+        plot_slope_error_map as _slope_error,
     )
     from depth_fm.metrics import affine_align as _align
 
@@ -265,6 +269,19 @@ def _vis_worker_main(task_queue: mp.SimpleQueue, staging_dir: str, rank: int):
             ax2.axis("off")
             _plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
+            _save(fig, tag, step)
+        elif t == "uncertainty_map":
+            fig = _uncertainty(d["pred"], d["var_dtm"], d["img"], title=d["title"])
+            _save(fig, tag, step)
+        elif t == "geomorph_analysis":
+            fig = geomorphometric(d["pred"], d["gt"], title=d["title"])
+            _save(fig, tag, step)
+        elif t == "radial_psd":
+            fig = _radial_psd(d["pred"], d["gt"], title=d["title"])
+            _save(fig, tag, step)
+
+        elif t == "slope_error_dod":
+            fig = _slope_error(d["pred"], d["gt"], d["img"], title=d["title"])
             _save(fig, tag, step)
 
         else:
@@ -719,6 +736,47 @@ class DepthFMLightningModule(L.LightningModule):
         return self.model.decode_from_latent(latent)
 
     @torch.no_grad()
+    def estimate_uncertainty(
+            self,
+            z_img: torch.Tensor,
+            num_samples: int = 10,
+            num_steps: int = 4
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Computes the epistemic uncertainty via stochastic ODE sampling.
+
+        Args:
+            z_img: (B, C, H, W) Encoded input orthoimage.
+            num_samples: Number of stochastic noise initializations (N).
+            num_steps: Euler integration steps per sample.
+
+        Returns:
+            mean_dtm: (B, 1, H, W) The expected topographic surface.
+            var_dtm: (B, 1, H, W) The pixel-wise epistemic variance.
+        """
+        self._trace(f"Starting epistemic uncertainty estimation with N={num_samples}")
+
+        dtm_hypotheses = []
+
+        for i in range(num_samples):
+            # _predict_depth automatically samples a new x_source ~ N(0, I)
+            # via the _get_x_source() method internally.
+            z_pred = self._predict_depth(z_img, num_steps=num_steps)
+
+            # Decode to physical pixel space
+            pred_pix = self._decode(z_pred)[:, 0]
+            dtm_hypotheses.append(pred_pix)
+
+        # Stack into shape: (N, B, 1, H, W)
+        dtm_tensor = torch.stack(dtm_hypotheses, dim=0)
+
+        # Calculate moments
+        mean_dtm = torch.mean(dtm_tensor, dim=0)
+        var_dtm = torch.var(dtm_tensor, dim=0, unbiased=True)
+
+        return mean_dtm, var_dtm
+
+    @torch.no_grad()
     def _predict_depth(self, z_img: torch.Tensor, num_steps: int = 1) -> torch.Tensor:
         x_source = self._get_x_source(z_img)
         z_t = x_source
@@ -1005,6 +1063,13 @@ class DepthFMLightningModule(L.LightningModule):
                 self._trace(f"validation_step batch {batch_idx}: finished flow_intermediates")
 
         if batch_idx == 0:
+            if self.current_epoch % max(flow_vis_every, 1) == 0:
+                self._trace(f"validation_step batch {batch_idx}: computing epistemic uncertainty")
+                _, var_dtm = self.estimate_uncertainty(z_img[:1], num_samples=8, num_steps=4)
+                var_dtm_np = var_dtm[0].float().cpu().numpy()
+            else:
+                var_dtm_np = None
+
             # Prepare vis snapshot — kept on rank 0, broadcast later
             img_np = batch["image"][0].float().cpu().numpy()
             if img_np.shape[0] == 3:
@@ -1025,6 +1090,7 @@ class DepthFMLightningModule(L.LightningModule):
                     {t: v[0] for t, v in flow_intermediates.items()}
                     if flow_intermediates is not None else None
                 ),
+                "var_dtm": var_dtm_np
             }
 
         self._trace(f"Exiting validation_step for batch {batch_idx}")
@@ -1036,7 +1102,8 @@ class DepthFMLightningModule(L.LightningModule):
         _FIXED_VAL_METRICS = [
             "rmse", "abs_rel", "si_log", "delta_1",
             "normal_angular_error", "slope_rmse",
-            "photo_consistency", "psd_ratio",
+            "dbf_score", "curvature_rmse", "ms_ssim_topo",
+            "photo_consistency", "psd_ratio", "patch_swd",
         ]
 
         self._trace("on_validation_epoch_end: Starting mandatory sync_dist collective calls")
@@ -1165,6 +1232,53 @@ class DepthFMLightningModule(L.LightningModule):
                     },
                 })
 
+            # 7: Epistemic Uncertainty map (conditional)
+            if vd.get("var_dtm") is not None:
+                tasks.append({
+                    "type": "uncertainty_map",
+                    "tag": "val/epistemic_uncertainty",
+                    "step": step,
+                    "data": {
+                        "img": vd["img"],
+                        "pred": vd["pred"],
+                        "var_dtm": vd["var_dtm"],
+                        "title": f"Epistemic Variance (N=8, step {step})",
+                    },
+                })
+
+            # 8: Geomorphometric Analysis Triptych
+            tasks.append({
+                "type": "geomorph_analysis",
+                "tag": "val/geomorph_analysis",
+                "step": step,
+                "data": {
+                    "pred": vd["pred"], "gt": vd["gt"],
+                    "title": f"Geomorphometric Analysis: Edges & Curvature (step {step})",
+                },
+            })
+
+            # 9. Radial PSD Curve
+            tasks.append({
+                "type": "radial_psd",
+                "tag": "val/radial_psd",
+                "step": step,
+                "data": {
+                    "pred": vd["pred"], "gt": vd["gt"],
+                    "title": f"Spectral Synthesis (step {step})",
+                },
+            })
+
+            # 10. Geomorphometric DoD (Slope Error)
+            tasks.append({
+                "type": "slope_error_dod",
+                "tag": "val/slope_error_dod",
+                "step": step,
+                "data": {
+                    "pred": vd["pred"], "gt": vd["gt"], "img": vd["img"],
+                    "title": f"Slope Error DoD (step {step})",
+                },
+            })
+
             # ── Distribute tasks via round-robin ──
             # For multi-GPU: broadcast vis data so non-rank-0 workers
             # have the numpy arrays they need.
@@ -1181,6 +1295,8 @@ class DepthFMLightningModule(L.LightningModule):
                     broadcast_data["sun_vector"] = vd["sun_vector"]
                 if vd.get("flow_intermediates") is not None:
                     broadcast_data["flow_intermediates"] = vd["flow_intermediates"]
+                if vd.get("var_dtm") is not None:
+                    broadcast_data["var_dtm"] = vd["var_dtm"]
 
                 # On non-rank-0: create template dict with correct shapes
                 # so the receiver side of _broadcast_numpy_dict knows the
@@ -1207,6 +1323,8 @@ class DepthFMLightningModule(L.LightningModule):
                             td["sun_vector"] = received["sun_vector"]
                         if "intermediates" in td and "flow_intermediates" in received:
                             td["intermediates"] = received["flow_intermediates"]
+                        if "var_dtm" in td and "var_dtm" in received:
+                            td["var_dtm"] = received["var_dtm"]
 
                 self._trace("on_validation_epoch_end: broadcast complete")
 
@@ -1335,6 +1453,7 @@ class DepthFMLightningModule(L.LightningModule):
         _FIXED_TEST_METRICS = [
             "rmse", "abs_rel", "si_log", "delta_1",
             "normal_angular_error", "slope_rmse",
+            "dbf_score", "curvature_rmse", "ms_ssim_topo",
             "photo_consistency", "psd_ratio",
         ]
 
