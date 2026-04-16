@@ -65,15 +65,33 @@ training:
   max_steps: 1000
   show_train_vis: true
 
-  learning_rate: 2.0e-4
-  weight_decay: 0.01
-  lr_scheduler: "cosine"
-  lr_warmup_steps: 50
-
   optimizer: "adamw"
-  adam_beta1: 0.9
-  adam_beta2: 0.999
-  adam_epsilon: 1.0e-8
+
+  adamw:
+    learning_rate: 2.0e-4
+    weight_decay: 0.01
+
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 500
+  shampoo:
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+
+    shampoo_max_dim: 4096              # Max tensor block size (reduce to 2048 if VRAM OOMs)
+    shampoo_freq: 100                  # Compute inverse roots every 100 steps
+    shampoo_start: 100                 # Delay Shampoo until step 100
+
+    lr_scheduler: "constant"           # Ensure sustained exploration
+    lr_warmup_steps: 500
+
   max_grad_norm: 1.0
   mixed_precision: "bf16"
 
@@ -126,7 +144,7 @@ training:
   resume_from: null
 
   use_ema: true
-  ema_decay: 0.99
+  ema_decay: 0.9999
 
   # 128 cores / 4 GPUs = 32 workers per process
   num_workers: 24
