@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Union
 
 import matplotlib as mpl
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+import torch
+
+from depth_fm.losses import PhotoclinometricLoss
 
 logger = logging.getLogger(__name__)
 
@@ -765,99 +769,168 @@ def plot_hillshade_comparison(
     return fig
 
 
-def compute_lunar_lambert_render(
-        elevation: np.ndarray,
-        sun_vector: np.ndarray,
-        intensity: float = 1.0,
-        ambient: float = 0.0,
-        lunar_lambert_weight: float = 0.5,
-) -> np.ndarray:
-    """Compute a physically accurate Lunar-Lambert render for planetary surfaces."""
-    normals = compute_surface_normals(elevation)
-
-    # 1. Cosine of incidence angle (dot product of normals and sun_vector)
-    cos_i = np.sum(normals * sun_vector, axis=-1)
-
-    # Clamp shadows to strictly >= 0 (light doesn't scatter from behind)
-    cos_i_clamped = np.clip(cos_i, 0.0, None)
-
-    # 2. Cosine of emission angle (Z-normal for nadir view)
-    cos_e = normals[..., 2]
-
-    # 3. Pure Photometric Components
-    lambert_comp = cos_i_clamped
-    ls_comp = cos_i_clamped / (cos_i_clamped + cos_e + 1e-6)
-
-    # 4. Blend using the Lunar-Lambert weight
-    L = lunar_lambert_weight
-    render_blend = (L * lambert_comp) + ((1.0 - L) * ls_comp)
-
-    # 5. Apply Scene Intensity and Ambient Light
-    render = (render_blend * intensity) + ambient
-
-    return np.clip(render, 0.0, 1.0).astype(np.float32)
-
-
+@torch.no_grad()
 def plot_lunar_lambert_comparison(
-        pred_dtm: np.ndarray,
-        gt_dtm: np.ndarray,
-        sun_vector: np.ndarray,
-        intensity: float = 1.0,
-        ambient: float = 0.0,
-        lunar_lambert_weight: float = 0.5,
+        pred_dtm: Union[torch.Tensor, np.ndarray],
+        gt_dtm: Union[torch.Tensor, np.ndarray],
+        real_ortho: Union[torch.Tensor, np.ndarray],
+        sun_vector: Union[torch.Tensor, np.ndarray],
+        intensity: Union[torch.Tensor, np.ndarray, float],
+        ambient: Union[torch.Tensor, np.ndarray, float],
+        loss_fn: "PhotoclinometricLoss",
+        valid_mask: Union[torch.Tensor, np.ndarray, None] = None,
         title: str = "",
-        save_path: str | Path | None = None,
+        save_path: Union[str, Path, None] = None,
 ) -> plt.Figure:
-    """Side-by-side Lunar-Lambert shading of predicted vs GT DTMs using actual physics."""
-    # Assuming set_neurips_style() is defined elsewhere in your codebase
-    # set_neurips_style()
+    """
+    Type-Agnostic PyTorch Lunar-Lambert diagnostic.
+    Seamlessly handles both NumPy arrays and PyTorch tensors, automatically
+    expanding shapes to (B, C, H, W) for the loss function's internal math.
+    """
 
-    from depth_fm.metrics import affine_align
-    pred_aligned, _, _ = affine_align(pred_dtm, gt_dtm)
+    # Extract the device the loss function is currently sitting on
+    try:
+        device = loss_fn.lunar_lambert_logit.device
+    except AttributeError:
+        device = torch.device("cpu")
 
-    # Fill NaN for gradient computation
-    pred_filled = np.nan_to_num(pred_aligned, nan=np.nanmean(pred_aligned))
-    gt_filled = np.nan_to_num(gt_dtm, nan=np.nanmean(gt_dtm))
+    def _ensure_tensor(x, is_spatial=False) -> torch.Tensor | None:
+        """Casts NumPy/Scalars to Tensors and enforces (B, C, H, W) dimensions."""
+        if x is None:
+            return None
 
-    # Pass the weight into the render function
-    render_pred = compute_lunar_lambert_render(
-        pred_filled, sun_vector, intensity, ambient, lunar_lambert_weight
+        # 1. Cast to PyTorch FloatTensor
+        if not isinstance(x, torch.Tensor):
+            if isinstance(x, (float, int)):
+                t = torch.tensor([x], dtype=torch.float32)
+            else:
+                t = torch.from_numpy(np.array(x)).float()
+        else:
+            t = x.float()  # Ensure float32 for safety
+
+        # 2. Fix Spatial Dimensions -> strictly (B, C, H, W)
+        if is_spatial:
+            # Catch standard image arrays (H, W, C) where C is 1, 3, or 4
+            if t.dim() == 3 and t.shape[-1] in [1, 3, 4]:
+                t = t.permute(2, 0, 1)  # -> (C, H, W)
+
+            # Add missing Batch or Channel dims
+            if t.dim() == 2:  # (H, W) -> (1, 1, H, W)
+                t = t.unsqueeze(0).unsqueeze(0)
+            elif t.dim() == 3:  # (C, H, W) -> (1, C, H, W)
+                t = t.unsqueeze(0)
+
+            # Catch stray (B, H, W, C) if it somehow slipped through
+            if t.dim() == 4 and t.shape[-1] in [1, 3, 4] and t.shape[1] not in [1, 3, 4]:
+                t = t.permute(0, 3, 1, 2)
+
+        # 3. Fix Parameter Dimensions
+        else:
+            if t.dim() == 1 and t.shape[0] == 3:  # Sun vector (3,) -> (1, 3)
+                t = t.unsqueeze(0)
+            elif t.dim() == 0:  # Scalar -> (1,)
+                t = t.unsqueeze(0)
+
+        return t.to(device)
+    # --- Cast all inputs to standardized Tensors ---
+    pred_dtm_t = _ensure_tensor(pred_dtm, is_spatial=True)
+    gt_dtm_t = _ensure_tensor(gt_dtm, is_spatial=True)
+    real_ortho_t = _ensure_tensor(real_ortho, is_spatial=True)
+    valid_mask_t = _ensure_tensor(valid_mask, is_spatial=True)
+
+    sun_vector_t = _ensure_tensor(sun_vector, is_spatial=False)
+    intensity_t = _ensure_tensor(intensity, is_spatial=False)
+    ambient_t = _ensure_tensor(ambient, is_spatial=False)
+
+    # Fallback mask if none provided
+    if valid_mask_t is None:
+        valid_mask_t = torch.ones_like(gt_dtm_t)
+
+    mask_bool = (valid_mask_t > 0.5).squeeze()
+
+    # 1. Convert real ortho to grayscale for SSIM comparison
+    if real_ortho_t.shape[1] == 3:
+        ortho_gray = real_ortho_t.mean(dim=1, keepdim=True)
+    else:
+        ortho_gray = real_ortho_t
+
+    # 2. Fast GPU-Native Affine Alignment for the DTM
+    p_valid = pred_dtm_t[valid_mask_t > 0.5]
+    g_valid = gt_dtm_t[valid_mask_t > 0.5]
+    if p_valid.numel() > 10:
+        A = torch.stack([p_valid, torch.ones_like(p_valid)], dim=1)
+        res = torch.linalg.lstsq(A, g_valid).solution
+        pred_aligned = (pred_dtm_t * res[0]) + res[1]
+    else:
+        pred_aligned = pred_dtm_t
+
+    # 3. Render using the exact loss function math
+    render_pred, _ = loss_fn.render_from_depth(pred_aligned, sun_vector_t, intensity_t, ambient_t)
+    render_gt, _ = loss_fn.render_from_depth(gt_dtm_t, sun_vector_t, intensity_t, ambient_t)
+
+    # 4. Compute Z-Scores (What the SSIM actually minimizes)
+    z_pred = loss_fn._zscore(render_pred, valid_mask_t)
+    z_ortho = loss_fn._zscore(ortho_gray, valid_mask_t)
+
+    # --- Move to CPU for Matplotlib ---
+    def prep_for_display(t: torch.Tensor, normalize_vis: bool = False) -> np.ndarray:
+        arr = t.squeeze().cpu().numpy().astype(np.float32)
+        mask_np = mask_bool.cpu().numpy()
+
+        if normalize_vis:
+            valid_pixels = arr[mask_np]
+            lo, hi = (valid_pixels.min(), valid_pixels.max()) if valid_pixels.size > 0 else (arr.min(), arr.max())
+            hi = max(hi, lo + 1e-6)
+            arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+        arr[~mask_np] = np.nan
+        return arr
+
+    r_ortho_np = prep_for_display(ortho_gray, normalize_vis=True)
+    r_pred_np = prep_for_display(render_pred, normalize_vis=True)
+    r_gt_np = prep_for_display(render_gt, normalize_vis=True)
+    z_pred_np = prep_for_display(z_pred, normalize_vis=False)
+    z_ortho_np = prep_for_display(z_ortho, normalize_vis=False)
+
+    # 5. The TRUE Structural Error Map the network feels
+    loss_map = np.abs(z_pred_np - z_ortho_np)
+
+    # --- Plotting ---
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4.5))
+    L_weight = loss_fn.lunar_lambert_weight.item()
+
+    # Panel 1: Real Ortho (The Target)
+    axes[0].imshow(r_ortho_np, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+    axes[0].set_title("Real Ortho (Target)")
+
+    # Panel 2: Predicted Render
+    axes[1].imshow(r_pred_np, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+    axes[1].set_title(f"Predicted Render (L={L_weight:.2f})")
+
+    # Panel 3: GT Render (Pure Topography Ideal)
+    axes[2].imshow(r_gt_np, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+    axes[2].set_title(f"GT Render (L={L_weight:.2f})")
+
+    # Panel 4: True SSIM Loss Map (Pred vs Ortho)
+    im4 = axes[3].imshow(loss_map, cmap="inferno", vmin=0, vmax=2.0, interpolation="nearest")
+    axes[3].set_title("Actual Loss Penalty ($|Z_{pred} - Z_{ortho}|$)")
+    fig.colorbar(im4, ax=axes[3], shrink=0.8, label="High SSIM Penalty")
+
+    for ax in axes:
+        ax.axis("off")
+
+    sv = sun_vector_t.squeeze().cpu().numpy()
+    footer_text = (
+        f"Sun: [{sv[0]:.2f}, {sv[1]:.2f}, {sv[2]:.2f}] | "
+        f"Intensity: {intensity_t.item():.2f} | Ambient: {ambient_t.item():.2f} | LL-Weight: {L_weight:.3f}"
     )
-    render_gt = compute_lunar_lambert_render(
-        gt_filled, sun_vector, intensity, ambient, lunar_lambert_weight
-    )
-
-    # Difference: >0.5 = predicted brighter, <0.5 = GT brighter
-    render_diff = (render_pred - render_gt + 1.0) / 2.0
-
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
-
-    axes[0].imshow(render_pred, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
-    axes[0].set_title(f"Predicted Render (L={lunar_lambert_weight:.2f})")
-    axes[0].axis("off")
-
-    axes[1].imshow(render_gt, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
-    axes[1].set_title(f"GT Render (L={lunar_lambert_weight:.2f})")
-    axes[1].axis("off")
-
-    im = axes[2].imshow(render_diff, cmap="RdBu_r", vmin=0.3, vmax=0.7, interpolation="nearest")
-    axes[2].set_title("Render difference")
-    axes[2].axis("off")
-    fig.colorbar(im, ax=axes[2], shrink=0.8, label="Pred brighter ← → GT brighter")
-
-    # Include the Lunar-Lambert weight in the footer stats
-    sun_str = f"Sun vector: [{sun_vector[0]:.2f}, {sun_vector[1]:.2f}, {sun_vector[2]:.2f}]"
-    fig.text(
-        0.5, 0.01,
-        f"{sun_str} | Intensity: {intensity:.2f} | Ambient: {ambient:.2f} | LL-Weight: {lunar_lambert_weight:.2f}",
-        ha="center", fontsize=8, style="italic", color="gray",
-    )
+    fig.text(0.5, 0.01, footer_text, ha="center", fontsize=10, style="italic", color="gray")
 
     if title:
-        fig.suptitle(title, fontweight="bold")
-
+        fig.suptitle(title, fontweight="bold", fontsize=14)
     if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
+        fig.savefig(save_path, bbox_inches="tight", dpi=150, facecolor="white")
+
     return fig
 
 
@@ -958,6 +1031,7 @@ def plot_timestep_ablation(
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
     return fig
+
 
 def plot_uncertainty_map(
         pred_dtm: np.ndarray,
@@ -1177,6 +1251,7 @@ def plot_pareto_frontier(
         fig.savefig(save_path, bbox_inches="tight")
     return fig
 
+
 def plot_slope_error_map(
         pred_dtm: np.ndarray,
         gt_dtm: np.ndarray,
@@ -1189,7 +1264,7 @@ def plot_slope_error_map(
 
     def _compute_slope(z):
         dy, dx = np.gradient(z)
-        return np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
+        return np.degrees(np.arctan(np.sqrt(dx ** 2 + dy ** 2)))
 
     slope_pred = _compute_slope(pred_dtm)
     slope_gt = _compute_slope(gt_dtm)
@@ -1208,14 +1283,14 @@ def plot_slope_error_map(
     # GT Slope
     vmax_s = np.nanpercentile(slope_gt, 98)
     im_gt = axes[1].imshow(slope_gt, cmap="viridis", vmin=0, vmax=vmax_s)
-    axes[1].set_title("Ground Truth Slope ($\theta^\circ$)")
+    axes[1].set_title(r"Ground Truth Slope ($\theta^\circ$)")
     axes[1].axis("off")
     fig.colorbar(im_gt, ax=axes[1], shrink=0.8, label="Degrees")
 
     # Slope Error
     vmax_e = np.nanpercentile(slope_error, 95)
     im_err = axes[2].imshow(slope_error, cmap="magma", vmin=0, vmax=vmax_e)
-    axes[2].set_title("Absolute Slope Error ($|\Delta\theta|^\circ$)")
+    axes[2].set_title(r"Absolute Slope Error ($|\Delta\theta|^\circ$)")
     axes[2].axis("off")
     fig.colorbar(im_err, ax=axes[2], shrink=0.8, label="Error Degrees")
 

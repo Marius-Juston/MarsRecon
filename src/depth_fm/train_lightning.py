@@ -28,6 +28,7 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import math
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -35,6 +36,7 @@ from pathlib import Path
 from matplotlib.figure import Figure
 
 from depth_fm.litdata_datamodule import _build_litdata_loaders
+from depth_fm.losses import PhotoclinometricLoss
 
 # ---------------------------------------------------------------------------
 # GLOBAL GDAL/IO OPTIMIZATIONS (For 256-Core / NVMe setups)
@@ -590,123 +592,206 @@ def visualize_loss_physics(
         dataloader,
         output_dir: Path,
         num_samples: int = 6,
-        lunar_lambert_weight: float = 0.5
+        loss_fn: "PhotoclinometricLoss | None" = None,
+        lunar_lambert_weight_override: float | None = None,
 ):
-    """
-    Visualizes the internal physics of the Photoclinometric Loss.
-    Layout: [Real Ortho] | [GT DTM] | [Surface Normals] | [Lunar-Lambert Render] | [Lunar-Lambert GT Check]
-    """
-    logger.info(f"Generating Loss Physics visualization for {num_samples} samples (L={lunar_lambert_weight:.2f})...")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Visualises the internal physics of the Photoclinometric Loss.
 
+    Uses the actual `PhotoclinometricLoss` class methods (`surface_normals`,
+    `render_from_depth`, `_zscore`) so the visualisation is guaranteed to
+    match exactly what the training loss computes. If the render ever
+    changes, this figure updates automatically.
+
+    Layout (6 columns):
+        [Real Ortho] [GT DTM] [Normals] [Render (pred params)]
+        [Render (GT-fit params)] [z-SSIM comparison strip]
+
+    The last column shows, side-by-side, the z-score normalised render
+    and z-score normalised ortho — i.e. exactly what the SSIM term of
+    the loss operates on. If those two look structurally similar, the
+    loss is well-behaved regardless of any global luminance mismatch
+    in the raw render columns.
+
+    Args:
+        dataloader: DataLoader yielding batches with keys
+            {image, dtm, confidence, sun_vector, intensity, ambient}.
+        output_dir: Where to save the figure.
+        num_samples: How many samples to render.
+        loss_fn: Optional trained `PhotoclinometricLoss` instance. If
+            None, a fresh one is created (L initialised to 0.5).
+        lunar_lambert_weight_override: If set, temporarily forces the
+            loss's Lunar-Lambert blend weight to this value for the
+            visualisation only. Useful for exploring what different
+            L values look like (the trained weight is restored after).
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Sobel filters for surface normals
-    sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=device) / 8.0
-    sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=device) / 8.0
-    kx = sobel_x.view(1, 1, 3, 3)
-    ky = sobel_y.view(1, 1, 3, 3)
+    # Get or create a loss instance (the viz uses its methods directly)
+    if loss_fn is None:
+        loss_fn = PhotoclinometricLoss()
+    loss_fn = loss_fn.to(device).eval()
 
-    n_cols = 5
+    # Optionally override the learned L for exploratory viz
+    saved_logit = None
+    if lunar_lambert_weight_override is not None:
+        w = float(min(max(lunar_lambert_weight_override, 1e-4), 1.0 - 1e-4))
+        saved_logit = loss_fn.lunar_lambert_logit.data.clone()
+        loss_fn.lunar_lambert_logit.data = torch.tensor(
+            math.log(w / (1.0 - w)), device=device, dtype=loss_fn.lunar_lambert_logit.dtype,
+        )
+
+    L_used = float(loss_fn.lunar_lambert_weight.item())
+    logger.info(f"Generating Loss Physics visualization for {num_samples} samples (L={L_used:.2f})...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _to_gray_display(x: torch.Tensor, mask: np.ndarray | None = None) -> np.ndarray:
+        """Percentile-stretch a (1,1,H,W) or (1,H,W) tensor to [0,1] for display.
+
+        Each panel is stretched independently so structural similarity is
+        visible regardless of absolute luminance offset. That is purely
+        a display choice; the loss sees raw / z-scored values.
+        """
+        arr = x.detach().cpu().numpy().squeeze()
+        if mask is not None:
+            valid = arr[mask]
+            if valid.size > 0:
+                lo, hi = valid.min(), valid.max()
+            else:
+                lo, hi = float(arr.min()), float(arr.max())
+        else:
+            lo, hi = arr.min(), arr.max()
+        if hi - lo < 1e-6:
+            hi = lo + 1e-6
+        clipped = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+        if mask is not None:
+            clipped[~mask] = np.nan
+
+        return clipped
+
+    n_cols = 6
     scale = 4
-    fig, axes = plt.subplots(num_samples, n_cols, figsize=(n_cols * scale, scale * num_samples))
-    plt.subplots_adjust(wspace=0.1, hspace=0.1)
 
-    count = 0
-    with tqdm(total=num_samples) as pbar:
-        for batch in dataloader:
-            if count >= num_samples:
-                break
-            B = batch["image"].shape[0]
-            for i in range(B):
+    width_ratios = [1, 1, 1, 1, 1, 3.1]
+
+    fig_width = sum(width_ratios) * scale * 0.85  # 0.85 multiplier prevents the figure from getting too massive
+    fig_height = scale * num_samples
+
+    fig, axes = plt.subplots(num_samples, n_cols, figsize=(fig_width, fig_height),
+                             gridspec_kw={'width_ratios': width_ratios})
+    if num_samples == 1:
+        axes = axes[None, :]
+    plt.subplots_adjust(wspace=0.08, hspace=0.08)
+
+    try:
+        count = 0
+        with tqdm(total=num_samples) as pbar:
+            for batch in dataloader:
                 if count >= num_samples:
                     break
+                B = batch["image"].shape[0]
+                for i in range(B):
+                    if count >= num_samples:
+                        break
 
-                # Extract inputs
-                img = batch["image"][i: i + 1].to(device)
-                dtm = batch["dtm"][i: i + 1, :1].to(device)
-                mask = batch["confidence"][i: i + 1].to(device)
-                sun_vec = batch["sun_vector"][i: i + 1].to(device)
-                intensity = batch["intensity"][i: i + 1].to(device)
-                ambient = batch["ambient"][i: i + 1].to(device)
+                    # --- Extract inputs ---
+                    img = batch["image"][i: i + 1].to(device).float()
+                    dtm = batch["dtm"][i: i + 1, :1].to(device).float()
+                    mask = batch["confidence"][i: i + 1].to(device).float()
+                    sun_vec = batch["sun_vector"][i: i + 1].to(device).float()
+                    intensity = batch["intensity"][i: i + 1].to(device).float()
+                    ambient = batch["ambient"][i: i + 1].to(device).float()
 
-                # Estimate GT parameters via OLS
-                sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
+                    ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
 
-                ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
-                _, _, H, W = dtm.shape
-                spatial_scale = max(H, W) / 2.0
+                    # --- Estimate GT exposure/sun via OLS (for sanity check column) ---
+                    sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
+                    # OLS returns (3,), scalar, scalar — reshape for render_from_depth
+                    sun_vec_gt = sun_vec_gt.view(1, 3)
+                    intensity_gt = intensity_gt.view(1)
+                    ambient_gt = ambient_gt.view(1)
 
-                # Compute Normals
-                padded_dtm = F.pad(dtm, (1, 1, 1, 1), mode="replicate")
-                n_x = -F.conv2d(padded_dtm, kx) * spatial_scale
-                n_y = -F.conv2d(padded_dtm, ky) * spatial_scale
-                n_z = torch.ones_like(n_x)
-                normals = F.normalize(torch.cat([n_x, n_y, n_z], dim=1), p=2, dim=1)
+                    # --- Use the ACTUAL loss class methods ---
+                    render, normals = loss_fn.render_from_depth(
+                        dtm, sun_vec, intensity, ambient,
+                    )
+                    render_gt, _ = loss_fn.render_from_depth(
+                        dtm, sun_vec_gt, intensity_gt, ambient_gt,
+                    )
 
-                # Emission angle is simply the Z-normal for a top-down (Nadir) satellite view
-                cos_e = normals[:, 2:3, :, :]
+                    # --- z-scored versions: what SSIM actually sees ---
+                    render_z = loss_fn._zscore(render, mask)
+                    ortho_z = loss_fn._zscore(ortho_gray, mask)
 
-                # --- 1. LUNAR-LAMBERT RENDER (GT Parameters) ---
-                cos_i_gt = torch.sum(normals * sun_vec_gt.view(1, 3, 1, 1), dim=1, keepdim=True)
-                cos_i_clamped_gt = torch.clamp(cos_i_gt, min=0.0)
+                    # --- Displays ---
+                    mask_np = mask[0, 0].cpu().numpy().astype(bool)
 
-                lambert_comp_gt = cos_i_clamped_gt
-                ls_comp_gt = cos_i_clamped_gt / (cos_i_clamped_gt + cos_e + 1e-6)
+                    img_disp = _to_gray_display(ortho_gray, mask_np)
+                    dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                    normals_disp = np.clip(
+                        (normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0, 0.0, 1.0,
+                    )
+                    render_disp = _to_gray_display(render, mask_np)
+                    render_disp_gt = _to_gray_display(render_gt, mask_np)
 
-                render_blend_gt = (lunar_lambert_weight * lambert_comp_gt) + ((1.0 - lunar_lambert_weight) * ls_comp_gt)
-                render_gt = (render_blend_gt * intensity_gt) + ambient_gt
+                    # Side-by-side z-scored render | z-scored ortho
+                    # (clip to ±3 for display, then stretch to [0,1])
+                    def _zdisp(z):
+                        a = z[0, 0].cpu().numpy()
+                        a = np.clip(a, -3.0, 3.0)
+                        return (a + 3.0) / 6.0
 
-                # --- 2. LUNAR-LAMBERT RENDER (Batch Parameters) ---
-                cos_i = torch.sum(normals * sun_vec.view(1, 3, 1, 1), dim=1, keepdim=True)
-                cos_i_clamped = torch.clamp(cos_i, min=0.0)
+                    z_render_img = _zdisp(render_z)
+                    z_ortho_img = _zdisp(ortho_z)
+                    # Stack horizontally with a thin separator
+                    residual = np.abs(render_z[0, 0].cpu().numpy() - ortho_z[0, 0].cpu().numpy())
+                    # Clip residual for display (values > 2.0 represent significant structural mismatch)
+                    residual_disp = np.clip(residual / 2.0, 0.0, 1.0)
 
-                lambert_comp = cos_i_clamped
-                ls_comp = cos_i_clamped / (cos_i_clamped + cos_e + 1e-6)
+                    # Mask invalid regions to background color
+                    z_render_img[~mask_np] = np.nan
+                    z_ortho_img[~mask_np] = np.nan
+                    residual_disp[~mask_np] = np.nan
 
-                render_blend = (lunar_lambert_weight * lambert_comp) + ((1.0 - lunar_lambert_weight) * ls_comp)
-                render = (render_blend * intensity) + ambient
+                    # Stack horizontally: Render | Ortho | Residual
+                    sep = np.ones((z_render_img.shape[0], 4)) * np.nan
+                    z_combined = np.concatenate([z_render_img, sep, z_ortho_img, sep, residual_disp], axis=1)
 
-                # --- 3. CLIPPING & MASKING ---
-                img_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
-                dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
-                mask_np = mask[0, 0].cpu().numpy().astype(bool)
-                normals_disp = np.clip((normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0, 0.0, 1.0)
-                render_disp = np.clip(render[0, 0].cpu().numpy(), 0.0, 1.0)
-                render_disp_gt = np.clip(render_gt[0, 0].cpu().numpy(), 0.0, 1.0)
+                    # --- Plotting ---
+                    axes[count, 0].imshow(img_disp, cmap="gray", vmin=0, vmax=1)
+                    axes[count, 1].imshow(dtm_disp, cmap="terrain")
+                    axes[count, 2].imshow(normals_disp)
+                    axes[count, 3].imshow(render_disp, cmap="gray", vmin=0, vmax=1)
+                    axes[count, 4].imshow(render_disp_gt, cmap="gray", vmin=0, vmax=1)
+                    axes[count, 5].imshow(z_combined, cmap="inferno", vmin=0, vmax=1)  # Inferno highlights errors well
 
-                # for arr in (img_disp, dtm_disp, render_disp, render_disp_gt):
-                #     arr[~mask_np] = np.nan
-                # normals_disp[~mask_np] = np.nan
+                    for ax in axes[count]:
+                        ax.axis("off")
 
-                # --- 4. PLOTTING ---
-                axes[count, 0].imshow(img_disp, cmap="gray", vmin=0, vmax=1)
-                axes[count, 1].imshow(dtm_disp, cmap="terrain")
-                axes[count, 2].imshow(normals_disp)
-                axes[count, 3].imshow(render_disp, cmap="gray", vmin=0, vmax=1)
-                axes[count, 4].imshow(render_disp_gt, cmap="gray", vmin=0, vmax=1)
+                    if count == 0:
+                        titles = [
+                            "Real Ortho (Gray)",
+                            "GT DTM",
+                            "Surface Normals",
+                            f"LL Render (L={L_used:.2f}, pred params)",
+                            "LL Render (OLS-fit params)",
+                            "z-SSIM view: Render | Ortho | $|Z_r - Z_o|$",
+                        ]
+                        for ax, t in zip(axes[0], titles):
+                            ax.set_title(t, fontsize=11)
 
-                for ax in axes[count]:
-                    ax.axis("off")
+                    count += 1
+                    pbar.update()
 
-                if count == 0:
-                    titles = [
-                        "Real Ortho (Gray)",
-                        "GT DTM",
-                        "Surface Normals",
-                        f"Lunar-Lambert Render (L={lunar_lambert_weight:.2f})",
-                        f"Lunar-Lambert GT Check"
-                    ]
-                    for ax, t in zip(axes[0], titles):
-                        ax.set_title(t)
+        save_path = output_dir / "loss_physics_inspection.png"
+        save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
+        plt.close(fig)
+        logger.info(f"Loss physics visualization saved to: {save_path}")
 
-                count += 1
-                pbar.update()
-
-    save_path = output_dir / "loss_physics_inspection.png"
-    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
-    plt.close(fig)
-    logger.info(f"Loss physics visualization saved to: {save_path}")
+    finally:
+        # Restore the original Lunar-Lambert weight if we overrode it
+        if saved_logit is not None:
+            loss_fn.lunar_lambert_logit.data = saved_logit
 
 
 @torch.no_grad()
@@ -1465,7 +1550,6 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
         logger.warning("Test aggregator not found in memory (run was skipped). Skipping patch analysis plotting.")
         return
 
-
     worst = aggregator.worst_k("rmse", k=5)
     best = aggregator.best_k("rmse", k=5)
     logger.info("Worst 5 test patches: %s", worst)
@@ -1551,6 +1635,7 @@ def dataload_switch_test(config, args):
             for b in tqdm(loader):
                 pass
 
+
 def hash_config(config: OmegaConf):
     raw = json.dumps(OmegaConf.to_container(config, resolve=True), sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:4]
@@ -1594,7 +1679,8 @@ def main():
     is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
     config_hash = hash_config(config)
 
-    config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type", "depthfm") / config_hash
+    config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type",
+                                                                                     "depthfm") / config_hash
 
     # Log hardware info
     if is_global_zero:

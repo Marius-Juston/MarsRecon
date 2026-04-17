@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import sys
 import time
 import traceback
@@ -100,7 +101,7 @@ import torch.nn.functional as F
 import wandb
 from lightning.pytorch.callbacks import EMAWeightAveraging
 
-from depth_fm.losses import CombinedLoss
+from depth_fm.losses import CombinedLoss, PhotoclinometricLoss
 from depth_fm.metrics import affine_align
 from depth_fm.metrics import compute_depth_metrics, compute_photo_consistency, MetricsAggregator
 from depth_fm.model import build_model
@@ -212,12 +213,37 @@ def _vis_worker_main(task_queue: mp.SimpleQueue, staging_dir: str, rank: int):
 
         elif t == "lunar_lambert":
             pred_a, _, _ = _align(d["pred"], d["gt"])
+
+            pred_t = torch.from_numpy(pred_a).float().unsqueeze(0).unsqueeze(0)
+            gt_t = torch.from_numpy(d["gt"]).float().unsqueeze(0).unsqueeze(0)
+
+            sun_t = torch.from_numpy(d["sun_vector"]).float().unsqueeze(0)
+
+            int_t = torch.tensor([d["intensity"]], dtype=torch.float32)
+            amb_t = torch.tensor([d["ambient"]], dtype=torch.float32)
+
+            mask_disp = d.get("mask_disp")
+            if mask_disp is not None:
+                mask_t = torch.from_numpy(mask_disp).float().unsqueeze(0).unsqueeze(0)
+            else:
+                mask_t = torch.ones_like(gt_t)
+
+            local_loss = PhotoclinometricLoss().eval()
+
+            w = float(min(max(d["lunar_lambert_weight"], 1e-4), 1.0 - 1e-4))
+            local_loss.lunar_lambert_logit.data = torch.tensor(
+                math.log(w / (1.0 - w)), dtype=local_loss.lunar_lambert_logit.dtype
+            )
+
             fig = _lambert(
-                pred_a, d["gt"],
-                sun_vector=d["sun_vector"],
-                intensity=d["intensity"],
-                ambient=d["ambient"],
-                lunar_lambert_weight=d["lunar_lambert_weight"],
+                pred_dtm=pred_t,
+                gt_dtm=gt_t,
+                real_ortho=d["img"],
+                sun_vector=sun_t,
+                intensity=int_t,
+                ambient=amb_t,
+                loss_fn=local_loss,
+                valid_mask=mask_t,
                 title=d["title"],
             )
             _save(fig, tag, step)
@@ -1208,17 +1234,32 @@ class DepthFMLightningModule(L.LightningModule):
             })
 
             # 5: Lunar Lambert (conditional on sun data)
+            # 5: Lunar Lambert (conditional on sun data)
             if vd.get("has_sun") and vd.get("sun_vector") is not None:
+                # Safely extract the learned weight scalar from the live model
+                try:
+                    ll_weight = float(self.loss_fn.photo_loss.lunar_lambert_weight.item())
+                except AttributeError:
+                    logger.exception("Photo Loss has no lunar_lambert_weight or has not been initialized yet")
+                    ll_weight = 0.5  # Fallback if photo_loss isn't initialized yet
+
+                # If you have confidence maps, extract the valid mask for the render
+                conf = self._val_vis_data.get("confidence")  # Or wherever you store it
+                mask_disp = conf[0] if conf is not None else None
+
                 tasks.append({
                     "type": "lunar_lambert",
                     "tag": "val/lambertian_render",
                     "step": step,
                     "data": {
-                        "pred": vd["pred"], "gt": vd["gt"],
+                        "pred": vd["pred"],
+                        "gt": vd["gt"],
+                        "img": vd["img"],
                         "sun_vector": vd["sun_vector"],
                         "intensity": vd["intensity"],
                         "ambient": vd["ambient"],
-                        "lunar_lambert_weight": 0.5,
+                        "mask_disp": mask_disp,
+                        "lunar_lambert_weight": ll_weight,
                         "title": f"Lambertian Render (step {step})",
                     },
                 })
