@@ -45,6 +45,7 @@ depthfm = [
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
     "tifffile>=2026.3.3",
+    "torch-shampoo",
     "torchdiffeq>=0.2.5",
     "torchmetrics>=1.9.0",
     "tqdm>=4.67.3",
@@ -85,3 +86,6 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.sources]
+torch-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }

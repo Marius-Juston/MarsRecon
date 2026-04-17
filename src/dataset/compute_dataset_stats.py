@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-PATCH_SIZE_DEG: float = 0.005  # ~0.005° ≈ 590 m at Mars equator
+PATCH_SIZE_DEG: float = 0.018  # ~0.005° ≈ 590 m at Mars equator
 CHANNELS: list[str] = ["NEAR-INFRARED", "RED", "BLUE-GREEN"]
 DTM_CHANNELS: list[str] = ["RED"]
 N_HIST_BINS: int = 1024
@@ -80,7 +80,7 @@ HIST_RANGE = {
 }
 
 CENTERED_HIST_RANGE = {
-    "dtm": {"min": -270.0, "max": 270.0},  # Max expected variance within 590m
+    "dtm": {"min": 0.0, "max": 220.0},  # Max expected variance within 590m
     "image": {"min": -0.22, "max": 0.22}
 }
 
@@ -171,6 +171,20 @@ def _welford_update(
 
     return new_n, mean_new, M2_new
 
+def detrend(z_data, mask):
+    z_data = z_data.squeeze(0)
+    mask = mask.squeeze(0)
+
+    # print(z_data.shape, mask.shape)
+    h, w = z_data.shape
+    y_grid, x_grid = np.mgrid[0:h, 0:w]
+    x_valid, y_valid, z_valid = x_grid[mask], y_grid[mask], z_data[mask]
+
+    A = np.c_[x_valid, y_valid, np.ones_like(x_valid)]
+    C, _, _, _ = np.linalg.lstsq(A, z_valid, rcond=None)
+    detrended = z_data - (C[0] * x_grid + C[1] * y_grid + C[2])
+
+    return np.abs(detrended[mask])
 
 # ---------------------------------------------------------------------------
 # Per-GPU worker
@@ -231,7 +245,7 @@ def _worker_fn(rank: int, args: dict) -> None:
         "persistent_workers": WORKERS_PER_GPU > 0,
     }
     if WORKERS_PER_GPU > 0:
-        loader_kwargs["prefetch_factor"] = 4
+        loader_kwargs["prefetch_factor"] = 64
 
     loader = DataLoader(dataset, sampler=subset_sampler, **loader_kwargs)
 
@@ -261,6 +275,8 @@ def _worker_fn(rank: int, args: dict) -> None:
             image = batch["image"].squeeze(0).to(device=device, dtype=torch.float64)
 
         for c, ch_name in enumerate(channels):
+            residual_histo = False
+
             if dtm:
                 if ch_name not in batch:
                     continue  # Safe fall-back if a patch misses orthos
@@ -268,8 +284,29 @@ def _worker_fn(rank: int, args: dict) -> None:
                 channel_pixels = batch[ch_name].squeeze(0).to(device=device, dtype=torch.float64)
 
                 if ch_name == "elevation":
-                    valid_mask = torch.isfinite(channel_pixels)
+                    valid_mask = torch.isfinite(channel_pixels) & (channel_pixels != 0.0)
                     range_key = "dtm"
+
+                    # Only detrend elevation — ortho detrending removes real shadow signal
+                    residual_np = detrend(
+                        channel_pixels.cpu().numpy(),
+                        valid_mask.cpu().numpy().astype(bool),
+                    )
+                    centered_valid = torch.from_numpy(residual_np).to(
+                        device=device, dtype=torch.float64
+                    )
+
+                    residual_histo = True
+
+                    c_count[c], c_mean[c], c_M2[c] = _welford_update(
+                        c_count[c], c_mean[c], c_M2[c], centered_valid
+                    )
+                    c_min[c] = torch.minimum(c_min[c], centered_valid.min())
+                    c_max[c] = torch.maximum(c_max[c], centered_valid.max())
+                    c_hist[c] += torch.histc(
+                        centered_valid.float(), bins=N_HIST_BINS,
+                        **CENTERED_HIST_RANGE["dtm"]
+                    ).to(torch.int64)
                 else:
                     valid_mask = channel_pixels != 0.0
                     range_key = "image"
@@ -293,15 +330,16 @@ def _worker_fn(rank: int, args: dict) -> None:
                 torch.histc(valid.float(), bins=N_HIST_BINS, **HIST_RANGE[range_key]
                             ).to(torch.int64))
 
-            # 2. Update Patch-Centered Stats
-            patch_mean = valid.mean()
-            centered_valid = valid - patch_mean
+            if not residual_histo:
+                # 2. Update Patch-Centered Stats
+                patch_mean = valid.mean()
+                centered_valid = valid - patch_mean
 
-            c_count[c], c_mean[c], c_M2[c] = _welford_update(c_count[c], c_mean[c], c_M2[c], centered_valid)
-            c_min[c] = torch.minimum(c_min[c], centered_valid.min())
-            c_max[c] = torch.maximum(c_max[c], centered_valid.max())
-            c_hist[c] += torch.histc(centered_valid.float(), bins=N_HIST_BINS, **CENTERED_HIST_RANGE[range_key]).to(
-                torch.int64)
+                c_count[c], c_mean[c], c_M2[c] = _welford_update(c_count[c], c_mean[c], c_M2[c], centered_valid)
+                c_min[c] = torch.minimum(c_min[c], centered_valid.min())
+                c_max[c] = torch.maximum(c_max[c], centered_valid.max())
+                c_hist[c] += torch.histc(centered_valid.float(), bins=N_HIST_BINS, **CENTERED_HIST_RANGE[range_key]).to(
+                    torch.int64)
 
         n_patches += 1
         if n_patches % log_every == 0:

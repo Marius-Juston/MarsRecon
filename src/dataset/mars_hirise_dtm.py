@@ -1129,7 +1129,8 @@ def main(argv=None) -> None:  # pragma: no cover
             "--target to override."
         )
 
-        bbox_tuple = (60, 0, 90, 30)
+        # bbox_tuple = (60, 0, 90, 30)
+        bbox_tuple = (-120, -30, 150, 30)
 
     dataset = MarsHiRISEDTM(
         target=args.target,

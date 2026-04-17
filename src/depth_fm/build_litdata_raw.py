@@ -16,6 +16,7 @@ Usage:
     python build_litdata.py --config configs/train_hirise.yaml --workers 96
     python build_litdata.py --config configs/train_hirise.yaml --workers 96 \\
         --hf-repo your-org/mars-hirise-dtm --hf-private
+    PYTHONPATH=src uv run -m src.depth_fm.build_litdata_raw --config configs/train_hirise.yaml
 """
 import argparse
 import glob
@@ -25,6 +26,8 @@ import logging
 import os
 import shutil
 from pathlib import Path
+
+import torch
 
 # GDAL / threading optimizations for the extraction phase
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
@@ -36,7 +39,6 @@ os.environ["OMP_NUM_THREADS"] = "2"
 
 import rasterio
 import numpy as np
-import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -45,15 +47,12 @@ from litdata import optimize
 from dataset.mars_hirise_dtm import MarsHiRISEDTM
 from dataset.hirise_sampler import HiRISEGeoSampler
 from torchgeo.samplers import Units
-from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_ols
 
 import torch.multiprocessing as mp
 
 mp.set_sharing_strategy('file_system')
 
 logger = logging.getLogger(__name__)
-
-# ── HuggingFace Hub helpers ────────────────────────────────────────────────
 
 DATASET_CARD_TEMPLATE = """\
 ---
@@ -93,45 +92,21 @@ test_ds  = StreamingDataset(input_dir="hf://datasets/{repo_id}/test")
 sample = train_ds[0]
 
 # Core Tensors
-print(sample["image"].shape)        # (3, H, W) float16
-print(sample["dtm"].shape)          # (3, H, W) float16
-print(sample["confidence"].shape)   # (1, H, W) float16
+print(sample["elevation"].shape)    # (1, H, W) float32
+print(sample["bounds"].shape)       # (4,)      float32
+print(sample["crs"])                # str
 
-# Physical / Lighting Parameters
-print(sample["sun_vector"].shape)   # (3,)      float32
-print(sample["intensity"])          # float32
-print(sample["ambient"])            # float32
+# Orthoimages (presence depends on config)
+if "left_red" in sample:
+    print(sample["left_red"].shape) # (1, H, W) float32
+if "left_irb" in sample:
+    print(sample["left_irb"].shape) # (3, H, W) float32
 
-# Original / Unnormalized Data
-print(sample["original_image"].shape) # (C, H, W) float16
-print(sample["original_dtm"].shape)   # (1, H, W) float16
-print(sample["trend_params"].shape)   # (3,)      float16
-
-# Normalization / Processing Metadata
-print(sample["residual_scale"])     # float32
-print(sample["raw_residual_p98"])   # float32
-print(sample["key"])                # str (e.g., "left_red")
+# Flattened Metadata
+print(sample["dtm_product_id"])     # str
+print(sample["left_obs_id"])        # str
+print(sample["incidence_angle"])    # float32
 ```
-
-## Fields
-
-During extraction, model inputs are quantized to `float16` to optimize streaming bandwidth. Physical lighting parameters remain `float32`.
-
-| Key                | Dtype   | Shape      | Description                                    |
-|--------------------|---------|------------|------------------------------------------------|
-| `image`            | float16 | (3, H, W)  | Normalized HiRISE orthoimage [-1, 1]           |
-| `dtm`              | float16 | (3, H, W)  | Normalized DTM elevation                       |
-| `confidence`       | float16 | (1, H, W)  | Binary valid data mask (eroded/cleaned)        |
-| `sun_vector`       | float32 | (3,)       | Estimated sun direction (OLS, unit-normalized) |
-| `intensity`        | float32 | scalar     | Estimated sun intensity                        |
-| `ambient`          | float32 | scalar     | Estimated ambient light                        |
-| `original_image`   | float16 | (C, H, W)  | Unnormalized resized orthoimage                |
-| `original_dtm`     | float16 | (1, H, W)  | Unnormalized resized DTM elevation             |
-| `trend_params`     | float16 | (3,)       | LSQR detrend parameters for the DTM plane      |
-| `residual_scale`   | float32 | scalar     | Normalization scale applied to the DTM residual|
-| `raw_residual_p98` | float32 | scalar     | 98th percentile of the raw topographic residual|
-| `key`              | string  | scalar     | Orthoimage source used (e.g., left_red)        |
-
 
 ## Preprocessing Configuration
 
@@ -142,6 +117,8 @@ This dataset was generated with the following pipeline parameters:
 ```yaml
 {config_yaml}
 ```
+
+*(Note: Depending on the dataset configuration, some orthoimage keys may be omitted).*
 """
 
 
@@ -218,8 +195,6 @@ def get_litdata_cache_key(config) -> str:
     key_parts = {
         "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
         "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
-        "resolution": config.data.get("resolution", 512),
-        "dtm_normalization": config.data.get("dtm_normalization", "relative"),
     }
     raw = json.dumps(key_parts, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -244,7 +219,6 @@ def _repack_npz(npz_path: str) -> dict:
     Top-level function with no closures — trivially picklable.
     """
     import numpy as np
-
     data = np.load(npz_path, allow_pickle=True)
     return dict(data)
 
@@ -283,6 +257,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     hc = config.data.hirise
     sc = config.data.sampler
     dataset_root = Path(hc.root)
+    mp.set_sharing_strategy('file_system')
 
     bbox_tuple = tuple(hc.bbox) if hc.get("bbox") else None
     ortho_type = hc.get("ortho_type", "RED")
@@ -310,10 +285,6 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     n_folds = config.data.get("n_folds")
     fold_idx = config.data.get("fold_idx", 0)
 
-    resolution = config.data.get("resolution", 512)
-    dtm_norm = config.data.get("dtm_normalization", "relative")
-    stats_path = config.data.get("stats_path")
-
     manifest_cache_dir = dataset_root / ".cache" / "manifests"
     manifest_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -330,24 +301,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
         reuse_cache=True,
     )
 
-    adapter = DepthFMHiRISEAdapterCached(
-        base_dataset=base_dataset,
-        sampler=sampler,
-        resolution=resolution,
-        dtm_normalization=dtm_norm,
-        random_flip=False,
-        brightness_jitter=0.0,
-        stats_path=stats_path,
-        use_manifest=True,
-        manifest_workers=min(workers, 94),
-        manifest_dir=str(manifest_cache_dir),
-    )
-
-    num_samples = len(adapter)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # PHASE 1: Extract with fork-based DataLoader → temp .npz files
-    # ═══════════════════════════════════════════════════════════════════
+    num_samples = len(sampler)
 
     tmp_dir = dataset_root / f"_litdata_tmp_{cache_hash}_{split}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -355,12 +309,13 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     effective_workers = min(workers, max(1, num_samples // 4))
 
     loader = DataLoader(
-        adapter,
+        base_dataset,
+        sampler=sampler,
         batch_size=None,
         shuffle=False,
         num_workers=effective_workers,
         pin_memory=False,
-        prefetch_factor=2 if workers > 0 else None,
+        prefetch_factor=4 if workers > 0 else None,
         drop_last=False,
         persistent_workers=True if workers > 0 else False,
         multiprocessing_context="spawn" if workers > 0 else None,
@@ -385,31 +340,28 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
 
     else:
         for i, sample in enumerate(tqdm(loader, total=num_samples, desc=f"Extract {split}")):
-            image_fp32 = sample["image"].float()
-            dtm_fp32 = sample["dtm"].float()
-            conf_fp32 = sample["confidence"].float()
-
-            dtm_1ch = dtm_fp32[:1]
-            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_1ch, image_fp32, conf_fp32)
-            sun_vec = torch.nn.functional.normalize(sun_vec, p=2, dim=0)
-
             npz_path = str(tmp_dir / f"{i:08d}.npz")
+
+            data = {}
+
+            def check(sample_v):
+                for key, value in sample_v.items():
+                    if isinstance(value, torch.Tensor):
+                        data[key] = value.float().numpy()
+                    elif isinstance(value, dict) or isinstance(value, list):
+                        data[key] = json.dumps(value)
+                    else:
+                        data[key] = value
+
+            check(sample)
+
             np.savez(
                 npz_path,
-                image=sample["image"].numpy().astype(np.float16),
-                original_dtm=sample["original_dtm"].numpy().astype(np.float16),
-                trend_params=sample["trend_params"].numpy().astype(np.float16),
-                original_image=sample["original_image"].numpy().astype(np.float16),
-                meta=json.dumps(sample["meta"]),
-                dtm=sample["dtm"].numpy().astype(np.float16),
-                confidence=sample["confidence"].numpy().astype(np.float16),
-                sun_vector=sun_vec.numpy(),
-                intensity=intensity.numpy(),
-                ambient=ambient.numpy(),
+                **data
             )
             npz_paths.append(npz_path)
 
-    del loader, adapter, sampler, base_dataset
+    del loader, sampler, base_dataset
     logger.info(f"[{split}] Phase 1 complete: {len(npz_paths)} .npz files.")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -424,6 +376,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
         output_dir=output_dir,
         num_workers=min(workers, 32),
         chunk_bytes="256MB",
+        compression="zstd"
     )
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -438,9 +391,9 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="configs/train_hirise.yaml")
     parser.add_argument("--workers", type=int, default=96 * 2)
     parser.add_argument(
-        "--hf-repo", type=str, default="SuperComputer/mars_hirise_dtm_processed",
-        help="Base HuggingFace repo id to upload to (e.g. your-org/mars-hirise-dtm). "
-             "The config hash will be automatically appended.",
+        "--hf-repo", type=str, default="SuperComputer/mars_hirise_dtm_raw",
+        help="HuggingFace repo id to upload to (e.g. your-org/mars-hirise-dtm). "
+             "Requires `huggingface-cli login` or HF_TOKEN env var.",
     )
     parser.add_argument(
         "--hf-private", action="store_true",
@@ -454,7 +407,6 @@ if __name__ == "__main__":
     cache_hash = get_litdata_cache_key(config)
     logger.info(f"LitData Cache Hash: {cache_hash}")
 
-    # Automatically append the hash to the repo name
     final_repo_id = f"{args.hf_repo}-{cache_hash}" if args.hf_repo else None
 
     for split in ["test", "val", "train"]:
@@ -471,8 +423,6 @@ if __name__ == "__main__":
         relevant_config = {
             "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
             "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
-            "resolution": config.data.get("resolution", 512),
-            "dtm_normalization": config.data.get("dtm_normalization", "relative"),
         }
         config_yaml_str = OmegaConf.to_yaml(relevant_config)
 

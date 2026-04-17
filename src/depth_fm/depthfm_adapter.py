@@ -42,6 +42,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import random
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -51,11 +53,18 @@ import pandas as pd
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
+import torch.nn.functional as F
 from pykrige.ok import OrdinaryKriging
 from pykrige.uk import UniversalKriging
+from scipy import ndimage
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
+
+from dataset.hirise_sampler import HiRISEGeoSampler
+from dataset.mars_hirise_dtm import MarsHiRISEDTM
+from depth_fm.scalers import GlobalLogNormalizer, TrainingNormResult, \
+    LocalStripOrthoNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +72,12 @@ logger = logging.getLogger(__name__)
 # (Olympus Mons region, 52 k patches)
 _DEFAULT_ELEV_P02 = -4396.5664071121255
 _DEFAULT_ELEV_P98 = 20757.65899590482
-_DEFAULT_IMG_P02 = 0.049661101862306406  # average of left_red / right_red p02
-_DEFAULT_IMG_P98 = 0.24805250879347127  # average of left_red / right_red p98
+_DEFAULT_IMG_P02 = 0.06526107076433259  # average of left_red / right_red p02
+_DEFAULT_IMG_P98 = 0.1828855234319496  # average of left_red / right_red p98
 # Scale factor for relative-topography mode: 98th-percentile of patch-centred
 # elevation distribution (metres).  98 % of patches stay within [-1, 1] before
 # clamping while physical slope magnitudes remain consistent across the dataset.
-_DEFAULT_ELEV_SCALE = 26.74  # centered_p98[elevation] from Olympus stats
+_DEFAULT_ELEV_SCALE = 45.90752235993998  # centered_p98[elevation] from Olympus stats
 
 
 def _load_quantiles(
@@ -171,10 +180,6 @@ def _safe_resize(tensor: torch.Tensor, size: int, is_mask: bool = False, has_nan
 
     # Standard orthoimage resizing
     return F.interpolate(tensor.unsqueeze(0), size=(size, size), mode='bilinear', align_corners=False).squeeze(0)
-
-
-import torch
-from scipy import ndimage
 
 
 def fill_invalid_nearest_neighbor(
@@ -567,7 +572,7 @@ def _gmrf_fill_channel(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
+# TODO instead of using GMRF, use a more approate distribution, especailly for the height maps since that does not follow a gaussian distribution but probably closer to a log normal distribution, or specifically from the
 def fill_voids_gmrf(
         image: torch.Tensor,
         dtm: torch.Tensor,
@@ -679,42 +684,160 @@ def fill_voids_gmrf(
     return filled_img_t, filled_dtm_t, eroded
 
 
-def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.15) -> bool:
+# TODO not relaly necessary thanks to the meta data num tiles data
+def detect_dtm_seam_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
+                             line_length: int = 35,
+                             num_angles: int = 8,
+                             min_valid_ratio: float = 0.5) -> float:
     """
-    Detects artificial TIN (Triangular Irregular Network) interpolation in DTMs.
-    TINs have perfectly planar facets, meaning their second derivative (Laplacian) is exactly 0.
+    Detects artificial merge seams at arbitrary angles using valid-masked
+    directional convolutions.
+
+    Args:
+        elevation: (H, W) or (1, 1, H, W) tensor of elevation data.
+        valid_mask: Boolean tensor indicating valid pixels.
+        line_length: The length of the straight line kernel used to detect seams.
+        num_angles: How many discrete angles to check (e.g., 8 = every 22.5 degrees).
+        min_valid_ratio: The line must cover at least this percentage of valid
+                         pixels relative to `line_length` to be considered.
+
+    Returns:
+        float: Seam score representing how severe the sharpest straight-line
+               gradient is compared to the background terrain.
     """
-    # 1. Prevent NaN poisoning in the convolution
+    if elevation.dim() == 2:
+        elevation = elevation.view(1, 1, elevation.shape[0], elevation.shape[1])
+        valid_mask = valid_mask.view(1, 1, valid_mask.shape[0], valid_mask.shape[1])
+
+    device = elevation.device
+    dtype = elevation.dtype
+
+    # 1. Gradient Magnitude (Normalized Sobel)
     safe_elev = elevation.clone()
     safe_elev[~valid_mask] = 0.0
 
-    elev_4d = safe_elev.view(1, 1, safe_elev.shape[-2], safe_elev.shape[-1])
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device, dtype=dtype).view(1, 1, 3,
+                                                                                                           3) / 8.0
+    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device, dtype=dtype).view(1, 1, 3,
+                                                                                                           3) / 8.0
 
-    # 3x3 Laplacian kernel
-    kernel = torch.tensor([[[[0.0, 1.0, 0.0],
-                             [1.0, -4.0, 1.0],
-                             [0.0, 1.0, 0.0]]]], device=elevation.device)
+    grad_x = F.conv2d(safe_elev, sobel_x, padding=1)
+    grad_y = F.conv2d(safe_elev, sobel_y, padding=1)
+    grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
 
-    # Calculate 2nd derivative
-    laplacian = torch.nn.functional.conv2d(elev_4d, kernel, padding=1)
+    # 2. Erode mask aggressively to ignore physical edges of the DTM
+    invalid_mask = (~valid_mask).float()
+    dilated_invalid = F.max_pool2d(invalid_mask, kernel_size=7, stride=1, padding=3)
+    eroded_valid = (dilated_invalid == 0.0).float()
 
-    # 2. Extract only valid pixels
-    # Note: Boundary pixels where NaNs were zeroed will have massive Laplacian values.
-    # This is fine, as they will safely fail the < 1e-2 check and not inflate our TIN count.
-    valid_laplacian = laplacian.view(-1)[valid_mask.view(-1).bool()]
+    grad_mag = grad_mag * eroded_valid
 
-    if len(valid_laplacian) == 0:
-        return True
+    # 3. Global background terrain roughness
+    valid_pixel_count = eroded_valid.sum().clamp(min=1)
+    bg_grad = (grad_mag.sum() / valid_pixel_count).clamp(min=1e-5)
 
-    # 3. Evaluate curvature
-    # 1e-2 accounts for float32 stepping limits at high Martian altitudes (e.g. 20,000m)
-    zero_curvature_ratio = (valid_laplacian.abs() < 1e-2).float().mean().item()
+    # 4. Generate Multi-Angle Kernels dynamically
+    k_center = line_length // 2
+    dir_kernels = torch.zeros((num_angles, 1, line_length, line_length), device=device, dtype=dtype)
 
-    return zero_curvature_ratio > threshold
+    for i in range(num_angles):
+        angle = math.pi * i / num_angles
+        # Draw a line through the center of the kernel
+        for r in range(line_length):
+            t = r - k_center
+            x = int(round(k_center + t * math.cos(angle)))
+            y = int(round(k_center + t * math.sin(angle)))
+            if 0 <= x < line_length and 0 <= y < line_length:
+                dir_kernels[i, 0, y, x] = 1.0
+
+    # 5. Convolve over both Gradient Map and Valid Mask
+    # This gives us the sum of gradients AND the exact count of valid pixels for every line
+    line_grad_sum = F.conv2d(grad_mag, dir_kernels, padding=k_center)
+    line_valid_count = F.conv2d(eroded_valid, dir_kernels, padding=k_center)
+
+    # 6. Calculate Average Gradient strictly over valid pixels
+    # Avoid div by zero
+    line_avg_grad = line_grad_sum / line_valid_count.clamp(min=1.0)
+
+    # 7. Valid-Mask Constraint Filter
+    # Only consider line segments that have enough valid data points.
+    # E.g., if line_length is 35, and min_valid_ratio is 0.5, the line must
+    # hit at least 17.5 valid pixels to be scored. This prevents false positives
+    # where a kernel just grazes a jagged 3-pixel corner of the valid mask.
+    valid_line_mask = line_valid_count >= (min_valid_ratio * line_length)
+
+    if not valid_line_mask.any():
+        return 0.0  # No lines long enough fit inside the valid area
+
+    # 8. Final Score Calculation
+    # Get the max average gradient from lines that passed the validity check
+    max_line_response = line_avg_grad[valid_line_mask].max().item()
+
+    # Seam score: Max directional average gradient vs background average gradient
+    seam_score = max_line_response / bg_grad.item()
+
+    return seam_score
 
 
-import torch
-import torch.nn.functional as F
+def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
+                    kernel_size: int = 32) -> float:
+    """
+    Scale-invariant TIN artifact detection using Localized Maximum Density.
+
+    Args:
+        elevation: (H, W) or (1, 1, H, W) tensor of elevation data.
+        valid_mask: Boolean tensor of same shape indicating valid pixels.
+        kernel_size: The fixed physical size of the sliding window (e.g., 32x32 pixels).
+                     This should be sized to match the minimum physical area a TIN
+                     artifact is expected to cover.
+    """
+    # 1. Format tensors
+    if elevation.dim() == 2:
+        elevation = elevation.view(1, 1, elevation.shape[0], elevation.shape[1])
+        valid_mask = valid_mask.view(1, 1, valid_mask.shape[0], valid_mask.shape[1])
+
+    safe_elev = elevation.clone()
+    safe_elev[~valid_mask] = 0.0
+
+    # 2. Compute Laplacian (2nd derivative)
+    laplacian_kernel = torch.tensor([[[[0.0, 1.0, 0.0],
+                                       [1.0, -4.0, 1.0],
+                                       [0.0, 1.0, 0.0]]]], device=elevation.device)
+    laplacian = F.conv2d(safe_elev, laplacian_kernel, padding=1)
+
+    # 3. Erode valid mask to remove 0-padding corruption at boundaries
+    invalid_mask = (~valid_mask).float()
+    dilated_invalid = F.max_pool2d(invalid_mask, kernel_size=3, stride=1, padding=1)
+    eroded_valid = (dilated_invalid == 0.0).float()
+
+    # 4. Generate the Boolean Indicator Tensor I(x,y)
+    # True (1.0) if curvature is approx 0 AND the pixel is deeply valid
+    zero_curvature_mask = ((laplacian.abs() < 1e-2) * eroded_valid.bool()).float()
+
+    # 5. Localized Maximum Density (The Scale-Invariant Step)
+    # We use average pooling with stride=1 to slide the window across every pixel.
+    # We must separately pool the valid mask to normalize edges properly.
+
+    local_planar_sum = F.avg_pool2d(zero_curvature_mask, kernel_size=kernel_size, stride=1)
+    local_valid_sum = F.avg_pool2d(eroded_valid, kernel_size=kernel_size, stride=1)
+
+    # Avoid division by zero in areas with no valid data
+    safe_valid_sum = torch.clamp(local_valid_sum, min=1e-6)
+
+    # Calculate density: planar pixels / valid pixels in the local window
+    local_density = local_planar_sum / safe_valid_sum
+
+    # Ignore windows that don't have enough valid data to make a statistically sound judgment
+    # (e.g., require the window to be at least 50% valid data)
+    valid_window_mask = local_valid_sum >= 0.5
+
+    if not valid_window_mask.any():
+        return False
+
+    # The scale-invariant statistic S
+    max_local_density = local_density[valid_window_mask].max().item()
+
+    return max_local_density
 
 
 def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: torch.Tensor) -> tuple[
@@ -846,43 +969,6 @@ def _normalize_dtm_relative(
     return normed
 
 
-def _normalize_ortho(
-        ortho: torch.Tensor,
-        p02: float,
-        p98: float,
-) -> torch.Tensor:
-    """Normalise an orthoimage using global dataset quantiles to [-1, 1].
-
-    Applies the same linear formula as the paper:
-        ĩ = ((i − p02) / (p98 − p02) − 0.5) × 2
-
-    Args:
-        ortho: (C, H, W) in I/F reflectance [0, 1].
-        p02: Dataset-level 2nd-percentile reflectance.
-        p98: Dataset-level 98th-percentile reflectance.
-
-    Returns:
-        (C, H, W) in [-1, 1], clamped.
-    """
-    # range_ = p98 - p02
-    # normed = ((ortho - p02) / range_ - 0.5) * 2.0
-    # return torch.clamp(normed, -1.0, 1.0)
-
-    # Instead of using self.img_p02 and self.img_p98 from the global JSON
-    valid_pixels = ortho[ortho > 0.0]  # Ignore pure black nodata
-    if len(valid_pixels) > 0:
-        local_p02 = torch.quantile(valid_pixels, 0.02)
-        local_p98 = torch.quantile(valid_pixels, 0.98)
-
-        # Avoid divide-by-zero if the patch is perfectly uniform
-        if local_p98 > local_p02:
-            ortho = ((ortho - local_p02) / (local_p98 - local_p02) - 0.5) * 2.0
-        else:
-            ortho = torch.zeros_like(ortho)  # Fallback
-
-    return torch.clamp(ortho, -1.0, 1.0)
-
-
 def _to_3ch(tensor: torch.Tensor) -> torch.Tensor:
     """Replicate a (1, H, W) tensor to (3, H, W) for VAE compatibility."""
     if tensor.shape[0] == 1:
@@ -963,8 +1049,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
     def __init__(
             self,
-            base_dataset,
-            sampler,
+            base_dataset: MarsHiRISEDTM,
+            sampler: HiRISEGeoSampler,
             resolution: int = 512,
             dtm_normalization: Literal["relative", "log", "linear"] = "relative",
             random_flip: bool = True,
@@ -975,8 +1061,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             manifest_workers: int = 16,  # Set this high to build the cache fast
             manifest_dir: str = ".cache/manifests",
             erode_radius: int = 2,
+            multiprocessing_context='fork'
     ):
         super().__init__()
+        self.multiprocessing_context = multiprocessing_context
         self.erode_radius = erode_radius
         self.base = base_dataset
         self.sampler = sampler
@@ -998,6 +1086,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             self.elev_scale,
         ) = _load_quantiles(stats_path)
 
+        # TODO instead of local patch ortho normalizer, it should be a per-strip normalization. Sadly infrastructure does not handle this well yet
+        self.ortho_normalizer = LocalStripOrthoNormalizer(self.img_p02, self.img_p98)
+        self.evel_normalizer = GlobalLogNormalizer(self.elev_scale)
+
         # Pre-materialise sampler indices
         self._raw_indices = list(sampler)
 
@@ -1015,7 +1107,9 @@ class DepthFMHiRISEAdapterCached(Dataset):
             "resolution": self.resolution,
             "sampler_length": len(self._raw_indices),
             "split": getattr(self.sampler, "split", "unknown"),
-            "seed": getattr(self.sampler, "seed", 0)
+            "seed": getattr(self.sampler, "seed", 0),
+            "dataset_hash": str(self.base.spatial_index_cache),
+            "sampler_hash": str(self.sampler.cache_hash)
         }
         raw = json.dumps(key_parts, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -1036,14 +1130,17 @@ class DepthFMHiRISEAdapterCached(Dataset):
         # You can easily adjust these thresholds in the future without rebuilding the cache!
         clean_df = df[
             (df['is_valid_data'] == True) &
-            (df['valid_ratio'] >= 0.85) &
+            (df['valid_ratio'] >= 0.5) &
             (df['residual'] >= 0.1) &
-            (df['is_tin'] == False)
+            (df[
+                 'is_tin'] <= 0.95) &  # High TIN values means 2nd derivative (Laplacian) is nearly zero, which indicates perfectly flat planes.
+            (df["num_merges"] == 1)  # Currently tile merges have issues for DTM estimation
             ]
 
         # Convert to a list of dicts for O(1) lookup during training
         self.clean_records = clean_df.to_dict('records')
-        logger.info(f"Manifest ready: Filtered {len(df)} total patches down to {len(self.clean_records)} clean pairs.")
+        logger.info(
+            f"Manifest ready: Filtered {len(df)} total patches down to {len(self.clean_records)} clean pairs. Saving manifest to {manifest_path}")
 
     def _build_manifest_parallel(self, save_path: Path) -> pd.DataFrame:
         """Uses a temporary PyTorch DataLoader to build the cache at maximum speed."""
@@ -1065,7 +1162,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
             batch_size=1,  # Process one by one
             num_workers=self.manifest_workers,
             collate_fn=lambda x: x[0],  # Prevent PyTorch from batching dicts into tensors
-            shuffle=False
+            shuffle=False,
+            multiprocessing_context=self.multiprocessing_context
         )
 
         records = []
@@ -1126,10 +1224,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             # -------------------------------------------------------------
             # 2. Heavy Math Operations
             # -------------------------------------------------------------
-            residual = compute_topographic_residual(dtm_resized, valid_mask_resized) if valid_ratio >= 0.85 else 0.0
+            residual = compute_topographic_residual(dtm_resized, valid_mask_resized)
 
             elev_valid_native = torch.isfinite(elevation) & (elevation != 0.0)
-            is_tin = is_tin_artifact(elevation, elev_valid_native, threshold=0.15) if valid_ratio >= 0.85 else True
+            is_tin = is_tin_artifact(elevation, elev_valid_native)
 
             # -------------------------------------------------------------
             # 3. Sun Vector Math (Fixed)
@@ -1137,10 +1235,11 @@ class DepthFMHiRISEAdapterCached(Dataset):
             # We MUST normalize the data before computing the OLS sun vector because
             # the loss function renders shadows in the [-1, 1] normalized latent space.
             # Physical metadata is incompatible because local scaling distorts Z geometry.
-            dtm_norm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
-            image_norm = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
+            dtm_norm: TrainingNormResult = self.evel_normalizer.normalize_for_training(dtm_resized, valid_mask_resized)
+            image_norm = self.ortho_normalizer.normalize(image_resized)
 
-            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_norm, image_norm, valid_mask_resized)
+            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_norm.normed_residual, image_norm,
+                                                                  valid_mask_resized)
 
             sun_x = sun_vec[0].item()
             sun_y = sun_vec[1].item()
@@ -1159,7 +1258,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
                 "sun_y": sun_y,
                 "sun_z": sun_z,
                 "intensity": intensity_val,
-                "ambient": ambient_val
+                "ambient": ambient_val,
+                "num_merges": len(sample['meta'])
             }
 
         except Exception as e:
@@ -1171,7 +1271,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             return len(self.clean_records)
         return len(self._raw_indices)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | float]:
         """Lightning fast __getitem__. No retries, no heavy math."""
         if not self.use_manifest:
             raise NotImplementedError(
@@ -1205,8 +1305,9 @@ class DepthFMHiRISEAdapterCached(Dataset):
         valid_mask_resized = (ortho_valid & elev_valid).float()
 
         # 4. Normalization
-        dtm = _normalize_dtm_relative(dtm_resized, valid_mask_resized, scale_factor=self.elev_scale)
-        image = _normalize_ortho(image_resized, p02=self.img_p02, p98=self.img_p98)
+        dtm_res: TrainingNormResult = self.evel_normalizer.normalize_for_training(dtm_resized, valid_mask_resized)
+        dtm = dtm_res.normed_residual
+        image = self.ortho_normalizer.normalize(image_resized)
 
         # --- PRE-VAE NEAREST NEIGHBOR FILL ---
         # Fills regions outside the valid mask so the VAE doesn't encode sharp black boundaries
@@ -1246,7 +1347,6 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
         # Brightness jitter
         if getattr(self, 'is_train', False) and getattr(self, 'bright_jitter', 0) > 0:
-            import random
             factor = 1.0 + random.uniform(-self.bright_jitter, self.bright_jitter)
             image = (image * factor).clamp(-1.0, 1.0)
 
@@ -1254,11 +1354,22 @@ class DepthFMHiRISEAdapterCached(Dataset):
             intensity *= factor
             ambient *= factor
 
-        return {
+        res = {
             "image": image,
             "dtm": dtm,
             "confidence": valid_mask_resized,
             "sun_vector": sun_vector,
             "intensity": intensity,
-            "ambient": ambient
+            "ambient": ambient,
+            "original_dtm": dtm_resized,
+            "original_image": image_resized,
+            "trend_params": dtm_res.trend_params,
+            "residual_scale": dtm_res.residual_scale,
+            "raw_residual_p98": dtm_res.raw_residual_p98,
+            "key": key,
         }
+
+        if 'meta' in sample:
+            res['meta'] = sample['meta']
+
+        return res

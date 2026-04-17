@@ -1020,6 +1020,7 @@ depthfm = [
     { name = "scipy" },
     { name = "seaborn" },
     { name = "tifffile" },
+    { name = "torch-shampoo" },
     { name = "torchdiffeq" },
     { name = "torchmetrics" },
     { name = "tqdm" },
@@ -1077,6 +1078,7 @@ requires-dist = [
     { name = "seaborn", marker = "extra == 'depthfm'", specifier = ">=0.13.2" },
     { name = "tifffile", marker = "extra == 'depthfm'", specifier = ">=2026.3.3" },
     { name = "torch", specifier = "==2.10" },
+    { name = "torch-shampoo", marker = "extra == 'depthfm'", git = "https://github.com/facebookresearch/optimizers.git" },
     { name = "torchdiffeq", marker = "extra == 'depthfm'", specifier = ">=0.2.5" },
     { name = "torchgeo", specifier = ">=0.9.0" },
     { name = "torchmetrics", marker = "extra == 'depthfm'", specifier = ">=1.9.0" },
@@ -2174,6 +2176,14 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/23/8e/3c74db5e53bff7ed9e34c8123e6a8bfef718b2450c35eefab85bb4a7e270/torch-2.10.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:787124e7db3b379d4f1ed54dd12ae7c741c16a4d29b49c0226a89bea50923ffb", size = 915711952, upload-time = "2026-01-21T16:23:53.503Z" },
     { url = "https://files.pythonhosted.org/packages/6e/01/624c4324ca01f66ae4c7cd1b74eb16fb52596dce66dbe51eff95ef9e7a4c/torch-2.10.0-cp312-cp312-win_amd64.whl", hash = "sha256:2c66c61f44c5f903046cc696d088e21062644cbe541c7f1c4eaae88b2ad23547", size = 113757972, upload-time = "2026-01-21T16:24:39.516Z" },
     { url = "https://files.pythonhosted.org/packages/c9/5c/dee910b87c4d5c0fcb41b50839ae04df87c1cfc663cf1b5fca7ea565eeaa/torch-2.10.0-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:6d3707a61863d1c4d6ebba7be4ca320f42b869ee657e9b2c21c736bf17000294", size = 79498198, upload-time = "2026-01-21T16:24:34.704Z" },
+]
+
+[[package]]
+name = "torch-shampoo"
+version = "1.0.0"
+source = { git = "https://github.com/facebookresearch/optimizers.git#cb150a9d0b3b457a3a1bbe5bd8b12dd63b8336cd" }
+dependencies = [
+    { name = "torch" },
 ]
 
 [[package]]

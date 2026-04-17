@@ -28,11 +28,15 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import math
 import os
 from copy import deepcopy
 from pathlib import Path
 
+from matplotlib.figure import Figure
+
 from depth_fm.litdata_datamodule import _build_litdata_loaders
+from depth_fm.losses import PhotoclinometricLoss
 
 # ---------------------------------------------------------------------------
 # GLOBAL GDAL/IO OPTIMIZATIONS (For 256-Core / NVMe setups)
@@ -44,9 +48,6 @@ os.environ["GDAL_CACHEMAX"] = "10%"
 os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
 
 import lightning as L
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
 import torch.fft
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import (
@@ -62,17 +63,23 @@ from tqdm import tqdm
 from depth_fm.depthfm_adapter import (
     DepthFMHiRISEAdapterCached,
     estimate_sun_vector_ols, fill_voids_gmrf, )
-from depth_fm.lightning_module import DepthFMLightningModule, EMACallback
+from depth_fm.lightning_module import DepthFMLightningModule, FasterEMAWeightAveraging
 from depth_fm.visualization import (
     plot_convergence_curves,
     plot_metric_distributions,
     plot_multi_run_summary_table,
-    set_neurips_style,
+    set_neurips_style, plot_pareto_frontier,
 )
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
 
 # ---------------------------------------------------------------------------
 # Hardware-aware constants for 2×128-core Ryzen / 4×A6000 / 1 TB RAM
@@ -86,10 +93,452 @@ _NUM_GPUS_DEFAULT = torch.cuda.device_count() if torch.cuda.is_available() else 
 _WORKERS_PER_GPU = min(24, max(4, (_TOTAL_CORES - 16) // max(_NUM_GPUS_DEFAULT, 1)))
 _VAL_WORKERS = min(4, _WORKERS_PER_GPU)
 
+DPI = 300
+
 
 # ---------------------------------------------------------------------------
 # Visualization helpers (unchanged from original)
 # ---------------------------------------------------------------------------
+
+def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"), **kwargs):
+    for f in formats:
+        new_path = path.with_suffix(f)
+        fig.savefig(new_path, **kwargs)
+
+
+@torch.no_grad()
+def visualize_random_flips_and_rotations(dataloader, output_dir: Path, num_samples: int = 4):
+    """
+    Simulates the 8 deterministic states of flips and rotations to visually
+    validate that the sun vector stays physically locked to the terrain shading.
+    Evaluates 'num_samples' separate patches and saves an image for each.
+    """
+    logger.info(f"Generating Sun Vector Augmentation Validation for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Collect n samples safely across batches
+    samples = []
+    for batch in dataloader:
+        B = batch["image"].shape[0]
+        for i in range(B):
+            samples.append({
+                "image": batch["image"][i],
+                "dtm": batch["dtm"][i],
+                "confidence": batch["confidence"][i],
+                "sun_vector": batch["sun_vector"][i]
+            })
+            if len(samples) >= num_samples:
+                break
+        if len(samples) >= num_samples:
+            break
+
+    # Define the core transformations to test (Name, H-Flip, V-Flip, k_rot)
+    transformations = [
+        ("Original", False, False, 0),
+        ("H-Flip", True, False, 0),
+        ("V-Flip", False, True, 0),
+        ("Rot 90 (CCW)", False, False, 1),
+        ("Rot 180", False, False, 2),
+        ("Rot 270 (CW)", False, False, 3),
+        ("H-Flip + Rot 90", True, False, 1),
+        ("V-Flip + Rot 270", False, True, 3),
+    ]
+
+    # 2. Generate a grid for each sample
+    for sample_idx, sample in enumerate(samples):
+        fig, axes = plt.subplots(len(transformations), 3, figsize=(15, 5 * len(transformations)))
+        plt.subplots_adjust(wspace=0.1, hspace=0.3)
+
+        base_img = sample["image"]  # (C, H, W)
+        base_dtm = sample["dtm"]  # (1, H, W)
+        base_conf = sample["confidence"]  # (1, H, W)
+        base_sun = sample["sun_vector"]  # (3,)
+
+        for i, (name, h_flip, v_flip, k_rot) in enumerate(transformations):
+            # Clone base tensors
+            img = base_img.clone()
+            dtm = base_dtm.clone()
+            conf = base_conf.clone()
+            sun = base_sun.clone()
+
+            # Apply exact augmentation logic
+            if h_flip:
+                img = torch.flip(img, [-1])
+                dtm = torch.flip(dtm, [-1])
+                conf = torch.flip(conf, [-1])
+                sun[0] = -sun[0]
+
+            if v_flip:
+                img = torch.flip(img, [-2])
+                dtm = torch.flip(dtm, [-2])
+                conf = torch.flip(conf, [-2])
+                sun[1] = -sun[1]
+
+            if k_rot > 0:
+                img = torch.rot90(img, k=k_rot, dims=[-2, -1])
+                dtm = torch.rot90(dtm, k=k_rot, dims=[-2, -1])
+                conf = torch.rot90(conf, k=k_rot, dims=[-2, -1])
+                sx, sy = sun[0].clone(), sun[1].clone()
+                if k_rot == 1:
+                    sun[0], sun[1] = sy, -sx
+                elif k_rot == 2:
+                    sun[0], sun[1] = -sx, -sy
+                elif k_rot == 3:
+                    sun[0], sun[1] = -sy, sx
+
+            # Format for matplotlib
+            img_np = np.clip((np.transpose(img.cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+            dtm_np = np.clip((dtm[0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+            mask_np = conf[0].cpu().numpy()
+
+            # Isolate spatial dimensions to place the arrow in the center
+            H, W = dtm_np.shape
+            cx, cy = W // 2, H // 2
+            vx, vy = sun[0].item(), sun[1].item()
+
+            # Scale arrow to be 30% of the image size for visibility
+            arrow_scale = min(W, H) * 0.3
+
+            # --- Plot Ortho ---
+            axes[i, 0].imshow(img_np, cmap='gray' if img_np.shape[-1] == 1 else None)
+            axes[i, 0].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
+                             linewidth=2)
+            axes[i, 0].set_title(f"Sample {sample_idx} | {name} - Ortho\nSun XY: [{vx:.2f}, {vy:.2f}]")
+            axes[i, 0].axis('off')
+
+            # --- Plot DTM ---
+            axes[i, 1].imshow(dtm_np, cmap='terrain')
+            axes[i, 1].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
+                             linewidth=2)
+            axes[i, 1].set_title(f"Sample {sample_idx} | {name} - DTM")
+            axes[i, 1].axis('off')
+
+            # --- Plot Mask ---
+            axes[i, 2].imshow(mask_np, cmap='gray')
+            axes[i, 2].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
+                             linewidth=2)
+            axes[i, 2].set_title(f"Sample {sample_idx} | {name} - Mask")
+            axes[i, 2].axis('off')
+
+        save_path = output_dir / f"augmentation_sun_vector_validation_sample_{sample_idx:02d}.png"
+        save_fig(fig, save_path, bbox_inches="tight", dpi=300, facecolor="white")
+        plt.close(fig)
+
+    logger.info(f"Saved {num_samples} augmentation validation grids to: {output_dir}")
+
+
+@torch.no_grad()
+def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int = -1):
+    """
+    Visualizes solar physics and saves individual plots for publication.
+    """
+    logger.info("Generating and saving individual solar distribution plots...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    set_neurips_style()
+
+    sun_vecs, intensities, ambients = [], [], []
+
+    for i, batch in tqdm(enumerate(dataloader), total=len(dataloader), desc="Extracting sun vectors"):
+        if 0 < num_batches <= i: break
+        sun_vecs.append(batch["sun_vector"].cpu().numpy())
+        intensities.append(batch["intensity"].cpu().numpy())
+        ambients.append(batch["ambient"].cpu().numpy())
+
+    sv = np.concatenate(sun_vecs, axis=0)
+    it = np.concatenate(intensities, axis=0).flatten()
+    am = np.concatenate(ambients, axis=0).flatten()
+
+    # CRITICAL: Fix for the RuntimeWarning (Negative sizes)
+    # We clip ambient at a tiny positive value so the sqrt doesn't fail
+    viz_ambient_sizes = np.clip(am, 1e-6, None) * 500
+
+    azimuth = np.arctan2(sv[:, 1], sv[:, 0])
+    elevation = np.degrees(np.arcsin(sv[:, 2]))
+
+    # --- 1. Standalone 3D Solar Compass ---
+    fig_3d = plt.figure(figsize=(8, 8))
+    ax1 = fig_3d.add_subplot(111, projection='3d')
+    # Wireframe hemisphere
+    u, v = np.mgrid[0:2 * np.pi:30j, 0:np.pi / 2:15j]
+    ax1.plot_wireframe(np.cos(u) * np.sin(v), np.sin(u) * np.sin(v), np.cos(v),
+                       color='gray', alpha=0.1, linewidth=0.5)
+
+    p3d = ax1.scatter(sv[:, 0], sv[:, 1], sv[:, 2],
+                      c=it, cmap='plasma', s=viz_ambient_sizes,
+                      alpha=0.8, edgecolors='w', linewidth=0.2)
+    ax1.set_title("3D Solar Vector Compass")
+    fig_3d.colorbar(p3d, ax=ax1, shrink=0.6, label='Intensity')
+    save_fig(fig_3d, output_dir / "solar_compass_3d.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig_3d)
+
+    # --- 2. Standalone Polar Sky-Map ---
+    fig_polar = plt.figure(figsize=(8, 8))
+    ax2 = fig_polar.add_subplot(111, projection='polar')
+    ax2.set_theta_zero_location("N")
+    ax2.set_theta_direction(-1)
+    sc2 = ax2.scatter(azimuth, elevation, c=it, cmap='plasma', alpha=0.7)
+    ax2.set_ylim(0, 90)
+    ax2.set_title("Solar Sky-Map (Azimuth vs Elevation)")
+    save_fig(fig_polar, output_dir / "solar_sky_map_polar.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig_polar)
+
+    # --- 3. Standalone Illumination Coupling ---
+    fig_corr = plt.figure(figsize=(8, 8))
+    ax3 = fig_corr.add_subplot(111)
+
+    sns.regplot(x=it, y=am, ax=ax3, scatter_kws={'alpha': 0.4, 's': 20}, line_kws={'color': 'red'})
+    ax3.set_title("Illumination Coupling (Intensity vs Ambient)")
+    ax3.set_xlabel("Solar Intensity")
+    ax3.set_ylabel("Ambient (Sky) Light")
+    save_fig(fig_corr, output_dir / "solar_coupling_regression.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig_corr)
+
+    logger.info(f"Individual solar figures saved to {output_dir}")
+
+
+@torch.no_grad()
+def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16):
+    """
+    Scans a buffer of patches, scores them for seam artifacts, and plots
+    the worst (highest score) vs the best (lowest score) for visual validation.
+    Layout: [Ortho] | [GT DTM] | [Confidence Mask] | [Gradient Map]
+    """
+    from depth_fm.depthfm_adapter import detect_dtm_seam_artifact
+
+    logger.info(f"Generating Seam Artifact validation for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    evaluated_samples = []
+    scan_limit = len(dataloader.dataset)  # Scan a larger buffer to find actual seams
+
+    with tqdm(total=scan_limit, desc="Scanning for seams") as pbar:
+        for batch in dataloader:
+            B = batch["image"].shape[0]
+            for i in range(B):
+                if len(evaluated_samples) >= scan_limit:
+                    break
+
+                img = batch["image"][i: i + 1].to(device)
+                dtm = batch["dtm"][i: i + 1, :1].to(device)
+                mask = batch["confidence"][i: i + 1].to(device) > 0.5
+
+                # Skip empty masks
+                # if not mask.any() or not (~mask).any():
+                #     continue
+
+                score = detect_dtm_seam_artifact(dtm, mask)
+
+                # Compute normalized gradient magnitude for visualization
+                sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device).view(1, 1, 3,
+                                                                                                          3) / 8.0
+                sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device).view(1, 1, 3,
+                                                                                                          3) / 8.0
+
+                safe_dtm = dtm.clone()
+                safe_dtm[~mask.bool()] = 0.0
+                grad_x = F.conv2d(safe_dtm, sobel_x, padding=1)
+                grad_y = F.conv2d(safe_dtm, sobel_y, padding=1)
+                grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+
+                evaluated_samples.append({
+                    "score": score,
+                    "img": img[0].cpu().numpy(),
+                    "dtm": dtm[0, 0].cpu().numpy(),
+                    "mask": mask[0, 0].cpu().numpy(),
+                    "grad_mag": grad_mag[0, 0].cpu().numpy()
+                })
+                pbar.update(1)
+
+            if len(evaluated_samples) >= scan_limit:
+                break
+
+    # Sort by score descending
+    evaluated_samples.sort(key=lambda x: x["score"], reverse=True)
+
+    num_samples = min(len(evaluated_samples), num_samples)
+
+    # Select the Top N (Most severe seams) and Bottom N (Cleanest terrain)
+    selected = evaluated_samples[:num_samples] + evaluated_samples[-num_samples:]
+    half = len(selected) // 2
+
+    total_rows = len(selected)
+
+    fig, axes = plt.subplots(total_rows, 4, figsize=(16, 4 * total_rows))
+    plt.subplots_adjust(wspace=0.1, hspace=0.3)
+
+    for count, item in enumerate(selected):
+        img_disp = np.clip((np.transpose(item["img"], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+        dtm_disp = np.clip((item["dtm"] + 1.0) / 2.0, 0.0, 1.0)
+        mask_np = item["mask"].astype(bool)
+        grad_np = item["grad_mag"]
+
+        # Mask out invalid areas purely for plotting clarity
+        img_disp[~mask_np] = np.nan
+        dtm_disp[~mask_np] = np.nan
+        grad_np[~mask_np] = np.nan
+
+        axes[count, 0].imshow(img_disp, vmin=0, vmax=1)
+        axes[count, 1].imshow(dtm_disp, cmap="terrain", vmin=0, vmax=1)
+        axes[count, 2].imshow(item["mask"], cmap="gray", vmin=0, vmax=1)
+
+        # Stretch gradient map for visibility
+        p2, p98 = np.nanpercentile(grad_np, [2, 98]) if np.any(~np.isnan(grad_np)) else (0, 1)
+        grad_disp = np.clip((grad_np - p2) / (p98 - p2 + 1e-8), 0, 1)
+        axes[count, 3].imshow(grad_disp, cmap="magma")
+
+        for ax in axes[count]:
+            ax.axis("off")
+
+        if count == 0:
+            titles = ["Masked Ortho", "Masked GT DTM", "Confidence Mask", "Gradient Map"]
+            for ax, t in zip(axes[0], titles):
+                ax.set_title(t)
+
+        # Add side-label indicating Seam Score
+        label = "High Score\n(Likely Seam)" if count < half else "Low Score\n(Clean Terrain)"
+        axes[count, 0].text(-0.1, 0.5, f"Score: {item['score']:.2f}\n{label}",
+                            transform=axes[count, 0].transAxes, fontsize=12, fontweight='bold',
+                            va='center', ha='right', color='red' if count < half else 'green')
+
+    save_path = output_dir / "seam_artifact_inspection.png"
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
+    plt.close(fig)
+    logger.info(f"Seam artifact visualization saved to: {save_path}")
+
+
+@torch.no_grad()
+def visualize_tin_artifacts(dataloader, output_dir: Path, num_samples: int = 8, kernel_size: int = 32):
+    """
+    Visualizes TIN artifacts by finding patches with high local planar density.
+    Layout: [Ortho] | [GT DTM] | [Laplacian Magnitude] | [TIN Density Map]
+    """
+    logger.info(f"Generating TIN Artifact visualization for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    evaluated_samples = []
+    scan_limit = len(dataloader.dataset)  # Scan a larger buffer to find actual TINs
+
+    laplacian_kernel = torch.tensor([[[[0.0, 1.0, 0.0],
+                                       [1.0, -4.0, 1.0],
+                                       [0.0, 1.0, 0.0]]]], device=device)
+
+    with tqdm(total=scan_limit, desc="Scanning for TIN artifacts") as pbar:
+        for batch in dataloader:
+            B = batch["image"].shape[0]
+            for i in range(B):
+                if len(evaluated_samples) >= scan_limit:
+                    break
+
+                img = batch["image"][i: i + 1].to(device)
+                dtm = batch["dtm"][i: i + 1, :1].to(device)
+                mask = batch["confidence"][i: i + 1].to(device)
+
+                # --- Extract TIN Logic for Spatial Mapping ---
+                safe_elev = dtm.clone()
+                safe_elev[~mask.bool()] = 0.0
+
+                laplacian = F.conv2d(safe_elev, laplacian_kernel, padding=1)
+
+                invalid_mask = (~mask.bool()).float()
+                dilated_invalid = F.max_pool2d(invalid_mask, kernel_size=3, stride=1, padding=1)
+                eroded_valid = (dilated_invalid == 0.0).float()
+
+                zero_curvature_mask = ((laplacian.abs() < 1e-2) * eroded_valid.bool()).float()
+
+                local_planar_sum = F.avg_pool2d(zero_curvature_mask, kernel_size=kernel_size, stride=1)
+                local_valid_sum = F.avg_pool2d(eroded_valid, kernel_size=kernel_size, stride=1)
+
+                safe_valid_sum = torch.clamp(local_valid_sum, min=1e-6)
+                local_density = local_planar_sum / safe_valid_sum
+
+                valid_window_mask = local_valid_sum >= 0.5
+
+                if valid_window_mask.any():
+                    score = local_density[valid_window_mask].max().item()
+                else:
+                    score = 0.0
+
+                # Interpolate density map back to original size for side-by-side visualization
+                # (avg_pool2d with stride=1 shrinks size by kernel_size - 1)
+                pad_top = kernel_size // 2
+                pad_bottom = kernel_size - 1 - pad_top
+                density_map = F.pad(local_density, (pad_top, pad_bottom, pad_top, pad_bottom), mode='constant',
+                                    value=0.0)
+
+                evaluated_samples.append({
+                    "score": score,
+                    "img": img[0].cpu().numpy(),
+                    "dtm": dtm[0, 0].cpu().numpy(),
+                    "mask": mask[0, 0].cpu().numpy(),
+                    "laplacian": laplacian[0, 0].cpu().numpy(),
+                    "density": density_map[0, 0].cpu().numpy()
+                })
+                pbar.update(1)
+
+            if len(evaluated_samples) >= scan_limit:
+                break
+
+    # Sort by TIN score descending
+    evaluated_samples.sort(key=lambda x: x["score"], reverse=True)
+
+    # Select the Top N (Severe TINs) and Bottom N (Clean terrain)
+    num_samples = min(num_samples, len(evaluated_samples))
+    if num_samples == 0:
+        logger.warning("No valid samples found for TIN visualization.")
+        return
+
+    half = num_samples // 2
+    selected = evaluated_samples[:half] + evaluated_samples[-half:]
+
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+    plt.subplots_adjust(wspace=0.1, hspace=0.3)
+
+    for count, item in enumerate(selected):
+        img_disp = np.clip((np.transpose(item["img"], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+        dtm_disp = np.clip((item["dtm"] + 1.0) / 2.0, 0.0, 1.0)
+        mask_np = item["mask"].astype(bool)
+        lap_np = np.abs(item["laplacian"])
+        density_np = item["density"]
+
+        # Mask invalid areas purely for visual clarity
+        img_disp[~mask_np] = np.nan
+        dtm_disp[~mask_np] = np.nan
+        lap_np[~mask_np] = np.nan
+        density_np[~mask_np] = np.nan
+
+        axes[count, 0].imshow(img_disp, vmin=0, vmax=1)
+        axes[count, 1].imshow(dtm_disp, cmap="terrain", vmin=0, vmax=1)
+
+        # Stretch Laplacian for visibility (highlighting sharp edges)
+        p98 = np.nanpercentile(lap_np, 98) if np.any(~np.isnan(lap_np)) else 1.0
+        lap_disp = np.clip(lap_np / (p98 + 1e-8), 0, 1)
+        axes[count, 2].imshow(lap_disp, cmap="magma")
+
+        # Local Density Map (0 to 1 heatmap)
+        axes[count, 3].imshow(density_np, cmap="jet", vmin=0, vmax=1)
+
+        for ax in axes[count]:
+            ax.axis("off")
+
+        if count == 0:
+            titles = ["Masked Ortho", "Masked GT DTM", "Laplacian Magnitude", "TIN Density Map"]
+            for ax, t in zip(axes[0], titles):
+                ax.set_title(t)
+
+        # Add side-label indicating TIN Score
+        label = "High Score\n(TIN Suspected)" if count < half else "Low Score\n(Clean Terrain)"
+        axes[count, 0].text(-0.1, 0.5, f"Score: {item['score']:.2f}\n{label}",
+                            transform=axes[count, 0].transAxes, fontsize=12, fontweight='bold',
+                            va='center', ha='right', color='red' if count < half else 'green')
+
+    save_path = output_dir / "tin_artifact_inspection.png"
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
+    plt.close(fig)
+    logger.info(f"TIN artifact visualization saved to: {save_path}")
 
 
 @torch.no_grad()
@@ -177,7 +626,7 @@ def visualize_loss_components(dataloader, output_dir, num_samples=4):
                 pbar.update()
 
     save_path = output_dir / "loss_components_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     plt.close(fig)
     logger.info(f"Loss components visualization saved to: {save_path}")
 
@@ -254,7 +703,7 @@ def visualize_invalid_fill(dataloader, output_dir: Path, num_samples: int = 4, i
                 pbar.update()
 
     save_path = output_dir / "smooth_fill_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     plt.close(fig)
     logger.info(f"Smooth filling visualization saved to: {save_path}")
 
@@ -264,123 +713,206 @@ def visualize_loss_physics(
         dataloader,
         output_dir: Path,
         num_samples: int = 6,
-        lunar_lambert_weight: float = 0.5
+        loss_fn: "PhotoclinometricLoss | None" = None,
+        lunar_lambert_weight_override: float | None = None,
 ):
-    """
-    Visualizes the internal physics of the Photoclinometric Loss.
-    Layout: [Real Ortho] | [GT DTM] | [Surface Normals] | [Lunar-Lambert Render] | [Lunar-Lambert GT Check]
-    """
-    logger.info(f"Generating Loss Physics visualization for {num_samples} samples (L={lunar_lambert_weight:.2f})...")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Visualises the internal physics of the Photoclinometric Loss.
 
+    Uses the actual `PhotoclinometricLoss` class methods (`surface_normals`,
+    `render_from_depth`, `_zscore`) so the visualisation is guaranteed to
+    match exactly what the training loss computes. If the render ever
+    changes, this figure updates automatically.
+
+    Layout (6 columns):
+        [Real Ortho] [GT DTM] [Normals] [Render (pred params)]
+        [Render (GT-fit params)] [z-SSIM comparison strip]
+
+    The last column shows, side-by-side, the z-score normalised render
+    and z-score normalised ortho — i.e. exactly what the SSIM term of
+    the loss operates on. If those two look structurally similar, the
+    loss is well-behaved regardless of any global luminance mismatch
+    in the raw render columns.
+
+    Args:
+        dataloader: DataLoader yielding batches with keys
+            {image, dtm, confidence, sun_vector, intensity, ambient}.
+        output_dir: Where to save the figure.
+        num_samples: How many samples to render.
+        loss_fn: Optional trained `PhotoclinometricLoss` instance. If
+            None, a fresh one is created (L initialised to 0.5).
+        lunar_lambert_weight_override: If set, temporarily forces the
+            loss's Lunar-Lambert blend weight to this value for the
+            visualisation only. Useful for exploring what different
+            L values look like (the trained weight is restored after).
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Sobel filters for surface normals
-    sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=device) / 8.0
-    sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=device) / 8.0
-    kx = sobel_x.view(1, 1, 3, 3)
-    ky = sobel_y.view(1, 1, 3, 3)
+    # Get or create a loss instance (the viz uses its methods directly)
+    if loss_fn is None:
+        loss_fn = PhotoclinometricLoss()
+    loss_fn = loss_fn.to(device).eval()
 
-    n_cols = 5
+    # Optionally override the learned L for exploratory viz
+    saved_logit = None
+    if lunar_lambert_weight_override is not None:
+        w = float(min(max(lunar_lambert_weight_override, 1e-4), 1.0 - 1e-4))
+        saved_logit = loss_fn.lunar_lambert_logit.data.clone()
+        loss_fn.lunar_lambert_logit.data = torch.tensor(
+            math.log(w / (1.0 - w)), device=device, dtype=loss_fn.lunar_lambert_logit.dtype,
+        )
+
+    L_used = float(loss_fn.lunar_lambert_weight.item())
+    logger.info(f"Generating Loss Physics visualization for {num_samples} samples (L={L_used:.2f})...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _to_gray_display(x: torch.Tensor, mask: np.ndarray | None = None) -> np.ndarray:
+        """Percentile-stretch a (1,1,H,W) or (1,H,W) tensor to [0,1] for display.
+
+        Each panel is stretched independently so structural similarity is
+        visible regardless of absolute luminance offset. That is purely
+        a display choice; the loss sees raw / z-scored values.
+        """
+        arr = x.detach().cpu().numpy().squeeze()
+        if mask is not None:
+            valid = arr[mask]
+            if valid.size > 0:
+                lo, hi = valid.min(), valid.max()
+            else:
+                lo, hi = float(arr.min()), float(arr.max())
+        else:
+            lo, hi = arr.min(), arr.max()
+        if hi - lo < 1e-6:
+            hi = lo + 1e-6
+        clipped = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+        if mask is not None:
+            clipped[~mask] = np.nan
+
+        return clipped
+
+    n_cols = 6
     scale = 4
-    fig, axes = plt.subplots(num_samples, n_cols, figsize=(n_cols * scale, scale * num_samples))
-    plt.subplots_adjust(wspace=0.1, hspace=0.1)
 
-    count = 0
-    with tqdm(total=num_samples) as pbar:
-        for batch in dataloader:
-            if count >= num_samples:
-                break
-            B = batch["image"].shape[0]
-            for i in range(B):
+    width_ratios = [1, 1, 1, 1, 1, 3.1]
+
+    fig_width = sum(width_ratios) * scale * 0.85  # 0.85 multiplier prevents the figure from getting too massive
+    fig_height = scale * num_samples
+
+    fig, axes = plt.subplots(num_samples, n_cols, figsize=(fig_width, fig_height),
+                             gridspec_kw={'width_ratios': width_ratios})
+    if num_samples == 1:
+        axes = axes[None, :]
+    plt.subplots_adjust(wspace=0.08, hspace=0.08)
+
+    try:
+        count = 0
+        with tqdm(total=num_samples) as pbar:
+            for batch in dataloader:
                 if count >= num_samples:
                     break
+                B = batch["image"].shape[0]
+                for i in range(B):
+                    if count >= num_samples:
+                        break
 
-                # Extract inputs
-                img = batch["image"][i: i + 1].to(device)
-                dtm = batch["dtm"][i: i + 1, :1].to(device)
-                mask = batch["confidence"][i: i + 1].to(device)
-                sun_vec = batch["sun_vector"][i: i + 1].to(device)
-                intensity = batch["intensity"][i: i + 1].to(device)
-                ambient = batch["ambient"][i: i + 1].to(device)
+                    # --- Extract inputs ---
+                    img = batch["image"][i: i + 1].to(device).float()
+                    dtm = batch["dtm"][i: i + 1, :1].to(device).float()
+                    mask = batch["confidence"][i: i + 1].to(device).float()
+                    sun_vec = batch["sun_vector"][i: i + 1].to(device).float()
+                    intensity = batch["intensity"][i: i + 1].to(device).float()
+                    ambient = batch["ambient"][i: i + 1].to(device).float()
 
-                # Estimate GT parameters via OLS
-                sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
+                    ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
 
-                ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
-                _, _, H, W = dtm.shape
-                spatial_scale = max(H, W) / 2.0
+                    # --- Estimate GT exposure/sun via OLS (for sanity check column) ---
+                    sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
+                    # OLS returns (3,), scalar, scalar — reshape for render_from_depth
+                    sun_vec_gt = sun_vec_gt.view(1, 3)
+                    intensity_gt = intensity_gt.view(1)
+                    ambient_gt = ambient_gt.view(1)
 
-                # Compute Normals
-                padded_dtm = F.pad(dtm, (1, 1, 1, 1), mode="replicate")
-                n_x = -F.conv2d(padded_dtm, kx) * spatial_scale
-                n_y = -F.conv2d(padded_dtm, ky) * spatial_scale
-                n_z = torch.ones_like(n_x)
-                normals = F.normalize(torch.cat([n_x, n_y, n_z], dim=1), p=2, dim=1)
+                    # --- Use the ACTUAL loss class methods ---
+                    render, normals = loss_fn.render_from_depth(
+                        dtm, sun_vec, intensity, ambient,
+                    )
+                    render_gt, _ = loss_fn.render_from_depth(
+                        dtm, sun_vec_gt, intensity_gt, ambient_gt,
+                    )
 
-                # Emission angle is simply the Z-normal for a top-down (Nadir) satellite view
-                cos_e = normals[:, 2:3, :, :]
+                    # --- z-scored versions: what SSIM actually sees ---
+                    render_z = loss_fn._zscore(render, mask)
+                    ortho_z = loss_fn._zscore(ortho_gray, mask)
 
-                # --- 1. LUNAR-LAMBERT RENDER (GT Parameters) ---
-                cos_i_gt = torch.sum(normals * sun_vec_gt.view(1, 3, 1, 1), dim=1, keepdim=True)
-                cos_i_clamped_gt = torch.clamp(cos_i_gt, min=0.0)
+                    # --- Displays ---
+                    mask_np = mask[0, 0].cpu().numpy().astype(bool)
 
-                lambert_comp_gt = cos_i_clamped_gt
-                ls_comp_gt = cos_i_clamped_gt / (cos_i_clamped_gt + cos_e + 1e-6)
+                    img_disp = _to_gray_display(ortho_gray, mask_np)
+                    dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                    normals_disp = np.clip(
+                        (normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0, 0.0, 1.0,
+                    )
+                    render_disp = _to_gray_display(render, mask_np)
+                    render_disp_gt = _to_gray_display(render_gt, mask_np)
 
-                render_blend_gt = (lunar_lambert_weight * lambert_comp_gt) + ((1.0 - lunar_lambert_weight) * ls_comp_gt)
-                render_gt = (render_blend_gt * intensity_gt) + ambient_gt
+                    # Side-by-side z-scored render | z-scored ortho
+                    # (clip to ±3 for display, then stretch to [0,1])
+                    def _zdisp(z):
+                        a = z[0, 0].cpu().numpy()
+                        a = np.clip(a, -3.0, 3.0)
+                        return (a + 3.0) / 6.0
 
-                # --- 2. LUNAR-LAMBERT RENDER (Batch Parameters) ---
-                cos_i = torch.sum(normals * sun_vec.view(1, 3, 1, 1), dim=1, keepdim=True)
-                cos_i_clamped = torch.clamp(cos_i, min=0.0)
+                    z_render_img = _zdisp(render_z)
+                    z_ortho_img = _zdisp(ortho_z)
+                    # Stack horizontally with a thin separator
+                    residual = np.abs(render_z[0, 0].cpu().numpy() - ortho_z[0, 0].cpu().numpy())
+                    # Clip residual for display (values > 2.0 represent significant structural mismatch)
+                    residual_disp = np.clip(residual / 2.0, 0.0, 1.0)
 
-                lambert_comp = cos_i_clamped
-                ls_comp = cos_i_clamped / (cos_i_clamped + cos_e + 1e-6)
+                    # Mask invalid regions to background color
+                    z_render_img[~mask_np] = np.nan
+                    z_ortho_img[~mask_np] = np.nan
+                    residual_disp[~mask_np] = np.nan
 
-                render_blend = (lunar_lambert_weight * lambert_comp) + ((1.0 - lunar_lambert_weight) * ls_comp)
-                render = (render_blend * intensity) + ambient
+                    # Stack horizontally: Render | Ortho | Residual
+                    sep = np.ones((z_render_img.shape[0], 4)) * np.nan
+                    z_combined = np.concatenate([z_render_img, sep, z_ortho_img, sep, residual_disp], axis=1)
 
-                # --- 3. CLIPPING & MASKING ---
-                img_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
-                dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
-                mask_np = mask[0, 0].cpu().numpy().astype(bool)
-                normals_disp = np.clip((normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0, 0.0, 1.0)
-                render_disp = np.clip(render[0, 0].cpu().numpy(), 0.0, 1.0)
-                render_disp_gt = np.clip(render_gt[0, 0].cpu().numpy(), 0.0, 1.0)
+                    # --- Plotting ---
+                    axes[count, 0].imshow(img_disp, cmap="gray", vmin=0, vmax=1)
+                    axes[count, 1].imshow(dtm_disp, cmap="terrain")
+                    axes[count, 2].imshow(normals_disp)
+                    axes[count, 3].imshow(render_disp, cmap="gray", vmin=0, vmax=1)
+                    axes[count, 4].imshow(render_disp_gt, cmap="gray", vmin=0, vmax=1)
+                    axes[count, 5].imshow(z_combined, cmap="inferno", vmin=0, vmax=1)  # Inferno highlights errors well
 
-                for arr in (img_disp, dtm_disp, render_disp, render_disp_gt):
-                    arr[~mask_np] = np.nan
-                normals_disp[~mask_np] = np.nan
+                    for ax in axes[count]:
+                        ax.axis("off")
 
-                # --- 4. PLOTTING ---
-                axes[count, 0].imshow(img_disp, cmap="gray", vmin=0, vmax=1)
-                axes[count, 1].imshow(dtm_disp, cmap="terrain")
-                axes[count, 2].imshow(normals_disp)
-                axes[count, 3].imshow(render_disp, cmap="gray", vmin=0, vmax=1)
-                axes[count, 4].imshow(render_disp_gt, cmap="gray", vmin=0, vmax=1)
+                    if count == 0:
+                        titles = [
+                            "Real Ortho (Gray)",
+                            "GT DTM",
+                            "Surface Normals",
+                            f"LL Render (L={L_used:.2f}, pred params)",
+                            "LL Render (OLS-fit params)",
+                            "z-SSIM view: Render | Ortho | $|Z_r - Z_o|$",
+                        ]
+                        for ax, t in zip(axes[0], titles):
+                            ax.set_title(t, fontsize=11)
 
-                for ax in axes[count]:
-                    ax.axis("off")
+                    count += 1
+                    pbar.update()
 
-                if count == 0:
-                    titles = [
-                        "Real Ortho (Gray)",
-                        "GT DTM",
-                        "Surface Normals",
-                        f"Lunar-Lambert Render (L={lunar_lambert_weight:.2f})",
-                        f"Lunar-Lambert GT Check"
-                    ]
-                    for ax, t in zip(axes[0], titles):
-                        ax.set_title(t)
+        save_path = output_dir / "loss_physics_inspection.png"
+        save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
+        plt.close(fig)
+        logger.info(f"Loss physics visualization saved to: {save_path}")
 
-                count += 1
-                pbar.update()
-
-    save_path = output_dir / "loss_physics_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, facecolor="white")
-    plt.close(fig)
-    logger.info(f"Loss physics visualization saved to: {save_path}")
+    finally:
+        # Restore the original Lunar-Lambert weight if we overrode it
+        if saved_logit is not None:
+            loss_fn.lunar_lambert_logit.data = saved_logit
 
 
 @torch.no_grad()
@@ -488,7 +1020,9 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
             if len(images) == num_samples:
                 break
 
-    fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
+    n_cols = 7
+    scale = 4
+    fig, axes = plt.subplots(num_samples, n_cols, figsize=(scale * n_cols, scale * num_samples))
     plt.subplots_adjust(wspace=0.1, hspace=0.1)
     crop_size = 128
 
@@ -504,15 +1038,15 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
             normed = np.clip((detrended - dp2) / (dp98 - dp2), 0.0, 1.0) if dp98 > dp2 else np.zeros_like(detrended)
         else:
             normed = np.zeros_like(z_data)
-        normed[~mask] = np.nan
+        # normed[~mask] = np.nan
         return normed
 
     for idx in tqdm(range(num_samples), desc="Generating thumbnails"):
         img_np = np.clip((np.transpose(images[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
         dtm_np = np.clip((np.transpose(dtms[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
         mask_np = masks[idx][0].astype(bool)
-        img_np[~mask_np] = np.nan
-        dtm_np[~mask_np] = np.nan
+        # img_np[~mask_np] = np.nan
+        # dtm_np[~mask_np] = np.nan
 
         dtm_full_1ch = dtm_np[..., 0]
         detrended_full_norm = detrend_and_stretch(dtm_full_1ch, mask_np)
@@ -533,27 +1067,28 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
             slope_norm = np.clip((slope_mag - p2) / (p98 - p2), 0.0, 1.0) if p98 > p2 else np.zeros_like(slope_mag)
         else:
             slope_norm = np.zeros_like(slope_mag)
-        slope_norm[~mask_crop] = np.nan
+        # slope_norm[~mask_crop] = np.nan
         detrended_crop_norm = detrend_and_stretch(dtm_crop, mask_crop)
 
         axes[idx, 0].imshow(img_np)
-        axes[idx, 1].imshow(dtm_full_1ch, cmap="terrain")
-        axes[idx, 2].imshow(detrended_full_norm, cmap="terrain")
-        axes[idx, 3].imshow(img_crop)
-        axes[idx, 4].imshow(slope_norm, cmap="magma")
-        axes[idx, 5].imshow(detrended_crop_norm, cmap="terrain")
+        axes[idx, 1].imshow(mask_np, cmap="gray", vmin=0, vmax=1)
+        axes[idx, 2].imshow(dtm_full_1ch, cmap="terrain")
+        axes[idx, 3].imshow(detrended_full_norm, cmap="terrain")
+        axes[idx, 4].imshow(img_crop)
+        axes[idx, 5].imshow(slope_norm, cmap="magma")
+        axes[idx, 6].imshow(detrended_crop_norm, cmap="terrain")
         for ax in axes[idx]:
             ax.axis("off")
         if idx == 0:
             for ax, t in zip(
                     axes[0],
-                    ["Ortho (Full)", "DTM (Full)", "Detrended (Full)", f"Ortho Zoom ({crop_size}px)",
+                    ["Ortho (Full)", "Mask (Full)", "DTM (Full)", "Detrended (Full)", f"Ortho Zoom ({crop_size}px)",
                      f"Masked Slope ({crop_size}px)", f"Masked Detrend ({crop_size}px)"],
             ):
                 ax.set_title(t)
 
     save_path = output_dir / "dataset_thumbnails_detailed.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=300, transparent=False, facecolor="white")
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, transparent=False, facecolor="white")
     plt.close(fig)
     logger.info(f"Detailed thumbnails successfully saved to: {save_path}")
 
@@ -764,7 +1299,28 @@ def run_single_training(
         logger.info(f"Run {run_idx} at {output_dir} is already complete. Skipping.")
         with open(summary_path, "r") as f:
             test_summary = json.load(f)
-        return {"test_summary": test_summary, "output_dir": output_dir, "skipped": True}
+
+        # Load the saved dataframe so downstream plotting doesn't crash
+        import pandas as pd
+        test_df_path = output_dir / "test_results.csv"
+        test_df = pd.read_csv(test_df_path) if test_df_path.exists() else None
+
+        # Load the timestep ablation if it exists
+        ablation_path = output_dir / "timestep_ablation.json"
+        timestep_ablation = {}
+        if ablation_path.exists():
+            with open(ablation_path, "r") as f:
+                timestep_ablation = json.load(f)
+
+        return {
+            "test_summary": test_summary,
+            "test_df": test_df,
+            "timestep_ablation": timestep_ablation,
+            "output_dir": output_dir,
+            "skipped": True,
+            "val_history": [],  # Empty list to prevent KeyError in multi-run convergence plots
+            "test_aggregator": None  # Object is not in memory; requires a guard in the plotting function
+        }
 
     # Build data
     # FIXME
@@ -823,7 +1379,10 @@ def run_single_training(
 
     if config.training.get("use_ema", True):
         logger.info("EMA is ENABLED.")
-        callbacks.append(EMACallback())
+        callbacks.append(FasterEMAWeightAveraging(
+            decay=config.training.get("ema_decay", False),
+            device=config.training.get("ema_device", None)
+        ))
     else:
         logger.info("EMA is DISABLED.")
 
@@ -932,15 +1491,12 @@ def run_single_training(
 
     # Timestep ablation
     logger.info("Running timestep ablation...")
-    if config.training.get("use_ema", True) and module._ema_initialised:
-        module.load_ema_weights()
+
     timestep_results = module.run_timestep_ablation(
         loaders["test"],
         step_counts=[1, 2, 4, 8, 10, 20],
         max_batches=config.training.get("ablation_max_batches"),
     )
-    if config.training.get("use_ema", True) and module._ema_initialised:
-        module.restore_training_weights()
 
     if trainer.is_global_zero:
         with open(output_dir / "timestep_ablation.json", "w") as f:
@@ -966,7 +1522,14 @@ def run_single_training(
             primary_metric="photo_consistency",
             secondary_metrics=["delta_1", "normal_angular_error"],
             title="Mars DTM: inference quality vs Euler steps",
-            save_path=fig_dir / "timestep_ablation_rmse.pdf",
+            save_path=fig_dir / "timestep_ablation_photo.pdf",
+        )
+        plt.close(fig)
+
+        fig = plot_pareto_frontier(
+            metrics_per_step=timestep_results,
+            primary_metric="rmse",
+            save_path=fig_dir / "pareto_frontier_rmse.pdf",
         )
         plt.close(fig)
 
@@ -1103,7 +1666,11 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
 
 def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
     """Generate detailed per-patch analysis from the best run."""
-    aggregator = best_run["test_aggregator"]
+    aggregator = best_run.get("test_aggregator")
+    if aggregator is None:
+        logger.warning("Test aggregator not found in memory (run was skipped). Skipping patch analysis plotting.")
+        return
+
     worst = aggregator.worst_k("rmse", k=5)
     best = aggregator.best_k("rmse", k=5)
     logger.info("Worst 5 test patches: %s", worst)
@@ -1130,7 +1697,7 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
     ax.set_xlabel("RMSE (m)")
     ax.set_ylabel("Count")
     ax.set_title("Test RMSE distribution with worst patches")
-    fig.savefig(fig_dir / "rmse_distribution.pdf", bbox_inches="tight")
+    save_fig(fig, fig_dir / "rmse_distribution.pdf", bbox_inches="tight")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -1140,7 +1707,7 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
         ax.set_ylabel("Elevation RMSE (m)")
         ax.set_title("Error vs terrain complexity")
         fig.colorbar(ax.collections[0], label="Normal error (°)")
-        fig.savefig(fig_dir / "error_vs_complexity.pdf", bbox_inches="tight")
+        save_fig(fig, fig_dir / "error_vs_complexity.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1190,6 +1757,11 @@ def dataload_switch_test(config, args):
                 pass
 
 
+def hash_config(config: OmegaConf):
+    raw = json.dumps(OmegaConf.to_container(config, resolve=True), sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:4]
+
+
 def main():
     import warnings
 
@@ -1209,6 +1781,11 @@ def main():
     parser.add_argument("--view_loss_physics", action="store_true")
     parser.add_argument("--view_loss_components", action="store_true")
     parser.add_argument("--view_invalid_fill", action="store_true")
+    parser.add_argument("--view_seam_artifacts", action="store_true")
+    parser.add_argument("--view_tin_artifacts", action="store_true")
+    parser.add_argument("--view_solar_distribution", action="store_true")
+    parser.add_argument("--view_augmentations", action="store_true")
+    parser.add_argument("--all_viz", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
@@ -1222,19 +1799,43 @@ def main():
         config.data.fold_idx = args.fold_idx
 
     is_global_zero = int(os.environ.get("GLOBAL_RANK", os.environ.get("RANK", 0))) == 0
-    config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type", "depthfm")
+    config_hash = hash_config(config)
+
+    config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type",
+                                                                                     "depthfm") / config_hash
+
+    logger.info("Saving the data to the output directory: %s", config.training.output_dir)
 
     # Log hardware info
     if is_global_zero:
         logger.info("Hardware: %d CPU cores detected, %d GPUs, workers/GPU=%d", _TOTAL_CORES, _NUM_GPUS_DEFAULT,
                     _WORKERS_PER_GPU)
 
+    all_viz = args.all_viz
     # Inspection modes
-    inspection = args.analyze_masks or args.view_thumbnails or args.analyze_topography or args.view_loss_physics or args.view_loss_components or args.view_invalid_fill
+    inspection = (all_viz or
+                  args.analyze_masks or
+                  args.view_thumbnails or
+                  args.analyze_topography or
+                  args.view_loss_physics or
+                  args.view_loss_components or
+                  args.view_invalid_fill or
+                  args.view_tin_artifacts or
+                  args.view_solar_distribution or
+                  args.view_seam_artifacts or
+                  args.view_augmentations)
     if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
             L.seed_everything(args.seed, workers=True)
+            # For the visualisation we do not want to use the distributed setup, just GPU 0, as such to trick the
+            # creation for the dataloaders we want to have it look at the full dataset; however, it splits per
+            # rank using the WORLD_SIZE environment variable
+            if "WORLD_SIZE" in os.environ:
+                del os.environ["WORLD_SIZE"]
+                logger.warning(
+                    "Because we are running in a distributed environment and we are planning to run visualisation, we disable the other GPUs")
+
             loaders = build_dataloaders(config, split_seed=args.seed, parallel=config.data.get("parallel_load", False))
             output_path = Path(config.training.output_dir) / "inspection"
 
@@ -1243,14 +1844,22 @@ def main():
             if args.analyze_masks:
                 for split_name, loader in loaders.items():
                     compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
-            if args.view_thumbnails:
+            if all_viz or args.view_thumbnails:
                 generate_thumbnail_grids(loaders["val"], output_dir=output_path, num_samples=8)
-            if args.view_loss_physics:
+            if all_viz or args.view_loss_physics:
                 visualize_loss_physics(loaders["val"], output_dir=output_path, num_samples=8)
-            if args.view_loss_components:
+            if all_viz or args.view_loss_components:
                 visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
-            if args.view_invalid_fill:
+            if all_viz or args.view_invalid_fill:
                 visualize_invalid_fill(loaders["train"], output_dir=output_path, num_samples=16)
+            if all_viz or args.view_seam_artifacts:
+                visualize_seam_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+            if all_viz or args.view_tin_artifacts:
+                visualize_tin_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+            if all_viz or args.view_solar_distribution:
+                visualize_solar_distribution(loaders["train"], output_dir=output_path)
+            if all_viz or args.view_augmentations:
+                visualize_random_flips_and_rotations(loaders["train"], output_dir=output_path, num_samples=2)
 
             logger.info("Data inspection complete. Exiting without training.")
         return

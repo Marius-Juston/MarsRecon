@@ -177,20 +177,30 @@ class PhotoclinometricLoss(nn.Module):
          weight, correctly modeling the limb-darkening behaviour of regolith.
       2. Multi-scale rendering at 1×, 2×, 4× — enforces macro-scale
          topographic consistency alongside fine detail.
-      3. Combined Pearson + SSIM loss — Pearson captures global correlation,
-         SSIM captures local structural similarity (Wang et al. 2004).
-         SSIM is more perceptually meaningful and produces stabler gradients
-         than pure Pearson at convergence.
-      4. Variance floor and proper epsilon handling to prevent NaN gradients
-         when renders are near-flat (e.g. shadow regions).
+      3. Combined Pearson + z-normalised SSIM loss.
+         Pearson captures global correlation; SSIM captures local
+         structural similarity (Wang et al. 2004). Both components are
+         applied to per-image z-score normalised inputs, making the loss
+         invariant to global luminance and contrast mismatch between the
+         render and the ortho. This matters here because the scene
+         intensity/ambient parameters are fitted with a pure Lambertian
+         OLS, while the render uses Lunar-Lambert — so a systematic
+         luminance offset is expected and should not be penalised.
+      4. Unclamped render. Because both loss terms are scale- and
+         shift-invariant, clamping the render to [-1, 1] would only
+         destroy gradient information in saturated shadow pixels — which
+         is exactly where photoclinometric information is densest.
+      5. Variance floor and proper epsilon handling to prevent NaN
+         gradients when renders are near-flat (e.g. shadow regions).
 
     The loss is:
-        L = (1 - α) * (1 - Pearson) + α * (1 - SSIM)
-    averaged over scales, where α = 0.5 by default.
+        L = (1 - α) * (1 - Pearson) + α * (1 - SSIM_z)
+    averaged over scales, where α = 0.5 by default and SSIM_z is SSIM
+    computed on z-score normalised inputs.
 
     NaN-safety:
         Every code path is hardened against NaN under DDP + gradient
-        accumulation + mixed precision.  Key invariants:
+        accumulation + mixed precision. Key invariants:
         - NEVER early-return with a detached zero — always flow through
           self.lunar_lambert_logit so DDP gradient sync sees every param.
         - All internal math forced to float32 to avoid bf16/fp16 overflow
@@ -230,7 +240,7 @@ class PhotoclinometricLoss(nn.Module):
 
         Critical for DDP: if any rank skips the real loss (e.g. no valid
         pixels), it must still produce gradients for every parameter that
-        other ranks are updating.  A plain `torch.tensor(0.0)` would cause
+        other ranks are updating. A plain `torch.tensor(0.0)` would cause
         a DDP gradient sync mismatch → hang or NaN.
 
         The `0.0 * sigmoid(logit)` produces zero loss with a zero gradient
@@ -274,11 +284,16 @@ class PhotoclinometricLoss(nn.Module):
             self, normals: torch.Tensor, l_dir: torch.Tensor,
             intensity: torch.Tensor, ambient: torch.Tensor,
     ) -> torch.Tensor:
-        """Full Lunar-Lambert reflectance (McEwen 1991).
+        """Full Lunar-Lambert reflectance (McEwen 1991), unclamped.
 
         NaN-safe: cos_e is clamped to [1e-4, 1] to prevent Lommel-Seeliger
-        denominator collapse.  Even at extreme incidence angles where
+        denominator collapse. Even at extreme incidence angles where
         cos_i ≈ 0 and cos_e ≈ 0, the division stays bounded.
+
+        No final clamp on the render: downstream Pearson and z-SSIM are
+        scale- and shift-invariant, so clamping would only saturate
+        gradients in exactly the shadow pixels where photoclinometric
+        information is densest.
         """
         # Cosine of incidence angle
         cos_i = torch.sum(normals * l_dir, dim=1, keepdim=True)
@@ -297,7 +312,59 @@ class PhotoclinometricLoss(nn.Module):
         # Learnable blend
         L = self.lunar_lambert_weight
         render = (L * lambert + (1.0 - L) * lommel_seeliger) * intensity + ambient
-        return torch.clamp(render, min=-1.0, max=1.0)
+        return render
+
+    # ------------------------------------------------------------------
+    # Public helpers — used by visualization utilities so they share the
+    # exact same math as the training loss. If the render/normal math
+    # ever changes, the viz updates automatically.
+    # ------------------------------------------------------------------
+
+    def surface_normals(self, depth: torch.Tensor) -> torch.Tensor:
+        """Public: compute unit surface normals from a depth map."""
+        return self._get_surface_normals(depth.float())
+
+    def render_from_depth(
+            self, depth: torch.Tensor, sun_vector: torch.Tensor,
+            intensity: torch.Tensor, ambient: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Public: render a depth map under the current Lunar-Lambert model.
+
+        Handles input normalisation/broadcasting so callers can pass
+        per-sample sun vectors and scalar exposure parameters directly.
+
+        Returns:
+            render:  (B, 1, H, W) unclamped radiance.
+            normals: (B, 3, H, W) unit surface normals.
+        """
+        B = depth.shape[0]
+        depth = depth.float()
+        normals = self._get_surface_normals(depth)
+        l_dir = F.normalize(sun_vector.float(), p=2, dim=1, eps=1e-6).view(B, 3, 1, 1)
+        intensity_b = intensity.float().reshape(B, 1, 1, 1)
+        ambient_b = ambient.float().reshape(B, 1, 1, 1)
+        render = self._lunar_lambert_render(normals, l_dir, intensity_b, ambient_b)
+        return render, normals
+
+    @staticmethod
+    def _zscore(x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """Per-image z-score normalisation within the valid mask.
+
+        After this, values over valid pixels have mean ≈ 0 and std ≈ 1.
+        This makes downstream local statistics (for SSIM) invariant to:
+          - Global luminance shift (expected: Lunar-Lambert render has a
+            systematic offset vs. a Lambertian-fitted intensity/ambient).
+          - Global contrast scale (expected: LS component compresses
+            dynamic range relative to pure Lambert).
+        Local structural similarity is preserved.
+        """
+        B = x.shape[0]
+        vc = valid_mask.view(B, -1).sum(dim=1).view(B, 1, 1, 1).clamp(min=1.0)
+        mean = (x * valid_mask).view(B, -1).sum(dim=1).view(B, 1, 1, 1) / vc
+        centered = (x - mean) * valid_mask
+        var = (centered ** 2).view(B, -1).sum(dim=1).view(B, 1, 1, 1) / vc
+        std = torch.sqrt(var + 1e-6)
+        return (x - mean) / std
 
     def _masked_pearson(
             self, render: torch.Tensor, ortho: torch.Tensor,
@@ -358,25 +425,38 @@ class PhotoclinometricLoss(nn.Module):
             self, render: torch.Tensor, ortho: torch.Tensor,
             valid_mask: torch.Tensor, window_size: int = 7,
     ) -> torch.Tensor:
-        """Differentiable SSIM loss (1 - SSIM), NaN-safe.
+        """Differentiable SSIM loss on z-score normalised inputs, NaN-safe.
 
-        Uses the simplified SSIM formulation from Wang et al. 2004 with
-        Gaussian-weighted local statistics.
+        Z-scoring the inputs makes SSIM focus on local structural
+        similarity and effectively ignores global luminance / contrast
+        mismatch. This is important because:
+          - The render uses Lunar-Lambert while `intensity`/`ambient` are
+            fitted with a pure Lambertian OLS — a luminance offset is
+            expected and uninformative.
+          - The learnable L blend further shifts absolute luminance each
+            step; without z-scoring, SSIM would chase that rather than
+            the topography.
+
+        Constants scaled for z-scored data (effective data_range ≈ 6).
         """
-        C1, C2 = 0.01 ** 2, 0.03 ** 2  # stability constants (data_range ≈ 1.0)
+        # Wang 2004: C1 = (K1 * L)², C2 = (K2 * L)², with L = data range.
+        # Pre-z-score L ≈ 2 (inputs in [-1, 1]); post-z-score L ≈ 6 (≈ ±3σ).
+        data_range = 6.0
+        C1 = (0.01 * data_range) ** 2
+        C2 = (0.03 * data_range) ** 2
 
-        # nan_to_num before filling: if render has NaN from degenerate
-        # normals, replace with 0 before computing statistics
-        render_safe = torch.nan_to_num(render, nan=0.0, posinf=1.0, neginf=-1.0)
-        ortho_safe = torch.nan_to_num(ortho, nan=0.0, posinf=1.0, neginf=-1.0)
+        # nan_to_num before any stats: degenerate normals can produce NaN
+        render_safe = torch.nan_to_num(render, nan=0.0, posinf=6.0, neginf=-6.0)
+        ortho_safe = torch.nan_to_num(ortho, nan=0.0, posinf=6.0, neginf=-6.0)
 
-        # Fill invalid regions with per-image mean to avoid boundary artifacts
-        r_mean_fill = (render_safe * valid_mask).sum(dim=(-2, -1), keepdim=True) / \
-                      (valid_mask.sum(dim=(-2, -1), keepdim=True) + 1e-8)
-        o_mean_fill = (ortho_safe * valid_mask).sum(dim=(-2, -1), keepdim=True) / \
-                      (valid_mask.sum(dim=(-2, -1), keepdim=True) + 1e-8)
-        r_filled = render_safe * valid_mask + r_mean_fill * (1.0 - valid_mask)
-        o_filled = ortho_safe * valid_mask + o_mean_fill * (1.0 - valid_mask)
+        # Per-image z-score within valid mask
+        render_z = self._zscore(render_safe, valid_mask)
+        ortho_z = self._zscore(ortho_safe, valid_mask)
+
+        # Fill invalid regions with 0 (= the z-score mean) to avoid
+        # discontinuities at the mask boundary contaminating local stats.
+        r_filled = render_z * valid_mask
+        o_filled = ortho_z * valid_mask
 
         # Gaussian kernel for local statistics
         pad = window_size // 2
@@ -479,10 +559,10 @@ class PhotoclinometricLoss(nn.Module):
             normals = self._get_surface_normals(d_s)
             render = self._lunar_lambert_render(normals, l_dir, intensity, ambient)
 
-            # Pearson component
+            # Pearson component (scale- and shift-invariant by construction)
             pearson_loss = self._masked_pearson(render, o_s, m_s, B)
 
-            # SSIM component
+            # SSIM component (on z-score normalised inputs)
             ssim_loss = self._masked_ssim(render, o_s, m_s)
 
             # Combined: (1-α)*Pearson + α*SSIM
