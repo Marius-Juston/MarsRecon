@@ -76,7 +76,7 @@ training:
     adam_epsilon: 1.0e-8
 
     lr_scheduler: "cosine"
-    lr_warmup_steps: 500
+    lr_warmup_steps: 1000
   shampoo:
     learning_rate: 1.0e-4
     weight_decay: 0.01
@@ -140,7 +140,7 @@ training:
   logger: "wandb"
   project_name: "mars-depthfm"
   run_name: "sd21-hirise-v1"
-  output_dir: "outputs/mars_depthfm_hirise"
+  output_dir: "outputs/mars_depthfm_hirise_large"
   resume_from: null
 
   use_ema: true
