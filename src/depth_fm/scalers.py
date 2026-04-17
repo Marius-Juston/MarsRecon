@@ -105,7 +105,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +153,8 @@ class InferenceResult:
 # ──────────────────────────────────────────────────────────────────────
 
 def fit_plane(
-    elevation: torch.Tensor,
-    valid_mask: torch.Tensor,
+        elevation: torch.Tensor,
+        valid_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Fit z = ax + by + c to elevation using normalised [-1,1] coords.
 
@@ -200,8 +199,8 @@ def fit_plane(
 
 
 def evaluate_plane(
-    params: torch.Tensor, H: int, W: int,
-    device: torch.device = None, dtype: torch.dtype = torch.float32,
+        params: torch.Tensor, H: int, W: int,
+        device: torch.device = None, dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Evaluate plane on (H, W) grid. Returns (1, H, W)."""
     if device is None:
@@ -233,7 +232,7 @@ class GlobalFixedNormalizer:
         self.global_scale = global_scale
 
     def normalize_for_training(
-        self, elevation: torch.Tensor, valid_mask: torch.Tensor,
+            self, elevation: torch.Tensor, valid_mask: torch.Tensor,
     ) -> TrainingNormResult:
         """Training-time normalization (GT elevation available)."""
         elevation = torch.nan_to_num(elevation, nan=0.0)
@@ -330,7 +329,7 @@ class GlobalLogNormalizer:
         self._inv_log2 = 1.0 / self._log2
 
     def normalize_for_training(
-        self, elevation: torch.Tensor, valid_mask: torch.Tensor,
+            self, elevation: torch.Tensor, valid_mask: torch.Tensor,
     ) -> TrainingNormResult:
         """Training-time normalization."""
         elevation = torch.nan_to_num(elevation, nan=0.0)
@@ -360,9 +359,9 @@ class GlobalLogNormalizer:
 
         # 3. Signed log compression
         normed = (
-            torch.sign(residual)
-            * torch.log1p(residual.abs() / self.ref_scale)
-            * self._inv_log2
+                torch.sign(residual)
+                * torch.log1p(residual.abs() / self.ref_scale)
+                * self._inv_log2
         )
         normed = torch.clamp(normed, -1.0, 1.0)
         normed = torch.where(valid, normed, torch.zeros_like(normed))
@@ -382,9 +381,9 @@ class GlobalLogNormalizer:
         inverse: sign(n) * ref * expm1(|n| * ln2)
         """
         return (
-            torch.sign(prediction)
-            * self.ref_scale
-            * torch.expm1(prediction.abs() * self._log2)
+                torch.sign(prediction)
+                * self.ref_scale
+                * torch.expm1(prediction.abs() * self._log2)
         )
 
 
@@ -416,17 +415,17 @@ class AdaptiveWithScaleHead:
     """
 
     def __init__(
-        self,
-        min_scale: float = 0.1,
-        log_scale_mean: float = 1.5,   # ~exp(1.5) ≈ 4.5m
-        log_scale_std: float = 1.0,
+            self,
+            min_scale: float = 0.1,
+            log_scale_mean: float = 1.5,  # ~exp(1.5) ≈ 4.5m
+            log_scale_std: float = 1.0,
     ):
         self.min_scale = min_scale
         self.log_scale_mean = log_scale_mean
         self.log_scale_std = log_scale_std
 
     def normalize_for_training(
-        self, elevation: torch.Tensor, valid_mask: torch.Tensor,
+            self, elevation: torch.Tensor, valid_mask: torch.Tensor,
     ) -> dict:
         """Returns both the normalised residual AND the scale target.
 
@@ -478,9 +477,9 @@ class AdaptiveWithScaleHead:
         }
 
     def denormalize_prediction(
-        self,
-        prediction: torch.Tensor,
-        predicted_log_scale: torch.Tensor,
+            self,
+            prediction: torch.Tensor,
+            predicted_log_scale: torch.Tensor,
     ) -> torch.Tensor:
         """Inference-time inverse using the network's scale prediction.
 
@@ -502,330 +501,6 @@ class AdaptiveWithScaleHead:
             scale = scale.view(-1, 1, 1)
 
         return prediction * scale
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Reconstruction: recovering the trend from overlaps
-# ──────────────────────────────────────────────────────────────────────
-
-def recover_trend_offsets_from_overlaps(
-    physical_residuals: list[np.ndarray],
-    canvas_positions: list[tuple[int, int]],
-    patch_size: int,
-    regularization: float = 1e-4,
-) -> np.ndarray:
-    """Recover per-patch constant offsets from overlap consistency.
-
-    After denormalization, each predicted patch gives us the physical
-    residual (elevation minus unknown plane). In overlap regions,
-    two patches observe the same terrain, so their residuals should
-    agree up to a constant offset (the difference in their unknown
-    plane values at that location).
-
-    For patches with 50% overlap, the offset between adjacent patches
-    is approximately constant across the overlap (because the plane
-    difference varies slowly). So we solve:
-
-        residual_j(overlap) ≈ residual_i(overlap) + offset_ij
-
-    Then find globally consistent offsets O_i such that:
-        O_j - O_i ≈ offset_ij
-
-    With anchor O_0 = 0.
-
-    This is a simple sparse linear system with 1 unknown per patch.
-
-    Args:
-        physical_residuals: List of (H, W) arrays, denormalised predictions.
-        canvas_positions: List of (row, col) grid coordinates.
-        patch_size: Pixel size of each patch.
-
-    Returns:
-        (N,) array of per-patch offsets. Add this to each residual to
-        get a globally consistent surface.
-    """
-    import scipy.sparse as sp
-    import scipy.sparse.linalg as spla
-    from collections import defaultdict
-
-    N = len(physical_residuals)
-
-    # Build spatial index
-    grid_map = defaultdict(int)
-    for idx, (r, c) in enumerate(canvas_positions):
-        grid_map[(r, c)] = idx
-
-    # Compute pairwise offsets from overlaps
-    rows, cols, vals, rhs = [], [], [], []
-    eq = 0
-
-    neighbor_offsets = [(0, 1), (1, 0), (1, 1), (1, -1)]
-
-    for idx_i, (ri, ci) in enumerate(canvas_positions):
-        for dr, dc in neighbor_offsets:
-            key_j = (ri + dr, ci + dc)
-            if key_j not in grid_map:
-                continue
-            idx_j = grid_map[key_j]
-
-            # Compute overlap region
-            stride = patch_size // 2  # 50% overlap
-            y_off = dr * stride
-            x_off = dc * stride
-
-            # Overlap bounds in patch_i coords
-            oy_start_i = max(0, y_off)
-            oy_end_i = min(patch_size, patch_size + y_off)
-            ox_start_i = max(0, x_off)
-            ox_end_i = min(patch_size, patch_size + x_off)
-
-            # Corresponding bounds in patch_j coords
-            oy_start_j = oy_start_i - y_off
-            oy_end_j = oy_end_i - y_off
-            ox_start_j = ox_start_i - x_off
-            ox_end_j = ox_end_i - x_off
-
-            r_i = physical_residuals[idx_i][oy_start_i:oy_end_i, ox_start_i:ox_end_i]
-            r_j = physical_residuals[idx_j][oy_start_j:oy_end_j, ox_start_j:ox_end_j]
-
-            if r_i.size == 0:
-                continue
-
-            # Median offset is robust to boundary artifacts
-            offset_ij = float(np.median(r_j - r_i))
-
-            # O_j - O_i = offset_ij
-            rows.extend([eq, eq])
-            cols.extend([idx_j, idx_i])
-            vals.extend([1.0, -1.0])
-            rhs.append(offset_ij)
-            eq += 1
-
-    if eq == 0:
-        logger.warning("No overlap constraints found. Returning zero offsets.")
-        return np.zeros(N)
-
-    # Anchor: O_0 = 0
-    rows.append(eq)
-    cols.append(0)
-    vals.append(1000.0)
-    rhs.append(0.0)
-    eq += 1
-
-    A = sp.csr_matrix((vals, (rows, cols)), shape=(eq, N))
-    b = np.array(rhs)
-
-    offsets = spla.lsqr(A, b, damp=regularization)[0]
-
-    logger.info(
-        "Recovered %d offsets from %d constraints. Range: [%.2f, %.2f] m",
-        N, eq - 1, offsets.min(), offsets.max(),
-    )
-    return offsets
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Full inference pipeline
-# ──────────────────────────────────────────────────────────────────────
-
-def reconstruct_strip_from_predictions(
-    normalizer,
-    predictions: list[np.ndarray],
-    grid_positions: list[tuple[int, int]],
-    patch_size: int = 512,
-    poisson_screening: float = 0.01,
-) -> np.ndarray:
-    """Complete inference pipeline: predictions → seamless DTM strip.
-
-    1. Denormalize each prediction to physical residual (metres)
-    2. Recover per-patch offsets from overlap consistency
-    3. Apply offsets
-    4. Poisson-blend into seamless strip
-
-    Args:
-        normalizer: GlobalFixedNormalizer or GlobalLogNormalizer instance.
-        predictions: List of (H, W) numpy arrays, raw network output in [-1,1].
-        grid_positions: List of (row, col) grid positions.
-        patch_size: Pixel size of each patch.
-        poisson_screening: Screening weight for Poisson blending.
-
-    Returns:
-        (canvas_H, canvas_W) numpy array — the reconstructed DTM.
-    """
-    import torch
-    from strip_reconstruction import (
-        PatchPrediction, AlignedPatch,
-        poisson_blend_strip, _distance_weight,
-    )
-
-    # 1. Denormalize to physical residuals
-    physical = []
-    for pred_np in predictions:
-        pred_t = torch.from_numpy(pred_np).unsqueeze(0).float()
-        phys_t = normalizer.denormalize_prediction(pred_t)
-        physical.append(phys_t.squeeze(0).numpy())
-
-    # 2. Recover offsets from overlaps
-    offsets = recover_trend_offsets_from_overlaps(
-        physical, grid_positions, patch_size
-    )
-
-    # 3. Apply offsets and prepare for blending
-    stride = patch_size // 2
-    max_row = max(r for r, c in grid_positions)
-    max_col = max(c for r, c in grid_positions)
-    canvas_H = (max_row + 1) * stride + patch_size
-    canvas_W = (max_col + 1) * stride + patch_size
-
-    aligned = []
-    for i, ((row, col), phys, offset) in enumerate(
-        zip(grid_positions, physical, offsets)
-    ):
-        aligned.append(AlignedPatch(
-            row=row, col=col,
-            aligned=phys + offset,
-            confidence=np.ones_like(phys),
-            canvas_y=row * stride,
-            canvas_x=col * stride,
-            scale=1.0,
-            shift=offset,
-        ))
-
-    # 4. Poisson blend
-    result = poisson_blend_strip(
-        aligned, canvas_H, canvas_W, patch_size, poisson_screening
-    )
-
-    return result
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Statistics computation (run ONCE on your dataset)
-# ──────────────────────────────────────────────────────────────────────
-
-def compute_detrended_residual_stats(
-    dataset,
-    sampler,
-    resolution: int = 512,
-    max_patches: int = 5000,
-    output_path: str = "detrended_residual_stats.json",
-) -> dict:
-    """Compute the global scale factor from plane-detrended residuals.
-
-    Run this ONCE before training.
-
-    Iterates over patches, fits a plane to each, computes the residual,
-    and collects the distribution of |residual| values.
-
-    The returned ``recommended_global_scale`` (p98) is the value to
-    use as ``global_scale`` in ``GlobalFixedNormalizer`` or as
-    ``ref_scale`` in ``GlobalLogNormalizer``.
-
-    Returns dict with percentiles, saved to output_path.
-    """
-    import json
-    from tqdm import tqdm
-
-    all_abs = []
-    all_rms = []
-    all_p98 = []
-
-    indices = list(sampler)[:max_patches]
-
-    for geo_slice in tqdm(indices, desc="Computing detrended stats"):
-        try:
-            sample = dataset[geo_slice]
-            elevation = sample["elevation"]
-            if elevation.ndim == 4:
-                elevation = elevation[0]
-
-            valid = (torch.isfinite(elevation) & (elevation != 0.0)).float()
-            if valid.mean() < 0.3:
-                continue
-
-            if elevation.shape[-1] != resolution or elevation.shape[-2] != resolution:
-                elevation = F.interpolate(
-                    elevation.unsqueeze(0), (resolution, resolution),
-                    mode="bilinear", align_corners=False,
-                ).squeeze(0)
-                valid = F.interpolate(
-                    valid.unsqueeze(0), (resolution, resolution),
-                    mode="nearest-exact",
-                ).squeeze(0)
-
-            params = fit_plane(elevation, valid)
-            plane = evaluate_plane(params, resolution, resolution, elevation.device)
-            residual = elevation - plane
-
-            valid_bool = valid.bool()
-            if valid_bool.any():
-                vr = residual[valid_bool]
-                abs_r = vr.abs()
-                rms = torch.sqrt((vr ** 2).mean()).item()
-                p98 = torch.quantile(abs_r, 0.98).item()
-
-                # Sample pixels
-                if len(abs_r) > 500:
-                    idx = torch.randperm(len(abs_r))[:500]
-                    abs_r = abs_r[idx]
-
-                all_abs.append(abs_r.cpu().numpy())
-                all_rms.append(rms)
-                all_p98.append(p98)
-
-        except Exception as e:
-            logger.debug("Skip: %s", e)
-
-    if not all_abs:
-        raise RuntimeError("No valid patches!")
-
-    all_abs_np = np.concatenate(all_abs)
-    all_rms_np = np.array(all_rms)
-    all_p98_np = np.array(all_p98)
-
-    stats = {
-        "n_patches": len(all_rms),
-        "pixel_abs_residual_percentiles": {
-            f"p{p}": float(np.percentile(all_abs_np, p))
-            for p in [50, 75, 90, 95, 98, 99]
-        },
-        "patch_rms_distribution": {
-            "min": float(all_rms_np.min()),
-            "p25": float(np.percentile(all_rms_np, 25)),
-            "median": float(np.median(all_rms_np)),
-            "p75": float(np.percentile(all_rms_np, 75)),
-            "p90": float(np.percentile(all_rms_np, 90)),
-            "p98": float(np.percentile(all_rms_np, 98)),
-            "max": float(all_rms_np.max()),
-        },
-        "patch_p98_distribution": {
-            "min": float(all_p98_np.min()),
-            "median": float(np.median(all_p98_np)),
-            "p90": float(np.percentile(all_p98_np, 90)),
-            "max": float(all_p98_np.max()),
-        },
-        "recommended_global_scale": float(np.percentile(all_abs_np, 98)),
-        "recommended_log_ref_scale": float(np.percentile(all_abs_np, 90)),
-    }
-
-    with open(output_path, "w") as f:
-        json.dump(stats, f, indent=2)
-
-    logger.info(
-        "Detrended residual stats (%d patches):\n"
-        "  Pixel |residual| p98 = %.2f m → use as global_scale\n"
-        "  Pixel |residual| p90 = %.2f m → use as log ref_scale\n"
-        "  Patch RMS range: %.2f – %.2f m\n"
-        "  Saved: %s",
-        stats["n_patches"],
-        stats["recommended_global_scale"],
-        stats["recommended_log_ref_scale"],
-        stats["patch_rms_distribution"]["min"],
-        stats["patch_rms_distribution"]["max"],
-        output_path,
-    )
-
-    return stats
 
 
 @dataclass
@@ -915,6 +590,7 @@ def _normalize_ortho(
 
     return torch.clamp(ortho, -1.0, 1.0)
 
+
 class LocalStripOrthoNormalizer:
     """Normalises ortho patches using strip-level quantiles.
 
@@ -933,7 +609,6 @@ class LocalStripOrthoNormalizer:
     def __init__(self, *args, **kwargs):
         pass
 
-
     def normalize(self, ortho: torch.Tensor) -> torch.Tensor:
         """Normalise an ortho patch to [-1, 1].
 
@@ -951,4 +626,3 @@ class LocalStripOrthoNormalizer:
         Useful for visualization or re-rendering.
         """
         raise NotImplementedError("Cannot invert normalization")
-

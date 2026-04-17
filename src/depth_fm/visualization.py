@@ -832,6 +832,7 @@ def plot_lunar_lambert_comparison(
                 t = t.unsqueeze(0)
 
         return t.to(device)
+
     # --- Cast all inputs to standardized Tensors ---
     pred_dtm_t = _ensure_tensor(pred_dtm, is_spatial=True)
     gt_dtm_t = _ensure_tensor(gt_dtm, is_spatial=True)

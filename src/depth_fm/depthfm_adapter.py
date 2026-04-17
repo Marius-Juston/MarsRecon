@@ -572,7 +572,7 @@ def _gmrf_fill_channel(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-# TODO instead of using GMRF, use a more approate distribution, especailly for the height maps since that does not follow a gaussian distribution but probably closer to a log normal distribution, or specifically from the 
+# TODO instead of using GMRF, use a more approate distribution, especailly for the height maps since that does not follow a gaussian distribution but probably closer to a log normal distribution, or specifically from the
 def fill_voids_gmrf(
         image: torch.Tensor,
         dtm: torch.Tensor,
@@ -683,7 +683,8 @@ def fill_voids_gmrf(
 
     return filled_img_t, filled_dtm_t, eroded
 
-#TODO not relaly necessary thanks to the meta data num tiles data
+
+# TODO not relaly necessary thanks to the meta data num tiles data
 def detect_dtm_seam_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
                              line_length: int = 35,
                              num_angles: int = 8,
