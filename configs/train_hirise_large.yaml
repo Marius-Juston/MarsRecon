@@ -121,7 +121,7 @@ training:
     use_confidence_weighting: true
 
   # Validation and checkpointing
-  val_every_steps: 500
+  val_every_steps: 0.5
   save_every_steps: 100
   log_every_steps: 10
   num_val_samples: 8
