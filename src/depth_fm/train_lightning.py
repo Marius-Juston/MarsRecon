@@ -1522,7 +1522,7 @@ def run_single_training(
             primary_metric="photo_consistency",
             secondary_metrics=["delta_1", "normal_angular_error"],
             title="Mars DTM: inference quality vs Euler steps",
-            save_path=fig_dir / "timestep_ablation_rmse.pdf",
+            save_path=fig_dir / "timestep_ablation_photo.pdf",
         )
         plt.close(fig)
 
