@@ -572,7 +572,7 @@ def _gmrf_fill_channel(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
+# TODO instead of using GMRF, use a more approate distribution, especailly for the height maps since that does not follow a gaussian distribution but probably closer to a log normal distribution, or specifically from the 
 def fill_voids_gmrf(
         image: torch.Tensor,
         dtm: torch.Tensor,
