@@ -60,12 +60,12 @@ training:
   enable: true
 
   per_gpu_batch_size: 4
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   num_gpus: 4
   max_steps: 1000
   show_train_vis: true
 
-  optimizer: "shampoo"
+  optimizer: "adam"
 
   adamw:
     learning_rate: 2.0e-4
@@ -101,7 +101,7 @@ training:
     timestep_sampling: "logit_normal"
     logit_normal_mean: 0.0
     logit_normal_std: 1.0
-    noise_augmentation_alpha: 0.997
+    # noise_augmentation_alpha: 0.997
     sigma_min: 1.0e-4
 
   losses:
@@ -144,7 +144,7 @@ training:
   resume_from: null
 
   use_ema: true
-  ema_decay: 0.999
+  ema_decay: 0.99
   ema_device: "cpu" # Because we are using shampoo which uses extra memory, store EMA in CPU
 
   # 128 cores / 4 GPUs = 32 workers per process
