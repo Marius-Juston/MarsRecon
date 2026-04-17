@@ -145,7 +145,7 @@ training:
 
   use_ema: true
   ema_decay: 0.99
-  ema_device: "cpu" # Because we are using shampoo which uses extra memory, store EMA in CPU
+  ema_device: null # Because we are using shampoo which uses extra memory, store EMA in CPU, Adam is fine in GPU
 
   # 128 cores / 4 GPUs = 32 workers per process
   num_workers: 24
