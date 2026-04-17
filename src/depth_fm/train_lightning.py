@@ -107,6 +107,127 @@ def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"
 
 
 @torch.no_grad()
+def visualize_random_flips_and_rotations(dataloader, output_dir: Path, num_samples: int = 4):
+    """
+    Simulates the 8 deterministic states of flips and rotations to visually
+    validate that the sun vector stays physically locked to the terrain shading.
+    Evaluates 'num_samples' separate patches and saves an image for each.
+    """
+    logger.info(f"Generating Sun Vector Augmentation Validation for {num_samples} samples...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Collect n samples safely across batches
+    samples = []
+    for batch in dataloader:
+        B = batch["image"].shape[0]
+        for i in range(B):
+            samples.append({
+                "image": batch["image"][i],
+                "dtm": batch["dtm"][i],
+                "confidence": batch["confidence"][i],
+                "sun_vector": batch["sun_vector"][i]
+            })
+            if len(samples) >= num_samples:
+                break
+        if len(samples) >= num_samples:
+            break
+
+    # Define the core transformations to test (Name, H-Flip, V-Flip, k_rot)
+    transformations = [
+        ("Original", False, False, 0),
+        ("H-Flip", True, False, 0),
+        ("V-Flip", False, True, 0),
+        ("Rot 90 (CCW)", False, False, 1),
+        ("Rot 180", False, False, 2),
+        ("Rot 270 (CW)", False, False, 3),
+        ("H-Flip + Rot 90", True, False, 1),
+        ("V-Flip + Rot 270", False, True, 3),
+    ]
+
+    # 2. Generate a grid for each sample
+    for sample_idx, sample in enumerate(samples):
+        fig, axes = plt.subplots(len(transformations), 3, figsize=(15, 5 * len(transformations)))
+        plt.subplots_adjust(wspace=0.1, hspace=0.3)
+
+        base_img = sample["image"]  # (C, H, W)
+        base_dtm = sample["dtm"]  # (1, H, W)
+        base_conf = sample["confidence"]  # (1, H, W)
+        base_sun = sample["sun_vector"]  # (3,)
+
+        for i, (name, h_flip, v_flip, k_rot) in enumerate(transformations):
+            # Clone base tensors
+            img = base_img.clone()
+            dtm = base_dtm.clone()
+            conf = base_conf.clone()
+            sun = base_sun.clone()
+
+            # Apply exact augmentation logic
+            if h_flip:
+                img = torch.flip(img, [-1])
+                dtm = torch.flip(dtm, [-1])
+                conf = torch.flip(conf, [-1])
+                sun[0] = -sun[0]
+
+            if v_flip:
+                img = torch.flip(img, [-2])
+                dtm = torch.flip(dtm, [-2])
+                conf = torch.flip(conf, [-2])
+                sun[1] = -sun[1]
+
+            if k_rot > 0:
+                img = torch.rot90(img, k=k_rot, dims=[-2, -1])
+                dtm = torch.rot90(dtm, k=k_rot, dims=[-2, -1])
+                conf = torch.rot90(conf, k=k_rot, dims=[-2, -1])
+                sx, sy = sun[0].clone(), sun[1].clone()
+                if k_rot == 1:
+                    sun[0], sun[1] = sy, -sx
+                elif k_rot == 2:
+                    sun[0], sun[1] = -sx, -sy
+                elif k_rot == 3:
+                    sun[0], sun[1] = -sy, sx
+
+            # Format for matplotlib
+            img_np = np.clip((np.transpose(img.cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+            dtm_np = np.clip((dtm[0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+            mask_np = conf[0].cpu().numpy()
+
+            # Isolate spatial dimensions to place the arrow in the center
+            H, W = dtm_np.shape
+            cx, cy = W // 2, H // 2
+            vx, vy = sun[0].item(), sun[1].item()
+
+            # Scale arrow to be 30% of the image size for visibility
+            arrow_scale = min(W, H) * 0.3
+
+            # --- Plot Ortho ---
+            axes[i, 0].imshow(img_np, cmap='gray' if img_np.shape[-1] == 1 else None)
+            axes[i, 0].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
+                             linewidth=2)
+            axes[i, 0].set_title(f"Sample {sample_idx} | {name} - Ortho\nSun XY: [{vx:.2f}, {vy:.2f}]")
+            axes[i, 0].axis('off')
+
+            # --- Plot DTM ---
+            axes[i, 1].imshow(dtm_np, cmap='terrain')
+            axes[i, 1].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
+                             linewidth=2)
+            axes[i, 1].set_title(f"Sample {sample_idx} | {name} - DTM")
+            axes[i, 1].axis('off')
+
+            # --- Plot Mask ---
+            axes[i, 2].imshow(mask_np, cmap='gray')
+            axes[i, 2].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
+                             linewidth=2)
+            axes[i, 2].set_title(f"Sample {sample_idx} | {name} - Mask")
+            axes[i, 2].axis('off')
+
+        save_path = output_dir / f"augmentation_sun_vector_validation_sample_{sample_idx:02d}.png"
+        save_fig(fig, save_path, bbox_inches="tight", dpi=300, facecolor="white")
+        plt.close(fig)
+
+    logger.info(f"Saved {num_samples} augmentation validation grids to: {output_dir}")
+
+
+@torch.no_grad()
 def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int = -1):
     """
     Visualizes solar physics and saves individual plots for publication.
@@ -1663,6 +1784,7 @@ def main():
     parser.add_argument("--view_seam_artifacts", action="store_true")
     parser.add_argument("--view_tin_artifacts", action="store_true")
     parser.add_argument("--view_solar_distribution", action="store_true")
+    parser.add_argument("--view_augmentations", action="store_true")
     parser.add_argument("--all_viz", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -1700,7 +1822,8 @@ def main():
                   args.view_invalid_fill or
                   args.view_tin_artifacts or
                   args.view_solar_distribution or
-                  args.view_seam_artifacts)
+                  args.view_seam_artifacts or
+                  args.view_augmentations)
     if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
@@ -1735,6 +1858,8 @@ def main():
                 visualize_tin_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_solar_distribution:
                 visualize_solar_distribution(loaders["train"], output_dir=output_path)
+            if all_viz or args.view_augmentations:
+                visualize_random_flips_and_rotations(loaders["train"], output_dir=output_path, num_samples=2)
 
             logger.info("Data inspection complete. Exiting without training.")
         return
