@@ -118,7 +118,7 @@ def visualize_random_flips_and_rotations(dataloader, output_dir: Path, num_sampl
 
     # 1. Collect n samples safely across batches
     samples = []
-    for batch in dataloader:
+    for batch in tqdm(dataloader, total=num_samples, desc="Collecting samples"):
         B = batch["image"].shape[0]
         for i in range(B):
             samples.append({
@@ -145,7 +145,7 @@ def visualize_random_flips_and_rotations(dataloader, output_dir: Path, num_sampl
     ]
 
     # 2. Generate a grid for each sample
-    for sample_idx, sample in enumerate(samples):
+    for sample_idx, sample in tqdm(enumerate(samples), total=len(samples), desc="Generating Sun Vector Augmentation Validation"):
         fig, axes = plt.subplots(len(transformations), 3, figsize=(15, 5 * len(transformations)))
         plt.subplots_adjust(wspace=0.1, hspace=0.3)
 
@@ -200,21 +200,21 @@ def visualize_random_flips_and_rotations(dataloader, output_dir: Path, num_sampl
             arrow_scale = min(W, H) * 0.3
 
             # --- Plot Ortho ---
-            axes[i, 0].imshow(img_np, cmap='gray' if img_np.shape[-1] == 1 else None)
+            axes[i, 0].imshow(img_np, cmap='gray' if img_np.shape[-1] == 1 else None, vmin=0, vmax=1)
             axes[i, 0].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
                              linewidth=2)
             axes[i, 0].set_title(f"Sample {sample_idx} | {name} - Ortho\nSun XY: [{vx:.2f}, {vy:.2f}]")
             axes[i, 0].axis('off')
 
             # --- Plot DTM ---
-            axes[i, 1].imshow(dtm_np, cmap='terrain')
+            axes[i, 1].imshow(dtm_np, cmap='terrain', vmin=0, vmax=1)
             axes[i, 1].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
                              linewidth=2)
             axes[i, 1].set_title(f"Sample {sample_idx} | {name} - DTM")
             axes[i, 1].axis('off')
 
             # --- Plot Mask ---
-            axes[i, 2].imshow(mask_np, cmap='gray')
+            axes[i, 2].imshow(mask_np, cmap='gray', vmin=0, vmax=1)
             axes[i, 2].arrow(cx, cy, vx * arrow_scale, vy * arrow_scale, color='red', head_width=12, head_length=15,
                              linewidth=2)
             axes[i, 2].set_title(f"Sample {sample_idx} | {name} - Mask")

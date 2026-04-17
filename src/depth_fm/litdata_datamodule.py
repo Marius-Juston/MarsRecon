@@ -300,8 +300,8 @@ def _build_litdata_loaders(config, split_seed: int = 42) -> dict:
 
         w = num_workers if is_train else _VAL_WORKERS
         logger.info(
-            "LitData [%s]: batch_size=%d, workers=%d, size=%d",
-            split, tc.per_gpu_batch_size, w, len(loaders[split])
+            "LitData [%s]: batch_size=%d, workers=%d, size=%d, dataset size=%d",
+            split, tc.per_gpu_batch_size, w, len(loaders[split]), len(dataset)
         )
 
     return loaders
