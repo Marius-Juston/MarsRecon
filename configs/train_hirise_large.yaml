@@ -121,12 +121,12 @@ training:
     use_confidence_weighting: true
 
   # Validation and checkpointing
-  val_every_steps: 1.0
-  save_every_steps: 5
+  val_every_steps: 500
+  save_every_steps: 100
   log_every_steps: 10
   num_val_samples: 8
   flow_vis_every_steps: 1
-  train_vis_every_steps: 80
+  train_vis_every_steps: 800
 
   # Test: use more Euler steps for best quality
   test_euler_steps: 16

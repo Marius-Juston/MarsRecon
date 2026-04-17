@@ -1682,6 +1682,8 @@ def main():
     config.training.output_dir = Path(config.training.output_dir) / config.model.get("model_type",
                                                                                      "depthfm") / config_hash
 
+    logger.info("Saving the data to the output directory: %s", config.training.output_dir)
+
     # Log hardware info
     if is_global_zero:
         logger.info("Hardware: %d CPU cores detected, %d GPUs, workers/GPU=%d", _TOTAL_CORES, _NUM_GPUS_DEFAULT,
