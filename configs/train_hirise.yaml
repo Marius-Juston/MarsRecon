@@ -108,14 +108,14 @@ training:
     velocity_weight: 1.0
     normals_weight: 1.0
     normals_start_step: 0
-    grad_weight: 500.0         # multi-scale gradient loss (no extra install)
+    grad_weight: 100.0         # multi-scale gradient loss (no extra install)
     grad_start_step: 0
     grad_scales: [1, 2, 4]
     # Focal Frequency Loss (requires: pip install focal-frequency-loss)
     freq_weight: 0.0
     freq_start_step: 1000
     freq_alpha: 1.0
-    photo_weight: 50.0
+    photo_weight: 1.5
     photo_start_step: 0
 
     use_confidence_weighting: true
