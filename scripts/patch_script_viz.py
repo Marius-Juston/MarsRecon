@@ -53,13 +53,14 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
+from shapely.affinity import rotate
+from shapely.geometry import Polygon, box
+
 from dataset.min_square_overlap import (
     as_patch_size,
     generate_valid_center_region,
     pack_patches_independent_strips,
 )
-from shapely.affinity import rotate
-from shapely.geometry import Polygon, box
 
 logger = logging.getLogger(__name__)
 
@@ -573,10 +574,6 @@ def visualize_multi_strip_grid(
     return fig
 
 
-
-
-
-
 # ---------------------------------------------------------------------------
 # 4) Real-dataset visualisation
 # ---------------------------------------------------------------------------
@@ -835,6 +832,70 @@ def make_publication_figure(
     return fig
 
 
+def plot_polygon(ax, poly, **kwargs):
+    """Helper to plot Shapely polygons on a matplotlib axis."""
+    x, y = poly.exterior.xy
+    ax.plot(x, y, **kwargs)
+    ax.fill(x, y, alpha=0.2, color=kwargs.get('color', 'blue'))
+
+
+def vizualize_overlap_polygon(output_path: str | Path | None = None,
+                              figsize: tuple[float, float] = (12.0, 10.0), ):
+    # Define test parameters
+    L = 4.0
+    min_overlap = 0.50  # 50% overlap
+
+    # Define a suite of convex shapes
+    test_shapes = {
+        "Standard Rectangle": rotate(Polygon([(0, 0), (10, 0), (10, 6), (0, 6)]), 45, origin='center'),
+        "Chamfered Rect (Your Use Case)": Polygon([(1, 0), (9, 0), (10, 1), (10, 5), (9, 6), (1, 6), (0, 5), (0, 1)]),
+        "Trapezoid": Polygon([(2, 0), (8, 0), (6, 6), (4, 6)]),
+        "Hexagon": Polygon([(3, 0), (7, 0), (9, 4), (7, 8), (3, 8), (1, 4)])
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    fig.suptitle(f"Valid Center Regions (Square Size: {L}x{L}, Target Overlap: {min_overlap * 100}%)", fontsize=14,
+                 y=0.935)
+
+    for ax, (title, base_poly) in zip(axes.flatten(), test_shapes.items()):
+        ax.set_title(title)
+        ax.set_aspect('equal')
+
+        # 1. Plot Base Polygon
+        plot_polygon(ax, base_poly, color='blue', label='Base Polygon', linewidth=2)
+
+        try:
+            # 2. Generate and Plot Valid Region
+            # Using 3 extra rays per edge. For an 8-point chamfered rect, this is 8 * (1+3) = 32 rays.
+            valid_region = generate_valid_center_region(base_poly, L, min_overlap, extra_rays_per_edge=3)
+            plot_polygon(ax, valid_region, color='red', label='Valid Region for Center', linestyle='--', linewidth=2)
+
+            # 3. Plot a Sample Square to prove the math
+            # Grab a point on the boundary of the valid region
+            sample_center = list(valid_region.exterior.coords)[0]
+            half_L = L / 2.0
+            sample_square = box(sample_center[0] - half_L, sample_center[1] - half_L,
+                                sample_center[0] + half_L, sample_center[1] + half_L)
+
+            # Plot the square outline and the intersection
+            x, y = sample_square.exterior.xy
+            ax.plot(x, y, color='green', linestyle=':', linewidth=2, label='Sample Square on Boundary')
+
+            intersection = base_poly.intersection(sample_square)
+            plot_polygon(ax, intersection, color='green')
+
+            # Mark the exact center point
+            ax.plot(sample_center[0], sample_center[1], 'ro', markersize=5)
+
+        except Exception as e:
+            ax.text(0.5, 0.5, f"Failed: {str(e)}", transform=ax.transAxes, ha='center', color='red')
+
+        ax.legend(loc='upper right', fontsize='small')
+        ax.grid(True, linestyle=':', alpha=0.6)
+
+    save_fig(fig, output_path)
+
+
 # ---------------------------------------------------------------------------
 # CLI / quick demo
 # ---------------------------------------------------------------------------
@@ -902,6 +963,8 @@ def run_demo(output_dir: str | Path = "./hirise_viz_out",
         output_path=output_dir / "publication_figure.png",
     )
     plt.close()
+
+    vizualize_overlap_polygon(output_path=output_dir / "min_overlap_polygon.png")
 
     logger.info("Demo complete. Files written to %s", output_dir)
     print(f"Wrote figures + benchmark.csv to {output_dir.resolve()}")
