@@ -505,7 +505,8 @@ class HiRISEGeoSampler(GeoSampler):
             size_w *= xres
 
         if stride is None:
-            stride_h, stride_w = size_h, size_w
+            stride_h = size_h * (1.0 - self.patch_overlap)
+            stride_w = size_w * (1.0 - self.patch_overlap)
         else:
             stride_h, stride_w = _to_tuple(stride)
             if units == Units.PIXELS:
