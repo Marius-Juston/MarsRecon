@@ -778,7 +778,7 @@ def main(argv=None) -> None:  # pragma: no cover
             normalization_path=normalization_path,
         )
 
-    output_path = pathlib.Path("Figures")
+    output_path = pathlib.Path("outputs/Figures")
     output_path.mkdir(parents=True, exist_ok=True)
 
     if args.global_coverage:
@@ -793,6 +793,7 @@ def main(argv=None) -> None:  # pragma: no cover
         dataset, size=0.005,
         length=None if args.length <= 0 else args.length,
         units=Units.CRS,
+        center_mode="optimal"
     )
 
     logger.info("Number of samples: %d", len(sampler))

@@ -1137,11 +1137,11 @@ def main(argv=None) -> None:  # pragma: no cover
         bbox=bbox_tuple,
         include_ortho=not args.no_ortho,
         ortho_type=args.ortho_type,
-        download=True,
+        download=False,
         reuse_cache=True,
     )
 
-    output_path = pathlib.Path("Figures_DTM")
+    output_path = pathlib.Path("outputs/Figures_DTM")
     output_path.mkdir(parents=True, exist_ok=True)
 
     fig = dataset.plot_coverage()
@@ -1158,6 +1158,7 @@ def main(argv=None) -> None:  # pragma: no cover
         dataset, size=0.018,
         length=None if args.length <= 0 else args.length,
         units=Units.CRS,
+        center_mode="optimal"
     )
 
     dataset._raw_index = None
