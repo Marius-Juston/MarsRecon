@@ -53,6 +53,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
+from mpl_toolkits.axisartist import Axes
 from shapely.affinity import rotate
 from shapely.geometry import Polygon, box
 
@@ -344,7 +345,13 @@ def visualize_single_strip(
     """
     _apply_publication_style()
 
-    simple_centers = _simple_centers(footprint, patch_size, min_overlap, stride)
+    size_h, size_w = as_patch_size(patch_size)
+    eq_stride_h = size_h * (1.0 - patch_overlap)
+    eq_stride_w = size_w * (1.0 - patch_overlap)
+
+    actual_stride = stride if stride is not None else (eq_stride_h, eq_stride_w)
+
+    simple_centers = _simple_centers(footprint, patch_size, min_overlap, actual_stride)
     optimal_centers, vr = _optimal_centers(
         footprint, patch_size, min_overlap, patch_overlap=patch_overlap,
     )
@@ -431,30 +438,37 @@ def visualize_patch_overlap_sweep(
     """Plot patch count & coverage vs ``patch_overlap`` in optimal mode."""
     _apply_publication_style()
 
-    counts: list[int] = []
-    covs: list[float] = []
-    for po in overlap_range:
-        centres, _ = _optimal_centers(footprint, patch_size, min_overlap, patch_overlap=po)
-        stats = _coverage_stats(footprint, centres, patch_size)
-        counts.append(stats["n_patches"])
-        covs.append(100 * stats["coverage_fraction"])
+    opt_counts, opt_covs = [], []
+    simp_counts, simp_covs = [], []
 
-    # Simple mode baseline (at stride = size, so patch_overlap=0 equivalent)
-    base = _coverage_stats(footprint, _simple_centers(footprint, patch_size, min_overlap),
-                           patch_size)
+    size_h, size_w = as_patch_size(patch_size)
+
+    for po in overlap_range:
+        # Calculate optimal stats
+        opt_cen, _ = _optimal_centers(footprint, patch_size, min_overlap, patch_overlap=po)
+        opt_stat = _coverage_stats(footprint, opt_cen, patch_size)
+        opt_counts.append(opt_stat["n_patches"])
+        opt_covs.append(100 * opt_stat["coverage_fraction"])
+
+        # Calculate equivalent simple stats
+        eq_stride = (size_h * (1.0 - po), size_w * (1.0 - po))
+        simp_cen = _simple_centers(footprint, patch_size, min_overlap, stride=eq_stride)
+        simp_stat = _coverage_stats(footprint, simp_cen, patch_size)
+        simp_counts.append(simp_stat["n_patches"])
+        simp_covs.append(100 * simp_stat["coverage_fraction"])
 
     fig, (ax_n, ax_c) = plt.subplots(1, 2, figsize=figsize)
-    ax_n.plot(overlap_range, counts, "-o", color=COLOR_OPTIMAL, label="optimal")
-    ax_n.axhline(base["n_patches"], color=COLOR_SIMPLE, ls="--",
-                 label=f"simple baseline (n = {base['n_patches']})")
+    ax_n: Axes
+    ax_n.plot(overlap_range, opt_counts, "-o", color=COLOR_OPTIMAL, label="optimal")
+    ax_n.plot(overlap_range, simp_counts, "-s", color=COLOR_SIMPLE, label="simple")
+    # ax_n.set_yscale("log")
     ax_n.set_xlabel("patch_overlap")
     ax_n.set_ylabel("number of patches")
     ax_n.set_title("Patch count vs patch_overlap")
     ax_n.legend(fontsize=9)
 
-    ax_c.plot(overlap_range, covs, "-o", color=COLOR_OPTIMAL, label="optimal")
-    ax_c.axhline(100 * base["coverage_fraction"], color=COLOR_SIMPLE, ls="--",
-                 label=f"simple baseline ({100 * base['coverage_fraction']:.1f}%)")
+    ax_c.plot(overlap_range, opt_covs, "-o", color=COLOR_OPTIMAL, label="optimal")
+    ax_c.plot(overlap_range, simp_covs, "-s", color=COLOR_SIMPLE, label="simple")
     ax_c.set_ylim((0, 102))
     ax_c.set_xlabel("patch_overlap")
     ax_c.set_ylabel("coverage of footprint (%)")
@@ -698,9 +712,12 @@ def benchmark_algorithms(
         ``strip``, ``simple_n``, ``optimal_n``, ``gain_pct``,
         ``simple_coverage``, ``optimal_coverage``, ``footprint_area``.
     """
+    size_h, size_w = as_patch_size(patch_size)
+    eq_stride = (size_h * (1.0 - patch_overlap), size_w * (1.0 - patch_overlap))
+
     rows: list[dict[str, Any]] = []
     for i, poly in enumerate(footprints):
-        s = _simple_centers(poly, patch_size, min_overlap)
+        s = _simple_centers(poly, patch_size, min_overlap, stride=eq_stride)
         o, _ = _optimal_centers(poly, patch_size, min_overlap,
                                 patch_overlap=patch_overlap)
         s_stat = _coverage_stats(poly, s, patch_size)
@@ -754,7 +771,11 @@ def make_publication_figure(
     hero = footprints[hero_strip_idx]
     # --- (A) hero: simple ---
     axA = fig.add_subplot(gs[0, 0])
-    simple = _simple_centers(hero, patch_size, min_overlap)
+
+    size_h, size_w = as_patch_size(patch_size)
+    eq_stride = (size_h * (1.0 - patch_overlap), size_w * (1.0 - patch_overlap))
+
+    simple = _simple_centers(hero, patch_size, min_overlap, stride=eq_stride)
     _draw_polygon(axA, hero, edge=COLOR_FOOTPRINT, face=COLOR_FOOTPRINT,
                   alpha=0.12, lw=2.0, label="Strip footprint")
     _draw_patches(axA, simple, patch_size, edge=COLOR_SIMPLE, face=COLOR_SIMPLE,
@@ -796,17 +817,27 @@ def make_publication_figure(
 
     # --- (C) sweep: patch count vs patch_overlap (mean across strips) ---
     axC = fig.add_subplot(gs[1, 0])
-    simple_baseline = np.mean([
-        len(_simple_centers(p, patch_size, min_overlap)) for p in footprints
-    ])
+
+
+
     mean_opt = []
+    mean_simp = []
+
     for po in overlap_range:
-        c = [len(_optimal_centers(p, patch_size, min_overlap, patch_overlap=po)[0])
-             for p in footprints]
-        mean_opt.append(np.mean(c))
+        # Optimal mean patch count
+        c_opt = [len(_optimal_centers(p, patch_size, min_overlap, patch_overlap=po)[0])
+                 for p in footprints]
+        mean_opt.append(np.mean(c_opt))
+
+        # Simple mean patch count (using equivalent stride)
+        eq_stride = (size_h * (1.0 - po), size_w * (1.0 - po))
+        c_simp = [len(_simple_centers(p, patch_size, min_overlap, stride=eq_stride))
+                  for p in footprints]
+        mean_simp.append(np.mean(c_simp))
+
     axC.plot(overlap_range, mean_opt, "-o", color=COLOR_OPTIMAL, label="optimal")
-    axC.axhline(simple_baseline, ls="--", color=COLOR_SIMPLE,
-                label=f"simple baseline ({simple_baseline:.1f})")
+    axC.plot(overlap_range, mean_simp, "-s", color=COLOR_SIMPLE, label="simple (equivalent stride)")
+
     axC.set_xlabel("patch_overlap")
     axC.set_ylabel("mean patches / strip")
     axC.set_title("(C) Patch density vs patch_overlap")
