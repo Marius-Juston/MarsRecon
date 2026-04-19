@@ -376,6 +376,13 @@ class DepthFMLightningModule(L.LightningModule):
             grad_scales=tuple(lc.get("grad_scales", [1, 2, 4])),
             photo_weight=lc.get("photo_weight", 0.0),
             photo_start_step=lc.get("photo_start_step", 2000),
+            huber_weight=lc.get("huber_weight", 0.0),
+            huber_start_step=lc.get("huber_start_step", 0.0),
+            laplacian_weight=lc.get("laplacian_weight", 0.0),
+            laplacian_start_step=lc.get("laplacian_start_step", 0.0),
+            ordinal_weight=lc.get("ordinal_weight", 0.0),
+            ordinal_start_step=lc.get("ordinal_start_step", 0.0),
+
         )
 
         # Flow matching config
@@ -914,6 +921,9 @@ class DepthFMLightningModule(L.LightningModule):
         self.log("train/loss_normals", loss_dict["normals"], rank_zero_only=True)
         self.log("train/loss_freq", loss_dict["freq"], rank_zero_only=True)
         self.log("train/loss_grad", loss_dict["grad"], rank_zero_only=True)
+        self.log("train/loss_huber", loss_dict["huber"], rank_zero_only=True)
+        self.log("train/loss_laplacian", loss_dict["laplacian"], rank_zero_only=True)
+        self.log("train/loss_ordinal", loss_dict["ordinal"], rank_zero_only=True)
         self.log("train/lr", self.optimizers().param_groups[0]["lr"], rank_zero_only=True)
         if "lunar_lambert_weight" in loss_dict:
             self.log("train/lunar_lambert_weight", loss_dict["lunar_lambert_weight"], rank_zero_only=True)

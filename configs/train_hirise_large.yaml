@@ -116,8 +116,15 @@ training:
     freq_weight: 0.0
     freq_start_step: 1000
     freq_alpha: 1.0
-    photo_weight: 1.5
+    photo_weight: 2.0
     photo_start_step: 0
+
+    huber_weight: 200.0
+    huber_start_step: 0.0       # well-conditioned from scratch
+    laplacian_weight: 20
+    laplacian_start_step: 0.0    # alongside normals
+    ordinal_weight: 250.0
+    ordinal_start_step: 0.0      # robust from scratch
 
     use_confidence_weighting: true
 

@@ -32,11 +32,14 @@ import math
 import os
 from copy import deepcopy
 from pathlib import Path
+from typing import Callable
 
 from matplotlib.figure import Figure
 
 from depth_fm.litdata_datamodule import _build_litdata_loaders
-from depth_fm.losses import PhotoclinometricLoss
+from depth_fm.losses import PhotoclinometricLoss, AbsoluteDepthLoss, LaplacianLoss, \
+    OrdinalRankingLoss
+import matplotlib.patches as mpatches
 
 # ---------------------------------------------------------------------------
 # GLOBAL GDAL/IO OPTIMIZATIONS (For 256-Core / NVMe setups)
@@ -104,6 +107,440 @@ def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"
     for f in formats:
         new_path = path.with_suffix(f)
         fig.savefig(new_path, **kwargs)
+
+
+def _make_synthetic_pred(
+        gt: torch.Tensor, noise_level: float = 0.08, seed: int = 42
+) -> torch.Tensor:
+    """Plausible fake prediction for standalone viz (no trained model needed).
+
+    Generates low-frequency noise + a small global bias so the resulting
+    'prediction' has realistic errors (not random high-frequency noise).
+    If the caller passes a trained predictor via `predictor_fn`, this is
+    never used.
+    """
+    B, C, H, W = gt.shape
+    g = torch.Generator(device=gt.device).manual_seed(seed)
+    noise = torch.randn(B, C, max(H // 8, 1), max(W // 8, 1),
+                        generator=g, device=gt.device)
+    noise = F.interpolate(noise, size=(H, W), mode="bicubic", align_corners=False)
+    bias = torch.randn(B, C, 1, 1, generator=g, device=gt.device) * noise_level * 0.3
+    return (gt + noise_level * noise + bias).clamp(-1.0, 1.0)
+
+
+def _gray_stretch(x: torch.Tensor, mask: np.ndarray | None = None) -> np.ndarray:
+    """Percentile-stretch a 2D tensor to [0, 1] for display, NaN outside mask."""
+    arr = x.detach().cpu().numpy().squeeze()
+    if mask is not None and mask.any():
+        valid = arr[mask]
+        lo, hi = float(valid.min()), float(valid.max())
+    else:
+        lo, hi = float(arr.min()), float(arr.max())
+    if hi - lo < 1e-6:
+        hi = lo + 1e-6
+    out = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    if mask is not None:
+        out[~mask] = np.nan
+    return out
+
+
+def _signed_stretch(x: torch.Tensor, mask: np.ndarray | None = None,
+                    vlim: float | None = None) -> tuple[np.ndarray, float]:
+    """Symmetric [-vlim, vlim] -> [0, 1] stretch, NaN outside mask."""
+    arr = x.detach().cpu().numpy().squeeze()
+    if vlim is None:
+        if mask is not None and mask.any():
+            vlim = float(np.abs(arr[mask]).max()) + 1e-8
+        else:
+            vlim = float(np.abs(arr).max()) + 1e-8
+    out = np.clip(arr / (2.0 * vlim) + 0.5, 0.0, 1.0)
+    if mask is not None:
+        out[~mask] = np.nan
+    return out, vlim
+
+
+def _extract_batch_sample(batch, i: int, device):
+    """Pull sample i out of a batch dict, move to device, add batch dim."""
+    img = batch["image"][i: i + 1].to(device).float()
+    dtm = batch["dtm"][i: i + 1, :1].to(device).float()
+    mask = batch["confidence"][i: i + 1].to(device).float()
+    ortho = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
+    mask_np = mask[0, 0].cpu().numpy().astype(bool)
+    return img, dtm, mask, ortho, mask_np
+
+
+def _get_pred(
+        predictor_fn: Callable | None,
+        batch: dict,
+        i: int,
+        gt_dtm: torch.Tensor,
+        device,
+) -> torch.Tensor:
+    """Return a prediction tensor aligned to gt_dtm shape (1, 1, H, W)."""
+    if predictor_fn is not None:
+        pred = predictor_fn({k: v[i: i + 1].to(device) for k, v in batch.items()})
+        if pred.shape[1] == 3:
+            pred = pred[:, :1]
+        return pred.float()
+    return _make_synthetic_pred(gt_dtm, seed=42 + i)
+
+
+# ============================================================================
+# Visualizations
+# ============================================================================
+
+
+@torch.no_grad()
+def visualize_huber_loss(
+        dataloader,
+        output_dir: Path,
+        num_samples: int = 6,
+        loss_fn: AbsoluteDepthLoss | None = None,
+        predictor_fn: Callable | None = None,
+):
+    """Visualise Huber loss internals.
+
+    Layout (6 columns):
+        Ortho | GT DTM | Pred DTM | Signed Error (pred-gt) | Abs Err | Huber Map
+
+    The last three columns together show the L1 vs L2 transition: pixels
+    with |err| < delta have Huber ≈ 0.5·err² (quadratic darkening);
+    pixels with |err| > delta have Huber ≈ delta·(|err| - 0.5·delta)
+    (linear). Saturating regions in 'Abs Err' that stay mid-grey in
+    'Huber Map' show the L1 clamping in action.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if loss_fn is None:
+        loss_fn = AbsoluteDepthLoss()
+    loss_fn = loss_fn.to(device).eval()
+    delta = loss_fn.delta
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
+    if num_samples == 1:
+        axes = axes[None, :]
+    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+
+    count = 0
+    with tqdm(total=num_samples, desc="Huber viz") as pbar:
+        for batch in dataloader:
+            if count >= num_samples:
+                break
+            for i in range(batch["image"].shape[0]):
+                if count >= num_samples:
+                    break
+
+                img, dtm, mask, ortho, mask_np = _extract_batch_sample(batch, i, device)
+                pred = _get_pred(predictor_fn, batch, i, dtm, device)
+
+                # --- Use the actual loss method so the plot matches training ---
+                huber_map = loss_fn.per_pixel_loss(pred, dtm)
+                signed_err = (pred - dtm).float()
+                abs_err = signed_err.abs()
+
+                logger.info(f"Huber loss: {loss_fn(pred, dtm):.3f}")
+
+                # --- Displays ---
+                ortho_d = _gray_stretch(ortho, mask_np)
+                dtm_d = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                pred_d = np.clip((pred[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                signed_d, vlim_s = _signed_stretch(signed_err, mask_np)
+                abs_d = abs_err[0, 0].cpu().numpy()
+                if mask_np is not None:
+                    abs_d_masked = np.where(mask_np, abs_d, np.nan)
+                huber_d = huber_map[0, 0].cpu().numpy()
+                if mask_np is not None:
+                    huber_d_masked = np.where(mask_np, huber_d, np.nan)
+
+                axes[count, 0].imshow(ortho_d, cmap="gray", vmin=0, vmax=1)
+                axes[count, 1].imshow(dtm_d, cmap="terrain")
+                axes[count, 2].imshow(pred_d, cmap="terrain")
+                axes[count, 3].imshow(signed_d, cmap="RdBu_r", vmin=0, vmax=1)
+                axes[count, 4].imshow(abs_d_masked, cmap="magma",
+                                      vmin=0, vmax=max(2 * delta, 1e-3))
+                axes[count, 5].imshow(huber_d_masked, cmap="magma",
+                                      vmin=0, vmax=max(delta ** 2, 1e-4))
+
+                for ax in axes[count]:
+                    ax.axis("off")
+
+                if count == 0:
+                    titles = [
+                        "Real Ortho",
+                        "GT DTM",
+                        "Pred DTM" if predictor_fn else "Pred DTM (synthetic)",
+                        f"Signed Error (±{vlim_s:.2f})",
+                        f"|Error|  (0..{2 * delta:.2f})",
+                        f"Huber Loss (δ={delta:.2f})",
+                    ]
+                    for ax, t in zip(axes[0], titles):
+                        ax.set_title(t, fontsize=11)
+
+                count += 1
+                pbar.update()
+
+    save_path = output_dir / "huber_loss_inspection.png"
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
+    plt.close(fig)
+    logger.info(f"Huber loss viz saved to: {save_path}")
+
+
+@torch.no_grad()
+def visualize_laplacian_loss(
+        dataloader,
+        output_dir: Path,
+        num_samples: int = 6,
+        loss_fn: LaplacianLoss | None = None,
+        predictor_fn: Callable | None = None,
+):
+    """Visualise Laplacian (curvature) loss internals.
+
+    Layout (6 columns):
+        Ortho | GT DTM | GT ∇²d | Pred DTM | Pred ∇²d | |∇²d error|
+
+    The Laplacian columns use a diverging colormap: blue = negative
+    curvature (concave, crater floors), red = positive curvature (convex,
+    central peaks and rims), white = flat. The error column uses the same
+    ±vlim as the Laplacian columns so you can see at a glance whether the
+    prediction has the RIGHT SHAPE (concave/convex structure matches)
+    regardless of absolute-elevation mismatch.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if loss_fn is None:
+        loss_fn = LaplacianLoss()
+    loss_fn = loss_fn.to(device).eval()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
+    if num_samples == 1:
+        axes = axes[None, :]
+    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+
+    count = 0
+    with tqdm(total=num_samples, desc="Laplacian viz") as pbar:
+        for batch in dataloader:
+            if count >= num_samples:
+                break
+            for i in range(batch["image"].shape[0]):
+                if count >= num_samples:
+                    break
+
+                img, dtm, mask, ortho, mask_np = _extract_batch_sample(batch, i, device)
+                pred = _get_pred(predictor_fn, batch, i, dtm, device)
+
+                gt_lap = loss_fn.laplacian(dtm)
+                pr_lap = loss_fn.laplacian(pred)
+                lap_err = (pr_lap - gt_lap).abs()
+
+                logger.info(f"Laplacian loss: {loss_fn(pred,dtm):.3f}")
+
+                # Shared diverging scale across GT and pred so colours are comparable
+                combined = torch.cat([gt_lap, pr_lap], dim=0)
+                _, shared_vlim = _signed_stretch(combined, None)
+
+                ortho_d = _gray_stretch(ortho, mask_np)
+                dtm_d = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                pred_d = np.clip((pred[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                gt_lap_d, _ = _signed_stretch(gt_lap, mask_np, shared_vlim)
+                pr_lap_d, _ = _signed_stretch(pr_lap, mask_np, shared_vlim)
+                err_d = lap_err[0, 0].cpu().numpy()
+                if mask_np is not None:
+                    err_d = np.where(mask_np, err_d, np.nan)
+
+                axes[count, 0].imshow(ortho_d, cmap="gray", vmin=0, vmax=1)
+                axes[count, 1].imshow(dtm_d, cmap="terrain")
+                axes[count, 2].imshow(gt_lap_d, cmap="RdBu_r", vmin=0, vmax=1)
+                axes[count, 3].imshow(pred_d, cmap="terrain")
+                axes[count, 4].imshow(pr_lap_d, cmap="RdBu_r", vmin=0, vmax=1)
+                axes[count, 5].imshow(err_d, cmap="magma",
+                                      vmin=0, vmax=shared_vlim)
+
+                for ax in axes[count]:
+                    ax.axis("off")
+
+                if count == 0:
+                    titles = [
+                        "Real Ortho",
+                        "GT DTM",
+                        f"GT ∇²d (±{shared_vlim:.2f})",
+                        "Pred DTM" if predictor_fn else "Pred DTM (synthetic)",
+                        "Pred ∇²d",
+                        "|∇²d error|",
+                    ]
+                    for ax, t in zip(axes[0], titles):
+                        ax.set_title(t, fontsize=11)
+
+                count += 1
+                pbar.update()
+
+    save_path = output_dir / "laplacian_loss_inspection.png"
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
+    plt.close(fig)
+    logger.info(f"Laplacian loss viz saved to: {save_path}")
+
+
+@torch.no_grad()
+def visualize_ordinal_ranking(
+        dataloader,
+        output_dir: Path,
+        num_samples: int = 6,
+        loss_fn: OrdinalRankingLoss | None = None,
+        predictor_fn: Callable | None = None,
+        pairs_to_draw: int = 250,
+        seed: int = 0,
+):
+    """Visualise ordinal ranking internals.
+
+    Layout (5 columns):
+        Ortho | GT DTM | Pred DTM | Pair scatter (correct/violated/ambig) | Violation heatmap
+
+    The pair-scatter column draws a random subset of sampled pairs as
+    line segments between endpoints, coloured:
+        green  = GT ordering unambiguous and prediction agrees
+        red    = GT ordering unambiguous and prediction disagrees (violation)
+        grey   = |gt_i - gt_j| <= margin (ambiguous, excluded from loss)
+
+    The violation-heatmap column bins pair endpoints into a coarse grid
+    and shows local violation rate, revealing WHERE the model tends to
+    get ordering wrong (e.g. always at crater rims, or in shadowed
+    regions).
+
+    Per-image violation rate is printed in the title so you can track it
+    as a scalar metric.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if loss_fn is None:
+        loss_fn = OrdinalRankingLoss()
+    loss_fn = loss_fn.to(device).eval()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(num_samples, 5, figsize=(22, 4 * num_samples))
+    if num_samples == 1:
+        axes = axes[None, :]
+    plt.subplots_adjust(wspace=0.08, hspace=0.15)
+
+    count = 0
+    with tqdm(total=num_samples, desc="Ordinal viz") as pbar:
+        for batch in dataloader:
+            if count >= num_samples:
+                break
+            for i in range(batch["image"].shape[0]):
+                if count >= num_samples:
+                    break
+
+                img, dtm, mask, ortho, mask_np = _extract_batch_sample(batch, i, device)
+                pred = _get_pred(predictor_fn, batch, i, dtm, device)
+                H, W = pred.shape[-2:]
+                N = H * W
+
+                # Deterministic sampling for reproducible viz
+                gen = torch.Generator(device=device).manual_seed(seed + count)
+                idx_i, idx_j = loss_fn.sample_pairs(1, N, device, generator=gen)
+                stats = loss_fn.pair_stats(pred, dtm, idx_i, idx_j, mask)
+
+                logger.info(f"Laplacian loss: {loss_fn(pred, dtm):.3f}")
+
+                ordered = stats["ordered"][0].cpu().numpy()
+                violations = stats["violations"][0].cpu().numpy()
+                n_ord = int(ordered.sum())
+                n_viol = int(violations.sum())
+                viol_rate = (n_viol / n_ord) if n_ord > 0 else 0.0
+
+                # ---- Pair scatter panel ----
+                idx_i_np = idx_i[0].cpu().numpy()
+                idx_j_np = idx_j[0].cpu().numpy()
+                yi, xi = np.divmod(idx_i_np, W)
+                yj, xj = np.divmod(idx_j_np, W)
+
+                # Subsample for legibility
+                draw = min(pairs_to_draw, len(idx_i_np))
+                rng = np.random.default_rng(seed + count)
+                subset = rng.choice(len(idx_i_np), size=draw, replace=False)
+
+                ortho_d = _gray_stretch(ortho, mask_np)
+                dtm_d = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                pred_d = np.clip((pred[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+
+                axes[count, 0].imshow(ortho_d, cmap="gray", vmin=0, vmax=1)
+                axes[count, 1].imshow(dtm_d, cmap="terrain")
+                axes[count, 2].imshow(pred_d, cmap="terrain")
+
+                # Pair scatter on top of dimmed ortho
+                ax_sc = axes[count, 3]
+                ax_sc.imshow(ortho_d, cmap="gray", vmin=0, vmax=1, alpha=0.45)
+                for k in subset:
+                    if violations[k]:
+                        col, lw, z = "#ff2a2a", 0.9, 3
+                    elif ordered[k]:
+                        col, lw, z = "#22cc55", 0.4, 2
+                    else:
+                        col, lw, z = "#888888", 0.2, 1
+                    ax_sc.plot([xi[k], xj[k]], [yi[k], yj[k]],
+                               "-", color=col, linewidth=lw, zorder=z, alpha=0.8)
+                ax_sc.set_xlim(0, W);
+                ax_sc.set_ylim(H, 0)
+
+                # Violation heatmap over coarse grid
+                grid = 32
+                heat = np.zeros((grid, grid), dtype=np.float32)
+                cnt = np.zeros((grid, grid), dtype=np.float32)
+                for k in range(len(idx_i_np)):
+                    if not ordered[k]:
+                        continue
+                    for (y, x) in [(yi[k], xi[k]), (yj[k], xj[k])]:
+                        gy = min(int(y * grid / H), grid - 1)
+                        gx = min(int(x * grid / W), grid - 1)
+                        cnt[gy, gx] += 1
+                        if violations[k]:
+                            heat[gy, gx] += 1
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    heat_rate = np.where(cnt > 0, heat / cnt, np.nan)
+
+                axes[count, 4].imshow(heat_rate, cmap="magma",
+                                      vmin=0, vmax=max(0.3, viol_rate * 1.5),
+                                      interpolation="nearest")
+
+                for ax in axes[count]:
+                    ax.axis("off")
+
+                # Per-sample stats in a caption above the pair scatter
+                axes[count, 3].set_title(
+                    f"pairs: {n_ord}/{len(ordered)} ordered | "
+                    f"violations: {n_viol} ({100 * viol_rate:.1f} %)",
+                    fontsize=9,
+                )
+
+                if count == 0:
+                    titles = [
+                        "Real Ortho",
+                        "GT DTM",
+                        "Pred DTM" if predictor_fn else "Pred DTM (synthetic)",
+                        "Pair samples (red=violation)",
+                        "Local violation rate",
+                    ]
+                    # Put the top-row title only where we don't already have a per-sample one
+                    for j, t in enumerate(titles):
+                        if j == 3:
+                            continue  # already has per-sample title
+                        axes[0, j].set_title(t, fontsize=11)
+
+                count += 1
+                pbar.update()
+
+    # Add legend in the bottom margin
+    handles = [
+        mpatches.Patch(color="#22cc55", label="Correct ordering"),
+        mpatches.Patch(color="#ff2a2a", label="Violation"),
+        mpatches.Patch(color="#888888", label="Ambiguous (|Δgt|<margin)"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=3,
+               fontsize=10, frameon=False,
+               bbox_to_anchor=(0.5, -0.01))
+
+    save_path = output_dir / "ordinal_ranking_inspection.png"
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
+    plt.close(fig)
+    logger.info(f"Ordinal ranking viz saved to: {save_path}")
 
 
 @torch.no_grad()
@@ -765,29 +1202,32 @@ def visualize_loss_physics(
     logger.info(f"Generating Loss Physics visualization for {num_samples} samples (L={L_used:.2f})...")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _to_gray_display(x: torch.Tensor, mask: np.ndarray | None = None) -> np.ndarray:
-        """Percentile-stretch a (1,1,H,W) or (1,H,W) tensor to [0,1] for display.
-
-        Each panel is stretched independently so structural similarity is
-        visible regardless of absolute luminance offset. That is purely
-        a display choice; the loss sees raw / z-scored values.
-        """
+    def _to_gray_display(
+            x: torch.Tensor,
+            mask: np.ndarray | None = None,
+            pct_low: float = 2.0,
+            pct_high: float = 98.0,
+    ) -> np.ndarray:
+        """Percentile-stretch a (1,1,H,W) or (1,H,W) tensor to [0,1] for display."""
         arr = x.detach().cpu().numpy().squeeze()
+        # The render is unclamped and can contain NaN/Inf from degenerate normals
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
         if mask is not None:
             valid = arr[mask]
             if valid.size > 0:
-                lo, hi = valid.min(), valid.max()
+                lo, hi = np.percentile(valid, [pct_low, pct_high])
             else:
                 lo, hi = float(arr.min()), float(arr.max())
         else:
-            lo, hi = arr.min(), arr.max()
+            lo, hi = np.percentile(arr, [pct_low, pct_high])
+
         if hi - lo < 1e-6:
             hi = lo + 1e-6
         clipped = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
 
         if mask is not None:
             clipped[~mask] = np.nan
-
         return clipped
 
     n_cols = 6
@@ -1786,6 +2226,7 @@ def main():
     parser.add_argument("--view_tin_artifacts", action="store_true")
     parser.add_argument("--view_solar_distribution", action="store_true")
     parser.add_argument("--view_augmentations", action="store_true")
+    parser.add_argument("--view_extras", action="store_true")
     parser.add_argument("--all_viz", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -1824,7 +2265,8 @@ def main():
                   args.view_tin_artifacts or
                   args.view_solar_distribution or
                   args.view_seam_artifacts or
-                  args.view_augmentations)
+                  args.view_augmentations or
+                  args.view_extras)
     if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
@@ -1861,6 +2303,10 @@ def main():
                 visualize_solar_distribution(loaders["train"], output_dir=output_path)
             if all_viz or args.view_augmentations:
                 visualize_random_flips_and_rotations(loaders["train"], output_dir=output_path, num_samples=2)
+            if all_viz or args.view_extras:
+                visualize_huber_loss(loaders["train"], output_dir=output_path, num_samples=6)
+                visualize_laplacian_loss(loaders["train"], output_dir=output_path, num_samples=6)
+                visualize_ordinal_ranking(loaders["train"], output_dir=output_path, num_samples=6)
 
             logger.info("Data inspection complete. Exiting without training.")
         return

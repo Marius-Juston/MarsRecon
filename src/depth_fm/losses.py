@@ -796,17 +796,245 @@ class FocalFrequencyLoss(nn.Module):
         return self._ffl(pred, target)
 
 
+class AbsoluteDepthLoss(nn.Module):
+    """Direct Huber regression in [-1, 1] depth space.
+
+    Fills the 'absolute accuracy' gap: every other pixel-space loss in the
+    pipeline is scale/shift-invariant (normals, gradient, photoclinometric).
+    Without a direct loss on absolute values, a model could have perfect
+    slopes and renders but systematically wrong elevations.
+
+    Huber combines:
+      - L2 behaviour near convergence (|r| <= delta): smooth gradients, fast
+        final-stage descent.
+      - L1 behaviour in the tails (|r| > delta): robust to outliers from
+        stereo GT artefacts and nodata boundaries.
+
+    For inputs bounded in [-1, 1], delta=0.1 treats errors under ~10 %
+    of the data range as 'near optimum' (L2) and larger errors as
+    'outliers' (L1).
+    """
+
+    def __init__(self, delta: float = 0.1):
+        super().__init__()
+        self.delta = delta
+
+    # -- Public helper: viz uses this directly so the plotted map is the
+    # -- exact quantity the training loss averages over ----------------
+    def per_pixel_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        """Un-reduced Huber loss map, shape (B, 1, H, W)."""
+        if pred.shape[1] == 3:
+            pred = pred[:, :1]
+        if gt.shape[1] == 3:
+            gt = gt[:, :1]
+        return F.huber_loss(
+            pred.float(), gt.float(), reduction="none", delta=self.delta
+        )
+
+    def forward(
+            self,
+            pred: torch.Tensor,
+            gt: torch.Tensor,
+            confidence: torch.Tensor = None,
+    ) -> torch.Tensor:
+        loss = self.per_pixel_loss(pred, gt)
+        if confidence is not None:
+            conf = confidence.float()
+            return (loss * conf).sum() / (conf.sum() + 1e-8)
+        return loss.mean()
+
+
+class LaplacianLoss(nn.Module):
+    """Second-order curvature consistency via discrete Laplacian.
+
+    Captures shape information that first-order gradients miss. Critical
+    for Mars because its defining landforms are curvature features:
+      - Crater bowls (negative curvature)
+      - Central peaks (positive curvature)
+      - Volcanic calderas, rims, scarps
+
+    A model matching all first-order gradients could still get crater
+    concavity qualitatively wrong; the Laplacian forces correct
+    concave/convex structure.
+
+        L = mean_over_valid(|∇²pred - ∇²gt|)
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Discrete 5-point Laplacian
+        kernel = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]
+        ).view(1, 1, 3, 3)
+        self.register_buffer("kernel", kernel)
+
+    # -- Public helpers -----------------------------------------------------
+    def laplacian(self, depth: torch.Tensor) -> torch.Tensor:
+        """Discrete Laplacian (∇²d) of a depth map, shape (B, 1, H, W)."""
+        if depth.shape[1] == 3:
+            depth = depth[:, :1]
+        padded = F.pad(depth.float(), (1, 1, 1, 1), mode="replicate")
+        return F.conv2d(padded, self.kernel.float())
+
+    def per_pixel_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        """Absolute Laplacian difference, shape (B, 1, H, W)."""
+        return (self.laplacian(pred) - self.laplacian(gt)).abs()
+
+    def forward(
+            self,
+            pred: torch.Tensor,
+            gt: torch.Tensor,
+            confidence: torch.Tensor = None,
+    ) -> torch.Tensor:
+        loss = self.per_pixel_loss(pred, gt)
+        if confidence is not None:
+            # Erode mask by 1 px since the Laplacian uses a 3x3 neighbourhood
+            eroded = -F.max_pool2d(
+                -confidence.float(), kernel_size=3, stride=1, padding=1
+            )
+            return (loss * eroded).sum() / (eroded.sum() + 1e-8)
+        return loss.mean()
+
+
+class OrdinalRankingLoss(nn.Module):
+    """Relative-ordering consistency over sampled pixel pairs.
+
+    For each sampled pair (i, j): if gt[i] - gt[j] > margin then pred[i]
+    should exceed pred[j]. Uses a hinge loss:
+
+        L_pair = ReLU( -sign(gt_i - gt_j) * (pred_i - pred_j) )
+
+    averaged over pairs where |gt_i - gt_j| > margin (i.e. pairs whose GT
+    ordering is unambiguous).
+
+    Why this helps on Mars
+    ----------------------
+    Mars DTM ground truth from stereo reconstruction has systematic noise
+    (registration, interpolation, crater-wall occlusion). Absolute values
+    in noisy regions are unreliable, but pairwise ORDERING is robust — if
+    crater floor is lower than rim in the GT, it is almost certainly lower
+    in reality even if the absolute depths are off. Ordinal loss gives a
+    supervision signal that degrades gracefully with GT noise.
+
+    Based on: Chen et al., 'Single-Image Depth Perception in the Wild',
+    NeurIPS 2016 (DIW) — adapted here to dense GT by random pair sampling.
+    """
+
+    def __init__(self, margin: float = 0.02, num_pairs: int = 10000):
+        super().__init__()
+        self.margin = margin
+        self.num_pairs = num_pairs
+
+    # -- Public helpers -----------------------------------------------------
+    def sample_pairs(
+            self,
+            B: int,
+            N: int,
+            device: torch.device,
+            generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample (idx_i, idx_j) flat indices, each shape (B, num_pairs).
+
+        Deterministic if a generator is provided — used by viz for
+        reproducible figures.
+        """
+        if generator is not None:
+            idx = torch.randint(
+                N, (B, self.num_pairs * 2), device=device, generator=generator
+            )
+        else:
+            idx = torch.randint(N, (B, self.num_pairs * 2), device=device)
+        return idx[:, : self.num_pairs], idx[:, self.num_pairs:]
+
+    def pair_stats(
+            self,
+            pred: torch.Tensor,
+            gt: torch.Tensor,
+            idx_i: torch.Tensor,
+            idx_j: torch.Tensor,
+            confidence: torch.Tensor = None,
+    ) -> dict:
+        """Per-pair losses, ordering labels, violation flags.
+
+        Returns dict with:
+          losses      (B, num_pairs) — hinge loss, 0 for ambiguous pairs
+          ordered     (B, num_pairs) bool — |gt_diff| > margin and valid
+          violations  (B, num_pairs) bool — ordered and pred disagrees
+          gt_diff     (B, num_pairs) — gt_i - gt_j
+          pr_diff     (B, num_pairs) — pred_i - pred_j
+        """
+        if pred.shape[1] == 3:
+            pred = pred[:, :1]
+        if gt.shape[1] == 3:
+            gt = gt[:, :1]
+
+        B = pred.shape[0]
+        pred_flat = pred.reshape(B, -1).float()
+        gt_flat = gt.reshape(B, -1).float()
+
+        gt_i = gt_flat.gather(1, idx_i)
+        gt_j = gt_flat.gather(1, idx_j)
+        pr_i = pred_flat.gather(1, idx_i)
+        pr_j = pred_flat.gather(1, idx_j)
+
+        gt_diff = gt_i - gt_j
+        pr_diff = pr_i - pr_j
+        sign_gt = torch.sign(gt_diff)
+
+        ordered = gt_diff.abs() > self.margin
+
+        if confidence is not None:
+            conf_flat = confidence.reshape(B, -1).float()
+            c_i = conf_flat.gather(1, idx_i)
+            c_j = conf_flat.gather(1, idx_j)
+            ordered = ordered & (c_i > 0.5) & (c_j > 0.5)
+
+        losses = F.relu(-sign_gt * pr_diff) * ordered.float()
+        # 'violation' = ordered AND predicted difference has wrong sign
+        violations = ordered & (sign_gt * pr_diff <= 0)
+
+        return {
+            "losses": losses,
+            "ordered": ordered,
+            "violations": violations,
+            "gt_diff": gt_diff,
+            "pr_diff": pr_diff,
+        }
+
+    def forward(
+            self,
+            pred: torch.Tensor,
+            gt: torch.Tensor,
+            confidence: torch.Tensor = None,
+    ) -> torch.Tensor:
+        B = pred.shape[0]
+        N = pred.shape[-2] * pred.shape[-1]
+        idx_i, idx_j = self.sample_pairs(B, N, pred.device)
+        stats = self.pair_stats(pred, gt, idx_i, idx_j, confidence)
+
+        n_ordered = stats["ordered"].float().sum()
+        if n_ordered < 1:
+            # Param-connected zero so DDP gradient sync stays consistent
+            return 0.0 * pred.float().mean()
+        return stats["losses"].sum() / (n_ordered + 1e-8)
+
+
 class CombinedLoss(nn.Module):
     """Combined training loss for Mars DepthFM.
 
-    L_total = w_vel * L_FM
-            + w_norm * L_normals       (after normals_start_step)
-            + w_freq * L_FFL           (after freq_start_step)
-            + w_grad * L_grad          (after grad_start_step)
+    L_total = w_vel    * L_FM
+            + w_norm   * L_normals     (after normals_start_step)
+            + w_freq   * L_FFL         (after freq_start_step)
+            + w_grad   * L_grad        (after grad_start_step)
+            + w_photo  * L_photo       (after photo_start_step)
+            + w_huber  * L_Huber       (after huber_start_step)     [NEW]
+            + w_lap    * L_Laplacian   (after laplacian_start_step) [NEW]
+            + w_ord    * L_Ordinal     (after ordinal_start_step)   [NEW]
 
-    Pixel-space losses (normals, FFL, grad) require the caller to pass
-    ``pred_depth_pixels`` and ``gt_depth_pixels`` decoded WITHOUT no_grad so
-    that gradients flow back through the decoder to v_pred.
+    Pixel-space losses (normals, FFL, grad, photo, huber, laplacian,
+    ordinal) require the caller to pass ``pred_depth_pixels`` and
+    ``gt_depth_pixels`` decoded WITHOUT no_grad so that gradients flow
+    back through the decoder to v_pred.
     """
 
     def __init__(
@@ -822,9 +1050,19 @@ class CombinedLoss(nn.Module):
             grad_start_step: int = 0,
             grad_scales: tuple[int, ...] = (1, 2, 4),
             photo_weight: float = 0.0,
-            photo_start_step: int = 2000
+            photo_start_step: int = 2000,
+            huber_weight: float = 3.0,
+            huber_start_step: int = 0,
+            huber_delta: float = 0.1,
+            laplacian_weight: float = 0.05,
+            laplacian_start_step: int = 0,
+            ordinal_weight: float = 1.0,
+            ordinal_start_step: int = 0,
+            ordinal_margin: float = 0.02,
+            ordinal_num_pairs: int = 10000,
     ):
         super().__init__()
+        # ---- Photo / velocity / existing aux ----------------------------
         self.photo_start_step = photo_start_step
         self.photo_weight = photo_weight
         self.photo_loss = PhotoclinometricLoss(
@@ -842,6 +1080,22 @@ class CombinedLoss(nn.Module):
         self.grad_weight = grad_weight
         self.grad_start = grad_start_step
         self.use_confidence_weighting = use_confidence_weighting
+
+        # ---- New losses --------------------------------------------------
+        self.huber_weight = huber_weight
+        self.huber_start = huber_start_step
+        self.huber_loss = AbsoluteDepthLoss(delta=huber_delta) if huber_weight > 0 else None
+
+        self.laplacian_weight = laplacian_weight
+        self.laplacian_start = laplacian_start_step
+        self.laplacian_loss = LaplacianLoss() if laplacian_weight > 0 else None
+
+        self.ordinal_weight = ordinal_weight
+        self.ordinal_start = ordinal_start_step
+        self.ordinal_loss = (
+            OrdinalRankingLoss(margin=ordinal_margin, num_pairs=ordinal_num_pairs)
+            if ordinal_weight > 0 else None
+        )
 
         if self.use_confidence_weighting:
             logging.info("Using confidence weighting to improve nodata region filtering")
@@ -865,7 +1119,11 @@ class CombinedLoss(nn.Module):
                 (self.norm_weight > 0 and global_step >= self.norm_start) or
                 (self.freq_weight > 0 and self.ffl is not None and global_step >= self.freq_start) or
                 (self.grad_weight > 0 and self.grad_loss is not None and global_step >= self.grad_start) or
-                (self.photo_weight > 0 and self.photo_loss is not None and global_step >= self.photo_start_step)
+                (self.photo_weight > 0 and self.photo_loss is not None and global_step >= self.photo_start_step) or
+                (self.huber_weight > 0 and self.huber_loss is not None and global_step >= self.huber_start) or
+                (
+                        self.laplacian_weight > 0 and self.laplacian_loss is not None and global_step >= self.laplacian_start) or
+                (self.ordinal_weight > 0 and self.ordinal_loss is not None and global_step >= self.ordinal_start)
         )
 
     def forward(
@@ -886,12 +1144,12 @@ class CombinedLoss(nn.Module):
             v_pred: predicted velocity in latent space (B, C, h, w)
             v_target: target velocity (B, C, h, w)
             pred_depth_pixels: decoded predicted clean depth (B, 3, H, W)
-            gt_depth_pixels: decoded GT depth (B, 3, H, W)
+            gt_depth_pixels:   decoded GT depth (B, 3, H, W)
             confidence: optional confidence map (B, 1, H, W)
             global_step: current training step
 
         Returns:
-            dict with "total", "velocity", "normals", "freq", "grad" losses
+            dict with component losses and "total"
         """
         active_conf = confidence if self.use_confidence_weighting else None
 
@@ -902,12 +1160,16 @@ class CombinedLoss(nn.Module):
             "normals": torch.tensor(0.0, device=l_vel.device),
             "freq": torch.tensor(0.0, device=l_vel.device),
             "grad": torch.tensor(0.0, device=l_vel.device),
-            "photo": torch.tensor(0.0, device=v_pred.device)
+            "photo": torch.tensor(0.0, device=v_pred.device),
+            "huber": torch.tensor(0.0, device=v_pred.device),
+            "laplacian": torch.tensor(0.0, device=v_pred.device),
+            "ordinal": torch.tensor(0.0, device=v_pred.device),
         }
 
         total = self.vel_weight * l_vel
         has_pixels = pred_depth_pixels is not None and gt_depth_pixels is not None
 
+        # ---- Existing pixel-space losses --------------------------------
         if self.norm_weight > 0 and global_step >= self.norm_start and has_pixels:
             l_norm = self.normals_loss(pred_depth_pixels, gt_depth_pixels, active_conf)
             loss_dict["normals"] = l_norm
@@ -940,7 +1202,6 @@ class CombinedLoss(nn.Module):
                 and has_pixels
         ):
             if sun_vector is None:
-                # Default to pointing diagonally down
                 sun_vector = torch.tensor([[0.5, -0.5, 1.0]], device=pred_depth_pixels.device)
                 sun_vector = sun_vector.expand(pred_depth_pixels.shape[0], -1)
 
@@ -962,14 +1223,45 @@ class CombinedLoss(nn.Module):
             loss_dict["photo"] = l_photo
             total = total + self.photo_weight * l_photo
 
+        # ---- New pixel-space losses -------------------------------------
+        if (
+                self.huber_weight > 0
+                and self.huber_loss is not None
+                and global_step >= self.huber_start
+                and has_pixels
+        ):
+            l_huber = self.huber_loss(pred_depth_pixels, gt_depth_pixels, active_conf)
+            loss_dict["huber"] = l_huber
+            total = total + self.huber_weight * l_huber
+
+        if (
+                self.laplacian_weight > 0
+                and self.laplacian_loss is not None
+                and global_step >= self.laplacian_start
+                and has_pixels
+        ):
+            l_lap = self.laplacian_loss(pred_depth_pixels, gt_depth_pixels, active_conf)
+            loss_dict["laplacian"] = l_lap
+            total = total + self.laplacian_weight * l_lap
+
+        if (
+                self.ordinal_weight > 0
+                and self.ordinal_loss is not None
+                and global_step >= self.ordinal_start
+                and has_pixels
+        ):
+            l_ord = self.ordinal_loss(pred_depth_pixels, gt_depth_pixels, active_conf)
+            loss_dict["ordinal"] = l_ord
+            total = total + self.ordinal_weight * l_ord
+
         loss_dict["total"] = total
 
-        # Final NaN guard: if any loss component produced NaN, fall back to
-        # velocity-only loss to prevent poisoning the entire training run.
+        # ---- Final NaN guard --------------------------------------------
         if not torch.isfinite(total):
             logger.warning(
                 "CombinedLoss: non-finite total detected at step %d. "
-                "Components: vel=%.4f norm=%.4f freq=%.4f grad=%.4f photo=%.4f. "
+                "Components: vel=%.4f norm=%.4f freq=%.4f grad=%.4f photo=%.4f "
+                "huber=%.4f lap=%.4f ord=%.4f. "
                 "Falling back to velocity-only loss.",
                 global_step,
                 loss_dict["velocity"].item() if torch.is_tensor(loss_dict["velocity"]) else 0,
@@ -977,10 +1269,12 @@ class CombinedLoss(nn.Module):
                 loss_dict["freq"].item() if torch.is_tensor(loss_dict["freq"]) else 0,
                 loss_dict["grad"].item() if torch.is_tensor(loss_dict["grad"]) else 0,
                 loss_dict["photo"].item() if torch.is_tensor(loss_dict["photo"]) else 0,
+                loss_dict["huber"].item() if torch.is_tensor(loss_dict["huber"]) else 0,
+                loss_dict["laplacian"].item() if torch.is_tensor(loss_dict["laplacian"]) else 0,
+                loss_dict["ordinal"].item() if torch.is_tensor(loss_dict["ordinal"]) else 0,
             )
             total = self.vel_weight * l_vel
             if not torch.isfinite(total):
-                # Even velocity is NaN — return zero to prevent crash
                 total = torch.tensor(0.0, device=l_vel.device, requires_grad=True)
             loss_dict["total"] = total
 
