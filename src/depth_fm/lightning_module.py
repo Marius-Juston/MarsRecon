@@ -995,7 +995,11 @@ class DepthFMLightningModule(L.LightningModule):
         self._trace("Entered on_validation_epoch_start")
         self._val_aggregator = MetricsAggregator()
         self._val_vis_data = None
-        self._val_gallery_data: dict[str, dict] = {}
+
+
+        # Replace self._val_gallery_data = {} with running lists
+        self._best_val_patches = []
+        self._worst_val_patches = []
 
         # ── Deferred upload from PREVIOUS epoch ──
         # By the time we start the next validation epoch, all worker
@@ -1072,17 +1076,30 @@ class DepthFMLightningModule(L.LightningModule):
 
             self._val_aggregator.add(metrics, tile_id)
 
-            if len(self._val_gallery_data) < 50:
+            if hasattr(metrics, "photo_consistency"):
                 img_i = batch["image"][i].float().cpu().numpy()
                 if img_i.shape[0] == 3:
                     img_i = np.transpose(img_i, (1, 2, 0))
                     img_i = (img_i + 1.0) / 2.0
-                self._val_gallery_data[tile_id] = {
+
+                patch_data = {
                     "image": img_i,
                     "pred": pred_pix[i].copy(),
                     "gt": gt_raw[i].copy(),
+                    "tile_id": tile_id,
+                    "score": metrics.photo_consistency,
                     "rmse": metrics.rmse,
                 }
+
+                # Maintain best 5 (Assuming higher photo_consistency is better)
+                self._best_val_patches.append(patch_data)
+                self._best_val_patches.sort(key=lambda x: x["score"], reverse=True)
+                self._best_val_patches = self._best_val_patches[:5]
+
+                # Maintain worst 5
+                self._worst_val_patches.append(patch_data)
+                self._worst_val_patches.sort(key=lambda x: x["score"], reverse=False)
+                self._worst_val_patches = self._worst_val_patches[:5]
 
         flow_intermediates = None
         flow_vis_every = self.config.training.get("flow_vis_every_steps", 500)
@@ -1389,20 +1406,8 @@ class DepthFMLightningModule(L.LightningModule):
         # Gallery uses per-sample data stored in _val_gallery_data which
         # is rank-local.  Broadcasting 50 samples of gallery data would be
         # expensive and the benefit is minimal (it's just 2 figures).
-        if self.global_rank == 0 and self._val_gallery_data:
-            gallery = self._val_gallery_data
-            for label, items in [("worst", worst), ("best", best)]:
-                patches = []
-                for tile_id, rmse_val in items[:5]:
-                    if tile_id in gallery:
-                        d = gallery[tile_id]
-                        patches.append({
-                            "image": d["image"],
-                            "pred": d["pred"],
-                            "gt": d["gt"],
-                            "tile_id": tile_id,
-                            "rmse": rmse_val,
-                        })
+        if self.global_rank == 0:
+            for label, patches in [("worst", self._worst_val_patches), ("best", self._best_val_patches)]:
                 if patches:
                     self._submit_vis_task({
                         "type": "gallery",
@@ -1415,7 +1420,8 @@ class DepthFMLightningModule(L.LightningModule):
                     })
 
         self._val_vis_data = None
-        self._val_gallery_data = {}
+        self._best_val_patches = []
+        self._worst_val_patches = []
         self._trace("Exiting on_validation_epoch_end")
 
     # ------------------------------------------------------------------
@@ -1425,7 +1431,10 @@ class DepthFMLightningModule(L.LightningModule):
     def on_test_epoch_start(self) -> None:
         self._trace("Entered on_test_epoch_start")
         self._test_aggregator = MetricsAggregator()
-        self._test_gallery_data: dict[str, dict] = {}
+
+        self._best_test_patches = []
+        self._worst_test_patches = []
+
         self._trace("Exited on_test_epoch_start")
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
@@ -1477,17 +1486,30 @@ class DepthFMLightningModule(L.LightningModule):
 
             self._test_aggregator.add(metrics, tile_id)
 
-            if len(self._test_gallery_data) < 50:
+            if hasattr(metrics, "photo_consistency"):
                 img_i = batch["image"][i].float().cpu().numpy()
                 if img_i.shape[0] == 3:
                     img_i = np.transpose(img_i, (1, 2, 0))
                     img_i = (img_i + 1.0) / 2.0
-                self._test_gallery_data[tile_id] = {
+
+                patch_data = {
                     "image": img_i,
                     "pred": pred_pix[i].copy(),
                     "gt": gt_raw[i].copy(),
+                    "tile_id": tile_id,
+                    "score": metrics.photo_consistency,
                     "rmse": metrics.rmse,
                 }
+
+                # Maintain best 5 (Assuming higher photo_consistency is better)
+                self._best_test_patches.append(patch_data)
+                self._best_test_patches.sort(key=lambda x: x["score"], reverse=True)
+                self._best_test_patches = self._best_test_patches[:5]
+
+                # Maintain worst 5
+                self._worst_test_patches.append(patch_data)
+                self._worst_test_patches.sort(key=lambda x: x["score"], reverse=False)
+                self._worst_test_patches = self._worst_val_patches[:5]
 
         self._trace(f"Exiting test_step for batch {batch_idx}")
 
@@ -1530,17 +1552,8 @@ class DepthFMLightningModule(L.LightningModule):
                         ", ".join(f"{tid}={v:.2f}m" for tid, v in best))
 
         # Gallery on rank 0 only
-        if self.global_rank == 0 and self._test_gallery_data:
-            gallery = self._test_gallery_data
-            for label, items in [("worst", worst), ("best", best)]:
-                patches = []
-                for tile_id, rmse_val in items[:5]:
-                    if tile_id in gallery:
-                        d = gallery[tile_id]
-                        patches.append({
-                            "image": d["image"], "pred": d["pred"],
-                            "gt": d["gt"], "tile_id": tile_id, "rmse": rmse_val,
-                        })
+        if self.global_rank == 0:
+            for label, patches in [("worst", self._worst_test_patches), ("best", self._best_test_patches)]:
                 if patches:
                     self._submit_vis_task({
                         "type": "gallery",
@@ -1556,7 +1569,8 @@ class DepthFMLightningModule(L.LightningModule):
         self._deferred_wandb_upload()
         self._upload_vector_figures_artifact(prefix="test")
 
-        self._test_gallery_data = {}
+        self._best_test_patches = []
+        self._worst_test_patches = []
         self._trace("Exiting on_test_epoch_end")
 
     # ------------------------------------------------------------------
