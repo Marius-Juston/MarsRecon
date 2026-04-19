@@ -874,24 +874,43 @@ def plot_lunar_lambert_comparison(
     z_ortho = loss_fn._zscore(ortho_gray, valid_mask_t)
 
     # --- Move to CPU for Matplotlib ---
-    def prep_for_display(t: torch.Tensor, normalize_vis: bool = False) -> np.ndarray:
-        arr = t.squeeze().cpu().numpy().astype(np.float32)
-        mask_np = mask_bool.cpu().numpy()
+    def prep_for_display(
+            x: torch.Tensor,
+            mask: np.ndarray | None = None,
+            pct_low: float = 2.0,
+            pct_high: float = 98.0,
+            normalize_vis: bool = False
+    ) -> np.ndarray:
+        """Percentile-stretch a (1,1,H,W) or (1,H,W) tensor to [0,1] for display."""
+        arr = x.detach().cpu().numpy().squeeze()
+        # The render is unclamped and can contain NaN/Inf from degenerate normals
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
+        if mask is not None:
+            valid = arr[mask]
+            if valid.size > 0:
+                lo, hi = np.percentile(valid, [pct_low, pct_high])
+            else:
+                lo, hi = float(arr.min()), float(arr.max())
+        else:
+            lo, hi = np.percentile(arr, [pct_low, pct_high])
+
+        if hi - lo < 1e-6:
+            hi = lo + 1e-6
         if normalize_vis:
-            valid_pixels = arr[mask_np]
-            lo, hi = (valid_pixels.min(), valid_pixels.max()) if valid_pixels.size > 0 else (arr.min(), arr.max())
-            hi = max(hi, lo + 1e-6)
             arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
 
-        arr[~mask_np] = np.nan
+        if mask is not None:
+            arr[~mask] = np.nan
         return arr
 
-    r_ortho_np = prep_for_display(ortho_gray, normalize_vis=True)
-    r_pred_np = prep_for_display(render_pred, normalize_vis=True)
-    r_gt_np = prep_for_display(render_gt, normalize_vis=True)
-    z_pred_np = prep_for_display(z_pred, normalize_vis=False)
-    z_ortho_np = prep_for_display(z_ortho, normalize_vis=False)
+    mask_bool_n = mask_bool.numpy()
+
+    r_ortho_np = prep_for_display(ortho_gray, mask=mask_bool_n, normalize_vis=True)
+    r_pred_np = prep_for_display(render_pred, mask=mask_bool_n, normalize_vis=True)
+    r_gt_np = prep_for_display(render_gt, mask=mask_bool_n, normalize_vis=True)
+    z_pred_np = prep_for_display(z_pred, mask=mask_bool_n, normalize_vis=False)
+    z_ortho_np = prep_for_display(z_ortho, mask=mask_bool_n, normalize_vis=False)
 
     # 5. The TRUE Structural Error Map the network feels
     loss_map = np.abs(z_pred_np - z_ortho_np)
