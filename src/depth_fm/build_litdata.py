@@ -328,6 +328,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
         n_folds=n_folds,
         fold_idx=fold_idx,
         reuse_cache=True,
+        center_mode=sc.get("center_mode", "simple")
     )
 
     adapter = DepthFMHiRISEAdapterCached(
@@ -342,6 +343,8 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
         manifest_workers=min(workers, 94),
         manifest_dir=str(manifest_cache_dir),
     )
+
+    logger.info("Number dataset %d, number samples %d, num filtered %d", len(base_dataset), len(sampler), len(adapter))
 
     num_samples = len(adapter)
 

@@ -1165,6 +1165,7 @@ def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -
         fold_idx=fold_idx,
         seed=split_seed,
         reuse_cache=True,
+        center_mode=sc.get("center_mode", "simple")
     )
 
     resolution = config.data.get("resolution", 512)
