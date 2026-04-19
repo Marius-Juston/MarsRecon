@@ -549,7 +549,12 @@ class PhotoclinometricLoss(nn.Module):
                 # Binarise: only pixels fully valid at this scale
                 m_s = (m_s > 0.99).float()
             else:
-                d_s, o_s, m_s = pred_depth, ortho_gray, valid_mask
+                d_s, o_s = pred_depth, ortho_gray
+                # Binarise at scale 1 as well, so soft confidence maps are
+                # treated consistently with the s > 1 branch. Without this,
+                # a confidence of 0.6 would count as valid at s=1 and
+                # invalid at s=2, producing scale-dependent artifacts.
+                m_s = (valid_mask > 0.99).float()
 
             # Skip scale if mask is nearly empty (< 5% valid)
             valid_ratio = m_s.sum() / max(m_s.numel(), 1)
@@ -610,7 +615,11 @@ class FlowMatchingVelocityLoss(nn.Module):
         sq_error = (v_pred.float() - v_target.float()).pow(2)
 
         if self.use_confidence and confidence is not None:
-            # Nearest neighbor interpolation ensures binary masks remain sharp
+            # Area interpolation gives a fractional-valid weight per latent
+            # cell: if 3 of 4 original pixels in the receptive field are
+            # valid, the weight is 0.75. This is more faithful than nearest
+            # neighbor because a single valid pixel shouldn't cause the
+            # whole latent cell to count as fully valid.
             mask = F.interpolate(
                 confidence.float(),
                 size=v_pred.shape[-2:],
@@ -687,7 +696,7 @@ class SurfaceNormalsLoss(nn.Module):
             loss = loss * eroded_mask
             return loss.sum() / (eroded_mask.sum() + 1e-8)
 
-        return loss.mean().clamp(min=1e-6)
+        return loss.mean()
 
 
 class MultiScaleGradientLoss(nn.Module):
@@ -1214,7 +1223,11 @@ class CombinedLoss(nn.Module):
             l_photo = self.photo_loss(
                 pred_depth=pred_depth_pixels,
                 real_ortho=real_ortho,
-                mask=confidence if confidence is not None else torch.ones_like(pred_depth_pixels[:, :1]),
+                # Use active_conf (gated by use_confidence_weighting) for
+                # consistency with all other aux losses. If the switch is
+                # off, fall back to all-ones so photo loss still runs.
+                mask=active_conf if active_conf is not None
+                else torch.ones_like(pred_depth_pixels[:, :1]),
                 sun_vectors=sun_vector,
                 ambient=ambient,
                 intensity=intensity,

@@ -189,26 +189,31 @@ def _vis_worker_main(task_queue: mp.SimpleQueue, staging_dir: str, rank: int):
         step = task["step"]
 
         if t == "triptych":
-            fig = _triptych(d["img"], d["pred"], d["gt"], title=d["title"])
+            fig = _triptych(d["img"], d["pred"], d["gt"], title=d["title"],
+                            mask=d.get("mask"))
             _save(fig, tag, step)
 
         elif t == "cross_sections":
-            fig = _cross(d["pred"], d["gt"], title=d["title"])
+            fig = _cross(d["pred"], d["gt"], title=d["title"],
+                         mask=d.get("mask"))
             _save(fig, tag, step)
 
         elif t == "error_heatmap":
             pred_a, _, _ = _align(d["pred"], d["gt"])
-            fig = _heatmap(pred_a, d["gt"], title=d["title"])
+            fig = _heatmap(pred_a, d["gt"], title=d["title"],
+                           mask=d.get("mask"))
             _save(fig, tag, step)
 
         elif t == "normal_maps":
             pred_a, _, _ = _align(d["pred"], d["gt"])
-            fig = _normals(pred_a, d["gt"], title=d["title"])
+            fig = _normals(pred_a, d["gt"], title=d["title"],
+                           mask=d.get("mask"))
             _save(fig, tag, step)
 
         elif t == "elevation_scatter":
             pred_a, _, _ = _align(d["pred"], d["gt"])
-            fig = _scatter(pred_a, d["gt"], title=d["title"])
+            fig = _scatter(pred_a, d["gt"], title=d["title"],
+                           mask=d.get("mask"))
             _save(fig, tag, step)
 
         elif t == "lunar_lambert":
@@ -249,7 +254,8 @@ def _vis_worker_main(task_queue: mp.SimpleQueue, staging_dir: str, rank: int):
             _save(fig, tag, step)
 
         elif t == "flow_evolution":
-            fig = _flow(d["intermediates"], d["gt"], title=d["title"])
+            fig = _flow(d["intermediates"], d["gt"], title=d["title"],
+                        mask=d.get("mask"))
             _save(fig, tag, step)
 
         elif t == "gallery":
@@ -297,17 +303,21 @@ def _vis_worker_main(task_queue: mp.SimpleQueue, staging_dir: str, rank: int):
 
             _save(fig, tag, step)
         elif t == "uncertainty_map":
-            fig = _uncertainty(d["pred"], d["var_dtm"], d["img"], title=d["title"])
+            fig = _uncertainty(d["pred"], d["var_dtm"], d["img"], title=d["title"],
+                               mask=d.get("mask"))
             _save(fig, tag, step)
         elif t == "geomorph_analysis":
-            fig = geomorphometric(d["pred"], d["gt"], title=d["title"])
+            fig = geomorphometric(d["pred"], d["gt"], title=d["title"],
+                                  mask=d.get("mask"))
             _save(fig, tag, step)
         elif t == "radial_psd":
-            fig = _radial_psd(d["pred"], d["gt"], title=d["title"])
+            fig = _radial_psd(d["pred"], d["gt"], title=d["title"],
+                              mask=d.get("mask"))
             _save(fig, tag, step)
 
         elif t == "slope_error_dod":
-            fig = _slope_error(d["pred"], d["gt"], d["img"], title=d["title"])
+            fig = _slope_error(d["pred"], d["gt"], d["img"], title=d["title"],
+                               mask=d.get("mask"))
             _save(fig, tag, step)
 
         else:
@@ -677,7 +687,10 @@ class DepthFMLightningModule(L.LightningModule):
             result = {}
             for k, v in data.items():
                 if isinstance(v, np.ndarray):
-                    t = torch.from_numpy(v.copy()).contiguous()
+                    # Enforce float32 to match the receiver's buffer dtype.
+                    # Any float64 numpy array would otherwise cause a silent
+                    # byte-layout mismatch during dist.broadcast.
+                    t = torch.from_numpy(np.ascontiguousarray(v, dtype=np.float32))
                     shape_t = torch.tensor(list(t.shape), dtype=torch.long, device=self.device)
                     dist.broadcast(shape_t, src=src)
                     t = t.to(self.device)
@@ -697,7 +710,8 @@ class DepthFMLightningModule(L.LightningModule):
                         key_t = torch.tensor([float(ik)], dtype=torch.float64, device=self.device)
                         dist.broadcast(key_t, src=src)
                         if isinstance(iv, np.ndarray):
-                            vt = torch.from_numpy(iv.copy()).contiguous().to(self.device)
+                            iv_f32 = np.ascontiguousarray(iv, dtype=np.float32)
+                            vt = torch.from_numpy(iv_f32).to(self.device)
                             shape_t = torch.tensor(list(vt.shape), dtype=torch.long, device=self.device)
                             dist.broadcast(shape_t, src=src)
                             dist.broadcast(vt, src=src)
@@ -1006,7 +1020,6 @@ class DepthFMLightningModule(L.LightningModule):
         self._val_aggregator = MetricsAggregator()
         self._val_vis_data = None
 
-
         # Replace self._val_gallery_data = {} with running lists
         self._best_val_patches = []
         self._worst_val_patches = []
@@ -1092,10 +1105,17 @@ class DepthFMLightningModule(L.LightningModule):
                     img_i = np.transpose(img_i, (1, 2, 0))
                     img_i = (img_i + 1.0) / 2.0
 
+                # Per-patch valid mask — copied so later mutation of
+                # conf_mask doesn't bleed into the retained gallery entry.
+                patch_mask = (
+                    conf_mask[i].copy() if conf_mask is not None else None
+                )
+
                 patch_data = {
                     "image": img_i,
                     "pred": pred_pix[i].copy(),
                     "gt": gt_raw[i].copy(),
+                    "mask": patch_mask,
                     "tile_id": tile_id,
                     "score": metrics.photo_consistency,
                     "rmse": metrics.rmse,
@@ -1113,14 +1133,22 @@ class DepthFMLightningModule(L.LightningModule):
 
         flow_intermediates = None
         flow_vis_every = self.config.training.get("flow_vis_every_steps", 500)
-        if batch_idx == 0 and self.global_step > 0:
-            if self.current_epoch % max(flow_vis_every, 1) == 0:
-                self._trace(f"validation_step batch {batch_idx}: computing flow_intermediates (DDP collective)")
-                flow_intermediates = self._predict_flow_intermediates(z_img[:1], num_steps=4)
-                self._trace(f"validation_step batch {batch_idx}: finished flow_intermediates")
+        # Gate on global_step (config key is `flow_vis_every_steps`), not
+        # current_epoch. The original code did `self.current_epoch % N == 0`
+        # which fires ~once per N epochs rather than once per N steps,
+        # effectively never firing for the default N=500.
+        do_flow_vis = (
+                batch_idx == 0
+                and self.global_step > 0
+                and (self.global_step % max(flow_vis_every, 1) == 0)
+        )
+        if do_flow_vis:
+            self._trace(f"validation_step batch {batch_idx}: computing flow_intermediates (DDP collective)")
+            flow_intermediates = self._predict_flow_intermediates(z_img[:1], num_steps=4)
+            self._trace(f"validation_step batch {batch_idx}: finished flow_intermediates")
 
         if batch_idx == 0:
-            if self.current_epoch % max(flow_vis_every, 1) == 0:
+            if do_flow_vis:
                 self._trace(f"validation_step batch {batch_idx}: computing epistemic uncertainty")
                 _, var_dtm = self.estimate_uncertainty(z_img[:1], num_samples=8, num_steps=4)
                 var_dtm_np = var_dtm[0].float().cpu().numpy()
@@ -1134,10 +1162,15 @@ class DepthFMLightningModule(L.LightningModule):
                 img_np = (img_np + 1) / 2
 
             sun_vec = batch.get("sun_vector")
+            # Persist the valid-data mask so all downstream visualisations
+            # (lunar lambert, normals, slope, etc.) can exclude nodata pixels.
+            # conf_mask has shape (B, H, W); we take item 0 to match pred/gt.
+            confidence_np = conf_mask[0].copy() if conf_mask is not None else None
             self._val_vis_data = {
                 "img": img_np,
                 "pred": pred_pix[0].copy(),
                 "gt": gt_raw[0].copy(),
+                "confidence": confidence_np,
                 "step": self.global_step,
                 "has_sun": sun_vec is not None,
                 "sun_vector": sun_vec[0].cpu().numpy() if sun_vec is not None else None,
@@ -1209,6 +1242,7 @@ class DepthFMLightningModule(L.LightningModule):
         if self._val_vis_data is not None and self.global_step > 0:
             vd = self._val_vis_data
             step = self.global_step
+            vmask = vd.get("confidence")  # may be None if no mask was provided
 
             # ── Build deterministic task list ──
             # The order here defines the round-robin assignment.
@@ -1221,6 +1255,7 @@ class DepthFMLightningModule(L.LightningModule):
                 "tag": "val/triptych",
                 "step": step,
                 "data": {"img": vd["img"], "pred": vd["pred"], "gt": vd["gt"],
+                         "mask": vmask,
                          "title": f"Step {step}"},
             })
 
@@ -1230,6 +1265,7 @@ class DepthFMLightningModule(L.LightningModule):
                 "tag": "val/cross_sections",
                 "step": step,
                 "data": {"pred": vd["pred"], "gt": vd["gt"],
+                         "mask": vmask,
                          "title": f"Cross-sections (step {step})"},
             })
 
@@ -1239,6 +1275,7 @@ class DepthFMLightningModule(L.LightningModule):
                 "tag": "val/error_map",
                 "step": step,
                 "data": {"pred": vd["pred"], "gt": vd["gt"],
+                         "mask": vmask,
                          "title": f"Error map (step {step})"},
             })
 
@@ -1248,6 +1285,7 @@ class DepthFMLightningModule(L.LightningModule):
                 "tag": "val/normal_maps",
                 "step": step,
                 "data": {"pred": vd["pred"], "gt": vd["gt"],
+                         "mask": vmask,
                          "title": f"Surface normals (step {step})"},
             })
 
@@ -1257,10 +1295,10 @@ class DepthFMLightningModule(L.LightningModule):
                 "tag": "val/elevation_scatter",
                 "step": step,
                 "data": {"pred": vd["pred"], "gt": vd["gt"],
+                         "mask": vmask,
                          "title": f"Pred vs GT (step {step})"},
             })
 
-            # 5: Lunar Lambert (conditional on sun data)
             # 5: Lunar Lambert (conditional on sun data)
             if vd.get("has_sun") and vd.get("sun_vector") is not None:
                 # Safely extract the learned weight scalar from the live model
@@ -1269,10 +1307,6 @@ class DepthFMLightningModule(L.LightningModule):
                 except AttributeError:
                     logger.exception("Photo Loss has no lunar_lambert_weight or has not been initialized yet")
                     ll_weight = 0.5  # Fallback if photo_loss isn't initialized yet
-
-                # If you have confidence maps, extract the valid mask for the render
-                conf = self._val_vis_data.get("confidence")  # Or wherever you store it
-                mask_disp = conf[0] if conf is not None else None
 
                 tasks.append({
                     "type": "lunar_lambert",
@@ -1285,7 +1319,7 @@ class DepthFMLightningModule(L.LightningModule):
                         "sun_vector": vd["sun_vector"],
                         "intensity": vd["intensity"],
                         "ambient": vd["ambient"],
-                        "mask_disp": mask_disp,
+                        "mask_disp": vmask,  # correctly pulls from _val_vis_data
                         "lunar_lambert_weight": ll_weight,
                         "title": f"Lambertian Render (step {step})",
                     },
@@ -1300,6 +1334,7 @@ class DepthFMLightningModule(L.LightningModule):
                     "data": {
                         "intermediates": vd["flow_intermediates"],
                         "gt": vd["gt"],
+                        "mask": vmask,
                         "title": f"Flow (step {step})",
                     },
                 })
@@ -1314,6 +1349,7 @@ class DepthFMLightningModule(L.LightningModule):
                         "img": vd["img"],
                         "pred": vd["pred"],
                         "var_dtm": vd["var_dtm"],
+                        "mask": vmask,
                         "title": f"Epistemic Variance (N=8, step {step})",
                     },
                 })
@@ -1325,6 +1361,7 @@ class DepthFMLightningModule(L.LightningModule):
                 "step": step,
                 "data": {
                     "pred": vd["pred"], "gt": vd["gt"],
+                    "mask": vmask,
                     "title": f"Geomorphometric Analysis: Edges & Curvature (step {step})",
                 },
             })
@@ -1336,6 +1373,7 @@ class DepthFMLightningModule(L.LightningModule):
                 "step": step,
                 "data": {
                     "pred": vd["pred"], "gt": vd["gt"],
+                    "mask": vmask,
                     "title": f"Spectral Synthesis (step {step})",
                 },
             })
@@ -1347,6 +1385,7 @@ class DepthFMLightningModule(L.LightningModule):
                 "step": step,
                 "data": {
                     "pred": vd["pred"], "gt": vd["gt"], "img": vd["img"],
+                    "mask": vmask,
                     "title": f"Slope Error DoD (step {step})",
                 },
             })
@@ -1363,6 +1402,8 @@ class DepthFMLightningModule(L.LightningModule):
                     "pred": vd["pred"],
                     "gt": vd["gt"],
                 }
+                if vd.get("confidence") is not None:
+                    broadcast_data["confidence"] = vd["confidence"]
                 if vd.get("sun_vector") is not None:
                     broadcast_data["sun_vector"] = vd["sun_vector"]
                 if vd.get("flow_intermediates") is not None:
@@ -1383,6 +1424,7 @@ class DepthFMLightningModule(L.LightningModule):
 
                 # Rebuild tasks on non-rank-0 with received data
                 if self.global_rank != 0:
+                    received_mask = received.get("confidence")
                     for task in tasks:
                         td = task["data"]
                         if "img" in td:
@@ -1391,6 +1433,10 @@ class DepthFMLightningModule(L.LightningModule):
                             td["pred"] = received["pred"]
                         if "gt" in td:
                             td["gt"] = received["gt"]
+                        if "mask" in td:
+                            td["mask"] = received_mask
+                        if "mask_disp" in td:
+                            td["mask_disp"] = received_mask
                         if "sun_vector" in td and "sun_vector" in received:
                             td["sun_vector"] = received["sun_vector"]
                         if "intermediates" in td and "flow_intermediates" in received:
@@ -1502,10 +1548,16 @@ class DepthFMLightningModule(L.LightningModule):
                     img_i = np.transpose(img_i, (1, 2, 0))
                     img_i = (img_i + 1.0) / 2.0
 
+                # Per-patch valid mask
+                patch_mask = (
+                    conf_mask[i].copy() if conf_mask is not None else None
+                )
+
                 patch_data = {
                     "image": img_i,
                     "pred": pred_pix[i].copy(),
                     "gt": gt_raw[i].copy(),
+                    "mask": patch_mask,
                     "tile_id": tile_id,
                     "score": metrics.photo_consistency,
                     "rmse": metrics.rmse,
@@ -1519,7 +1571,7 @@ class DepthFMLightningModule(L.LightningModule):
                 # Maintain worst 5
                 self._worst_test_patches.append(patch_data)
                 self._worst_test_patches.sort(key=lambda x: x["score"], reverse=False)
-                self._worst_test_patches = self._worst_val_patches[:5]
+                self._worst_test_patches = self._worst_test_patches[:5]
 
         self._trace(f"Exiting test_step for batch {batch_idx}")
 
