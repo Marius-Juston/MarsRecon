@@ -1,306 +1,230 @@
-# CODEX Handoff: MarsRecon SatMAE on Olympus Mons
+# CODEX Handoff: MarsRecon Stage A SatMAE
 
-Last updated: 2026-04-13 (America/Chicago)
+Last updated: 2026-04-20 (America/Chicago)
 
-This file is a practical handoff for the current Stage A SatMAE workflow on the `akshay` branch.
-It is meant to let another agent pick up quickly without re-discovering the same issues.
+This file is a practical handoff for the current Stage A workflow on the `akshay` branch.
+It is intentionally short and only keeps things that were re-verified recently.
 
-## What this branch is doing
+## Current Reality
 
-- Primary Stage A model: SatMAE-style ViT-Base masked autoencoder.
-- Region: Olympus Mons.
-- Data mode: HiRISE `COLOR` channels only.
-- Current stable path: build reusable `litData` streams on scratch, then train SatMAE from those streams.
-- W&B is now integrated and works online.
-
-This branch is no longer using the old raw patch DataLoader path for serious runs. That path was too slow and too fragile during preprocessing.
-
-## Current branch state
-
-- Branch: `akshay`
-- Upstream tracking: `origin/akshay`
-- There are uncommitted local changes that matter for this workflow.
-
-Modified / added files for this SatMAE + litData + W&B path:
-
-- `scripts/launch_satmae_olympus.sh`
-- `src/clip/build_marsclip_cache.py`
-- `src/clip/build_marsclip_litdata.py`
-- `src/clip/marsclip_cache.py`
-- `src/clip/marsclip_litdata.py`
-- `src/clip/marsclip_patches.py`
-- `src/clip/marsclip_splits.py`
-- `src/clip/train_marsclip_satmae.py`
-- `tests/test_marsclip_cache.py`
-- `tests/test_marsclip_litdata.py`
-- `tests/test_marsclip_patches.py`
-- `tests/test_marsclip_splits.py`
-- `tests/test_train_marsclip_satmae.py`
-
-## Scratch layout
-
-Stable scratch roots:
-
-- Raw HiRISE data:
-  - `/scratch/mars_hirise`
-- Stage A reusable assets:
-  - `/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1`
-- Stage A SatMAE runs:
-  - `/scratch/marsrecon_runs/stage_a/satmae`
-
-Important note:
-
-- Do not overwrite anything under `/scratch/mars_hirise_dtm`.
-  That belongs to a different DTM workflow.
-
-## Current healthy litData cache
-
-The current good cache root is:
-
-- `/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/litdata_cache_v1/6b920fc15bdc92fb`
-
-This cache was built from:
-
-- bbox: `(-136, 12, -124, 24)`
-- image size: `64`
-- patch size deg: `0.005`
-- split manifest:
-  - `/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_splits.csv`
-- patch records:
-  - `/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_patch_records.pkl`
-- `color_only = true`
-- `dataset_normalize = true`
-- `filter_invalid_patches = true`
-- `dominant_obs_only = true`
-- required splits: `train`, `val`
-
-Counts from `litdata_summary.json`:
-
-- Source train patches: `57,329`
-- Kept train patches: `29,722`
-- Dropped train patches: `27,607`
-- Source val patches: `12,285`
-- Kept val patches: `6,449`
-- Dropped val patches: `5,836`
-
-This means the current "full dataset" runs are using the full filtered train/val split, not every raw patch in the manifest.
-
-## Current live run
-
-The current long run is active and healthy:
-
-- Run dir:
-  - `/scratch/marsrecon_runs/stage_a/satmae/20260413/20260413_095120_olympus-satmae-vit-base-run3-online-litdata-e25`
-- W&B project:
-  - `akshayn3-auvsl/MarsRecon`
-- W&B run URL:
-  - `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/vuvtbxca`
-
-Most recent observed status:
-
-- phase: `training`
-- epoch: `0 / 25` at first confirmation, later advanced into validation
-- batch size: `64`
-- epochs: `25`
-- warmup epochs: `2`
-- model: `mae_vit_base_patch16`
-- norm pix loss: enabled
-- GPU: `0`
-
-Quick monitor command:
-
-```bash
-watch -n 5 'cat /scratch/marsrecon_runs/stage_a/satmae/20260413/20260413_095120_olympus-satmae-vit-base-run3-online-litdata-e25/progress.json'
-```
-
-## Last completed successful run
-
-The first clean full end-to-end success was:
-
-- `/scratch/marsrecon_runs/stage_a/satmae/20260413/20260413_094123_olympus-satmae-vit-base-run1-online-litdata-clean`
-
-Its W&B run:
-
-- `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/mf45a8i5`
-
-Key metrics from `summary.json`:
-
-- epochs: `2`
-- final train loss: `0.37687564596276857`
-- best / final val loss: `0.31400009151548147`
-
-Useful artifacts:
-
-- `checkpoints/best_checkpoint.pt`
-- `checkpoints/checkpoint.pt`
-- `reconstructions/reconstruction_best.png`
-- `reconstructions/reconstruction_final.png`
-- `history.json`
-- `val_history.json`
-
-## How to launch a new run
-
-Use the launcher. It will reuse the good litData cache if present.
-
-Example online run:
-
-```bash
-env \
-  WANDB_API_KEY='<set this in env, do not hardcode in files>' \
-  CUDA_VISIBLE_DEVICES=0 \
-  WANDB_MODE=online \
-  WANDB_PROJECT=MarsRecon \
-  WANDB_ENTITY=akshayn3-auvsl \
-  RUN_NAME=olympus_satmae_vit_base_runX \
-  EPOCHS=25 \
-  WARMUP_EPOCHS=2 \
-  USE_LITDATA=1 \
-  FILTER_INVALID_PATCHES=1 \
-  DOMINANT_OBS_ONLY=1 \
-  CACHE_INCLUDE_TEST=0 \
-  NUM_WORKERS=24 \
-  PREFETCH_FACTOR=8 \
-  LITDATA_WORKERS=24 \
-  bash scripts/launch_satmae_olympus.sh
-```
-
-Important:
-
-- Pass `WANDB_API_KEY` in the environment.
-  In this environment, relying on `~/.netrc` was unreliable for the real launcher.
-- Keep `USE_LITDATA=1`.
-- Keep `FILTER_INVALID_PATCHES=1` and `DOMINANT_OBS_ONLY=1` for apples-to-apples comparison with the successful runs.
-
-## How to check whether a run is truly healthy
-
-Healthy means all of the following are true:
-
-1. `progress.json` exists in the run dir.
-2. `progress.json` is updating.
-3. GPU memory is allocated to the training process.
-4. GPU utilization is non-zero during training.
-5. W&B prints a real online run URL, not an offline fallback.
-
-Recommended checks:
-
-```bash
-cat /scratch/marsrecon_runs/stage_a/satmae/<run_dir>/progress.json
-nvidia-smi
-ps -eo pid,ppid,pcpu,pmem,etimes,args | rg 'train_marsclip_satmae|wandb-core'
-```
-
-## Known failure modes and fixes
-
-### 1. Raw patch path looked like "training" but never really trained
-
-Cause:
-
-- preprocessing was too slow and mostly hidden
-- repeated JP2 open/reproject per patch was the bottleneck
-
-Fix:
-
-- switched to reusable `litData` streams on scratch
-
-### 2. litData cache built but launcher pointed to the wrong cache hash
-
-Cause:
-
-- earlier launcher guessed the cache hash
-
-Fix:
-
-- `scripts/launch_satmae_olympus.sh` now resolves the cache directory by reading `litdata_summary.json`
-- it checks metadata and required `_SUCCESS` files
-
-### 3. W&B online silently fell back to offline
-
-Cause:
-
-- online auth was not being carried into the actual launcher environment
-
-Fix:
-
-- pass `WANDB_API_KEY` explicitly in the launch environment
-- the trainer now prints when it falls back:
-  - `[wandb] Online initialization failed; falling back to offline mode for this run.`
-
-If you see that message on a run that is supposed to be online, stop it early and relaunch with the working key in env.
-
-### 4. litData wrote temporary chunks into `/tmp/chunks`
-
-Cause:
-
-- data optimizer temp paths were not pinned
-
-Fix:
-
-- `build_marsclip_litdata.py` now sets split-local optimizer cache dirs
-
-### 5. `--max-patches` with split manifests could become inconsistent
-
-Cause:
-
-- manifest patch IDs did not always line up with truncated patch-record tables
-
-Fix:
-
-- `align_manifest_to_patch_records(...)` in `src/clip/marsclip_splits.py`
-
-## W&B settings
-
-Current correct values:
-
-- entity: `akshayn3-auvsl`
-- project: `MarsRecon`
-
-Do not store the API key in code or docs.
-
-## DDP / Lightning / litData notes
-
-Current state:
-
-- SatMAE trainer is still single-process PyTorch.
-- It is not yet DDP.
-- It is not yet Lightning.
-- The important throughput improvement already in place is `litData`.
-
-If DDP is added later:
-
-- initialize distributed with `init_process_group` before dataloader creation
-- use `torchrun`
-- do not let world size be invisible to dataset / loader setup
-
-This was called out explicitly as a deadlock hazard by a collaborator.
-
-## What not to change casually
-
-- Do not remove `litData` from the serious run path.
-- Do not switch back to the old raw patch DataLoader for full runs.
-- Do not change both filtering and model/training hyperparameters at the same time if the goal is comparison.
-- Do not overwrite existing scratch run directories.
-- Do not touch `/scratch/mars_hirise_dtm`.
-
-## Best next steps after the current long run
-
-1. Inspect reconstruction quality from the long run.
-2. Compare the new best checkpoint against the 2-epoch successful run.
-3. Optionally build the `test` split stream once the Stage A recipe is locked.
-4. If throughput becomes the next bottleneck, consider DDP.
-5. If representation quality is the next question, run controlled SatMAE vs custom-MAE comparisons using the same filtered data regime.
-
-## Quick file map
-
-- Main trainer:
+- The active Stage A trainer is:
   - `src/clip/train_marsclip_satmae.py`
-- litData builder:
-  - `src/clip/build_marsclip_litdata.py`
-- litData dataset bridge:
-  - `src/clip/marsclip_litdata.py`
-- scratch launcher:
+- The canonical launcher is:
   - `scripts/launch_satmae_olympus.sh`
-- split utilities:
-  - `src/clip/marsclip_splits.py`
-- patch extraction:
-  - `src/clip/marsclip_patches.py`
+- Serious runs are scratch-backed and use litData caches.
+- The current Mars-specific improvements in the trainer are real:
+  - valid-mask-aware masking/loss
+  - runtime valid-mask refinement from the image tensor itself
+  - suppression of single-band pseudo-valid pixels in `color_only` mode
+  - optional spectral dropout
+- Spectral dropout is implemented but is still typically run with:
+  - `--spectral-dropout-prob 0.0`
 
+## Current Scratch Layout
+
+- raw HiRISE mirror:
+  - `/scratch/mars_hirise`
+- Stage A assets:
+  - `/scratch/marsrecon_runs/stage_a/assets`
+- Stage A runs:
+  - `/scratch/marsrecon_runs/stage_a/satmae`
+- dataset viz defaults:
+  - `/scratch/marsrecon_runs/dataset_viz`
+- clip viz defaults:
+  - `/scratch/marsrecon_runs/clip_viz`
+- clip report defaults:
+  - `/scratch/marsrecon_runs/clip_reports`
+
+Do not touch:
+
+- `/scratch/mars_hirise_dtm`
+
+## Current Best Completed Run
+
+Best completed Stage A reconstruction run so far:
+
+- run dir:
+  - `/scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_035331_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v1`
+- W&B:
+  - `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/robbis5a`
+- config:
+  - `image_size=256`
+  - `patch_size_px=8`
+  - `mask_ratio=0.5`
+  - `epochs=20`
+  - `valid_mask_aware=true`
+  - `token_min_valid_fraction=0.5`
+  - `spectral_dropout_prob=0.0`
+- result:
+  - best val loss `0.1479`
+
+Interpretation:
+
+- This is the strongest completed run quantitatively so far.
+- It is structurally better than the earlier `128/p8` and `128/p4` runs.
+- It still leaves some residual green/purple contamination near nodata-like regions.
+
+## Important Completed Runs
+
+### 128/p8/20e baseline
+
+- run dir:
+  - `/scratch/marsrecon_runs/stage_a/satmae/20260418/20260418_015410_olympus-satmae-vit-base-128p8-mr50-e20-v1`
+- best val loss:
+  - `0.1751`
+
+### 128/p8/80e
+
+- run dir:
+  - `/scratch/marsrecon_runs/stage_a/satmae/20260418/20260418_033907_olympus-satmae-vit-base-128p8-mr50-e80-underconvergence-test`
+- best val loss:
+  - `0.1510`
+
+### 128/p4/20e
+
+- run dir:
+  - `/scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_000436_olympus-satmae-vit-base-128p4-mr50-e20-v1`
+- best val loss:
+  - `0.1823`
+
+Interpretation:
+
+- `128/p4` reduced visible block size but was not an overall win.
+- `256/p8` plus valid-mask-aware training is the current best direction.
+
+## What the Trainer Supports
+
+Main trainer:
+
+- `src/clip/train_marsclip_satmae.py`
+
+Important CLI knobs that are actually live:
+
+- data:
+  - `--image-size`
+  - `--patch-size-px`
+  - `--patch-size-deg`
+  - `--split-manifest`
+  - `--patch-records-path`
+  - `--litdata-root`
+  - `--dataset-normalize`
+  - `--dataset-normalization-path`
+  - `--filter-invalid-patches`
+  - `--dominant-obs-only`
+  - `--valid-mask-aware`
+  - `--token-min-valid-fraction`
+- optimization:
+  - `--epochs`
+  - `--batch-size`
+  - `--accum-iter`
+  - `--blr`
+  - `--lr`
+  - `--min-lr`
+  - `--warmup-epochs`
+  - `--weight-decay`
+- MAE:
+  - `--mask-ratio`
+  - `--norm-pix-loss`
+  - `--spectral-dropout-prob`
+  - `--spectral-dropout-max-channels`
+- logging:
+  - `--wandb-mode`
+  - `--wandb-project`
+  - `--wandb-entity`
+  - `--save-reconstructions`
+- init:
+  - `--init-checkpoint`
+  - `--init-mode`
+  - `--init-pos-embed`
+
+## Important Caveats
+
+### 1. litData is the real training path
+
+Do not assume raw patch extraction is acceptable for serious runs.
+The current healthy path is scratch-backed litData.
+
+### 2. Recipe-alignment transforms are not active on litData
+
+The trainer has crop/flip transform code, but the litData path bypasses that wrapping.
+
+So:
+
+- the historical `recipealign` run is **not** a clean augmentation ablation
+
+### 3. Previews are better now, but still diagnostic
+
+Saved reconstruction previews are much more faithful than the old ones because they now:
+
+- denormalize from dataset stats
+- respect the refined valid mask
+- apply a per-channel percentile stretch
+
+Still, treat them as diagnostics rather than a formal metric.
+
+## Current Healthy Caches
+
+### 128 image-size cache
+
+- `/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/litdata_cache_v1/64e082972f642b74`
+
+### 256 image-size cache
+
+- `/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_256_v1/litdata_cache_v1/2815a653281747ba`
+
+That `256` cache is the one used by both the best completed `256/p8` run and the current strict-mask follow-up.
+
+## Current W&B Defaults
+
+- entity:
+  - `akshayn3-auvsl`
+- project:
+  - `MarsRecon`
+
+## Useful Commands
+
+Check the active strict run:
+
+```bash
+cat /scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_123744_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v2-strict80/progress.json
+```
+
+List the latest Stage A runs:
+
+```bash
+find /scratch/marsrecon_runs/stage_a/satmae -maxdepth 3 -name summary.json | sort
+```
+
+Launch the standard Olympus workflow:
+
+```bash
+bash scripts/launch_satmae_olympus.sh
+```
+
+For direct experimental control:
+
+```bash
+.venv/bin/python src/clip/train_marsclip_satmae.py --help
+```
+
+## Current Repo Changes Worth Preserving
+
+The most important local code changes on this branch are:
+
+- `src/clip/train_marsclip_satmae.py`
+  - valid-mask-aware SatMAE path
+  - runtime valid-mask refinement
+  - optional spectral dropout
+- `src/clip/marsclip_patches.py`
+  - stricter pixel-valid logic
+  - single-band invalidation in `color_only` mode
+- `tests/test_train_marsclip_satmae.py`
+- `tests/test_marsclip_patches.py`
+
+## Practical Recommendation
+
+Before choosing another architecture sweep, first compare the current strict-mask run against:
+
+- the completed `256/p8 validmask-v1` run
+
+The key question is whether the stricter mask logic reduces residual green contamination without damaging the stronger structural reconstruction that `256/p8` already achieved.
