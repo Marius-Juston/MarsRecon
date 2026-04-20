@@ -47,6 +47,7 @@ import random
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from warnings import deprecated
 
 import numpy as np
 import pandas as pd
@@ -839,7 +840,8 @@ def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
 
     return max_local_density
 
-
+# FIXME the problem is that this had z sun vector be negative
+@deprecated("Use estimate_sun_vector_irls instead, this does not calculate the z sun vector correctly and can render it to have negative values.")
 def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: torch.Tensor) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -856,7 +858,7 @@ def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: 
     # Ensure 3D (C, H, W)
     if dtm.ndim == 4:
         assert dtm.shape[
-                   0] == 1, "The batch size should be 1. estimate_sun_vector_ols currently only works for a batch size of 1"
+                   0] == 1, "The batch size should be 1. estimate_sun_vector_irls currently only works for a batch size of 1"
         dtm = dtm[0]
     if ortho.ndim == 4: ortho = ortho[0]
     if valid_mask.ndim == 4: valid_mask = valid_mask[0]
@@ -911,6 +913,102 @@ def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: 
     sun_vec = F.normalize(k, p=2, dim=0)
 
     return sun_vec, intensity, ambient
+
+
+import torch
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def estimate_sun_vector_irls(
+        dtm: torch.Tensor,
+        ortho: torch.Tensor,
+        valid_mask: torch.Tensor,
+        max_iter: int = 15,
+        tol: float = 1e-4
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Decoupled IRLS: Separates ambient light estimation from the linear system
+    to prevent the Nz / Bias collinearity trap from inverting the sun vector.
+    """
+    device = dtm.device
+
+    def get_defaults():
+        default_sun = F.normalize(torch.tensor([0.5, -0.5, 1.0], device=device), p=2, dim=0)
+        return default_sun, torch.tensor(1.0, device=device), torch.tensor(0.05, device=device)
+
+    if dtm.ndim == 4: dtm = dtm[0]
+    if ortho.ndim == 4: ortho = ortho[0]
+    if valid_mask.ndim == 4: valid_mask = valid_mask[0]
+    if ortho.shape[0] == 3: ortho = ortho.mean(dim=0, keepdim=True)
+
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device) / 8.0
+    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device) / 8.0
+    spatial_scale = max(dtm.shape[-2], dtm.shape[-1]) / 2.0
+    padded_dtm = F.pad(dtm.unsqueeze(0), (1, 1, 1, 1), mode='replicate')
+
+    n_x = -F.conv2d(padded_dtm, sobel_x.view(1, 1, 3, 3)) * spatial_scale
+    n_y = -F.conv2d(padded_dtm, sobel_y.view(1, 1, 3, 3)) * spatial_scale
+    n_z = torch.ones_like(n_x)
+
+    normals = F.normalize(torch.cat([n_x, n_y, n_z], dim=1), p=2, dim=1).squeeze(0)
+
+    mask = valid_mask.squeeze(0).bool()
+    zero_mask = ortho.squeeze(0) > 1e-4
+    final_mask = mask & zero_mask
+
+    N_flat = normals[:, final_mask].t()
+    Y_raw = ortho.squeeze(0)[final_mask].unsqueeze(1)
+
+    if N_flat.shape[0] < 100:
+        return get_defaults()
+
+    # --- 1. Decoupled Ambient Estimation ---
+    # The 1st percentile of valid pixels is a highly robust proxy for the
+    # secondary scattering/ambient floor in deep shadows.
+    ambient_est = torch.quantile(Y_raw, 0.01)
+
+    # Subtract ambient to isolate the pure directional irradiance
+    Y_flat = torch.clamp(Y_raw - ambient_est, min=0.0)
+
+    # --- 2. Design Matrix (No Bias Column) ---
+    H = N_flat  # Shape: (M, 3)
+
+    beta = torch.linalg.lstsq(H, Y_flat).solution
+    c = 1.345
+
+    for _ in range(max_iter):
+        residuals = Y_flat - torch.mm(H, beta)
+        median_res = torch.median(residuals)
+        mad = torch.median(torch.abs(residuals - median_res))
+        sigma = (mad / 0.67449) + 1e-6
+
+        r_stand = torch.abs(residuals / sigma)
+        weights = torch.clamp(c / (r_stand + 1e-8), max=1.0)
+
+        w_sqrt = torch.sqrt(weights)
+        H_w = H * w_sqrt
+        Y_w = Y_flat * w_sqrt
+
+        beta_new = torch.linalg.lstsq(H_w, Y_w).solution
+
+        if torch.norm(beta_new - beta, p=2) < tol:
+            beta = beta_new
+            break
+
+    # --- 3. Parameter Extraction and Enforced Positivity ---
+    k = beta[:3, 0]
+
+    # Absolute failsafe: Since we stripped the bias, if anomalous geometry
+    # somehow still forces a negative Z, we mathematically reflect it
+    # across the horizon line to maintain physical validity.
+    if k[2] < 0:
+        k[2] = -k[2]
+
+    intensity = torch.norm(k, p=2).clamp(min=1e-4)
+    sun_vec = F.normalize(k, p=2, dim=0)
+
+    return sun_vec, intensity, ambient_est
 
 
 def _normalize_dtm_relative(
@@ -1238,7 +1336,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             dtm_norm: TrainingNormResult = self.evel_normalizer.normalize_for_training(dtm_resized, valid_mask_resized)
             image_norm = self.ortho_normalizer.normalize(image_resized)
 
-            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_norm.normed_residual, image_norm,
+            sun_vec, intensity, ambient = estimate_sun_vector_irls(dtm_norm.normed_residual, image_norm,
                                                                   valid_mask_resized)
 
             sun_x = sun_vec[0].item()

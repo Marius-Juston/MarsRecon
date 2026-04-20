@@ -64,8 +64,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from depth_fm.depthfm_adapter import (
-    DepthFMHiRISEAdapterCached,
-    estimate_sun_vector_ols, fill_voids_gmrf, )
+    DepthFMHiRISEAdapterCached, fill_voids_gmrf, estimate_sun_vector_irls, )
 from depth_fm.lightning_module import DepthFMLightningModule, FasterEMAWeightAveraging
 from depth_fm.visualization import (
     plot_convergence_curves,
@@ -1266,8 +1265,9 @@ def visualize_loss_physics(
                     ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
 
                     # --- Estimate GT exposure/sun via OLS (for sanity check column) ---
-                    sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_ols(dtm, img, mask)
+                    sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_irls(dtm, img, mask)
                     # OLS returns (3,), scalar, scalar — reshape for render_from_depth
+                    print(sun_vec_gt, intensity_gt, ambient_gt)
                     sun_vec_gt = sun_vec_gt.view(1, 3)
                     intensity_gt = intensity_gt.view(1)
                     ambient_gt = ambient_gt.view(1)

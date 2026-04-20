@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 
 # GDAL / threading optimizations for the extraction phase
@@ -45,7 +46,7 @@ from litdata import optimize
 from dataset.mars_hirise_dtm import MarsHiRISEDTM
 from dataset.hirise_sampler import HiRISEGeoSampler
 from torchgeo.samplers import Units
-from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_ols
+from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_irls
 
 import torch.multiprocessing as mp
 
@@ -393,7 +394,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
             conf_fp32 = sample["confidence"].float()
 
             dtm_1ch = dtm_fp32[:1]
-            sun_vec, intensity, ambient = estimate_sun_vector_ols(dtm_1ch, image_fp32, conf_fp32)
+            sun_vec, intensity, ambient = estimate_sun_vector_irls(dtm_1ch, image_fp32, conf_fp32)
             sun_vec = torch.nn.functional.normalize(sun_vec, p=2, dim=0)
 
             npz_path = str(tmp_dir / f"{i:08d}.npz")
@@ -434,6 +435,8 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
 
     success_marker.touch()
     logger.info(f"[{split}] Done.")
+
+    del loader
 
 
 if __name__ == "__main__":
@@ -491,3 +494,6 @@ if __name__ == "__main__":
             f'  from litdata import StreamingDataset\n'
             f'  ds = StreamingDataset(input_dir="hf://datasets/{final_repo_id}/train")\n'
         )
+
+    # Need to manually terminate the program to ensure that the system does not hang
+    sys.exit(0)

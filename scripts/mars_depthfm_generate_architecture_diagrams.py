@@ -87,7 +87,7 @@ try:
         fill_voids_gmrf as _real_gmrf,
         is_tin_artifact as _real_tin,
         detect_dtm_seam_artifact as _real_seam,
-        estimate_sun_vector_ols as _real_sun,
+        estimate_sun_vector_irls as _real_sun,
         compute_topographic_residual as _real_residual,
     )
 
