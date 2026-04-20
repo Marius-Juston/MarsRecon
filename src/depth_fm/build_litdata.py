@@ -436,8 +436,6 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     success_marker.touch()
     logger.info(f"[{split}] Done.")
 
-    del loader
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
