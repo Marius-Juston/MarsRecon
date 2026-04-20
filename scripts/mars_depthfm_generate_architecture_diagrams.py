@@ -187,7 +187,7 @@ def _fallback_gmrf(image, dtm, valid_mask, *,
     Q_vv = Q[np.ix_(void_idx, void_idx)] + nugget * sp.eye(len(void_idx), format="csc")
     Q_vo = Q[np.ix_(void_idx, obs_idx)]
 
-    filled_img = img_np.copy();
+    filled_img = img_np.copy()
     filled_dtm = dtm_np.copy()
     for c in range(dtm_np.shape[0]):
         flat = dtm_np[c].ravel()
@@ -661,13 +661,13 @@ def _save_panel(path: Path, arr: np.ndarray, cmap: str = "mako",
         ax.imshow(arr, interpolation="nearest")
     else:
         ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-    ax.set_xticks([]);
+    ax.set_xticks([])
     ax.set_yticks([])
     for sp in ax.spines.values():
         if frame_color is None:
             sp.set_visible(False)
         else:
-            sp.set_color(frame_color);
+            sp.set_color(frame_color)
             sp.set_linewidth(3)
     if extra_draw is not None:
         extra_draw(ax)
@@ -685,7 +685,7 @@ def _save_hist(path: Path, samples: np.ndarray, *,
     ax.set_yticks([])
     ax.tick_params(axis="x", labelsize=7.5)
     for s in ax.spines.values():
-        s.set_color("#999");
+        s.set_color("#999")
         s.set_linewidth(0.6)
     if title:
         ax.set_title(title, fontsize=8.5, pad=4)
@@ -703,13 +703,13 @@ def _save_strip(path: Path, arrays: list[np.ndarray], *,
         axs = [axs]
     for i, (ax, arr) in enumerate(zip(axs, arrays)):
         ax.imshow(arr, cmap=cmap, interpolation="nearest")
-        ax.set_xticks([]);
+        ax.set_xticks([])
         ax.set_yticks([])
         for sp in ax.spines.values():
             if frame_color is None:
                 sp.set_visible(False)
             else:
-                sp.set_color(frame_color);
+                sp.set_color(frame_color)
                 sp.set_linewidth(1.5)
         if labels:
             ax.set_title(labels[i], fontsize=9)
@@ -1559,13 +1559,15 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
                          C["node_loss_pix"]),
                     ])
 
-        c.edge("decode", "p_photo");
+        c.edge("decode", "p_photo")
         c.edge("decode", "p_grad")
-        c.edge("decode", "p_norm");
+        c.edge("decode", "p_norm")
         c.edge("decode", "p_ffl")
-        c.edge("decode", "p_huber");
+        c.edge("decode", "p_huber")
         c.edge("decode", "p_lap")
         c.edge("decode", "p_ord")
+
+        c.edge("p_norm", "p_photo", label="N_pred")
 
     dot.edge("unet", "decode", xlabel=" vθ + z_t ")
 
@@ -1589,9 +1591,9 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
              fontcolor="white", penwidth="1.6")
 
     dot.edge("l_vel", "l_total", color=C["node_loss_vel"], penwidth="1.4")
-    dot.edge("p_photo", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_grad", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_norm", "l_total", color=C["node_loss_pix"], penwidth="1.3")
+    dot.edge("p_photo", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_ffl", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_huber", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_lap", "l_total", color=C["node_loss_pix"], penwidth="1.3")
