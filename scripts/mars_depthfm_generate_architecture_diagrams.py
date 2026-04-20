@@ -95,38 +95,37 @@ try:
 except Exception:  # pragma: no cover
     _USING_REAL_ADAPTER = False
 
-
 # ===========================================================================
 # PALETTE — mako/flare-inspired, matched to depth_fm/visualization.py
 # ===========================================================================
 
 C = {
     # Stage/cluster fills (pale, for cluster backgrounds)
-    "bg_infra":     "#EEF5FB",  # cool pale
-    "bg_filter":    "#FDEEED",  # pale red
-    "bg_preproc":   "#E7F7EF",  # pale green
-    "bg_flow":      "#EFEAF7",  # pale purple
-    "bg_loss":      "#FFF2E3",  # pale orange
-    "bg_optim":     "#EAF7EE",  # pale emerald
-    "bg_artifact":  "#F4ECF7",  # pale lavender
+    "bg_infra": "#EEF5FB",  # cool pale
+    "bg_filter": "#FDEEED",  # pale red
+    "bg_preproc": "#E7F7EF",  # pale green
+    "bg_flow": "#EFEAF7",  # pale purple
+    "bg_loss": "#FFF2E3",  # pale orange
+    "bg_optim": "#EAF7EE",  # pale emerald
+    "bg_artifact": "#F4ECF7",  # pale lavender
     # Node fills (saturated accents)
-    "node_infra":    "#1a6b7c",
-    "node_filter":   "#c0392b",
-    "node_accept":   "#27ae60",
-    "node_preproc":  "#2d9b78",
-    "node_latent":   "#4a90d9",
-    "node_unet":     "#6b5ea8",
+    "node_infra": "#1a6b7c",
+    "node_filter": "#c0392b",
+    "node_accept": "#27ae60",
+    "node_preproc": "#2d9b78",
+    "node_latent": "#4a90d9",
+    "node_unet": "#6b5ea8",
     "node_loss_vel": "#e74c3c",
     "node_loss_pix": "#e67e22",
-    "node_optim":    "#27ae60",
+    "node_optim": "#27ae60",
     "node_artifact": "#8e44ad",
-    "node_data":     "#0b3d54",
+    "node_data": "#0b3d54",
     # Neutrals
-    "edge":          "#495057",
-    "border":        "#343A40",
-    "light":         "#FFFFFF",
-    "text":          "#2c3e50",
-    "cluster_line":  "#DEE2E6",
+    "edge": "#495057",
+    "border": "#343A40",
+    "light": "#FFFFFF",
+    "text": "#2c3e50",
+    "cluster_line": "#DEE2E6",
 }
 
 
@@ -188,7 +187,8 @@ def _fallback_gmrf(image, dtm, valid_mask, *,
     Q_vv = Q[np.ix_(void_idx, void_idx)] + nugget * sp.eye(len(void_idx), format="csc")
     Q_vo = Q[np.ix_(void_idx, obs_idx)]
 
-    filled_img = img_np.copy(); filled_dtm = dtm_np.copy()
+    filled_img = img_np.copy();
+    filled_dtm = dtm_np.copy()
     for c in range(dtm_np.shape[0]):
         flat = dtm_np[c].ravel()
         u = spla.spsolve(Q_vv, -Q_vo @ flat[obs_idx])
@@ -241,7 +241,7 @@ def _fallback_seam(elevation, valid_mask,
                       device=dev, dtype=dt).view(1, 1, 3, 3) / 8.0
     gx = F.conv2d(safe, sx, padding=1)
     gy = F.conv2d(safe, sy, padding=1)
-    g = torch.sqrt(gx**2 + gy**2 + 1e-8)
+    g = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
     inv = (~valid_mask).float()
     dil = F.max_pool2d(inv, kernel_size=7, stride=1, padding=3)
     eroded = (dil == 0.0).float()
@@ -492,7 +492,7 @@ def _collect_real_data(H=128) -> dict:
     sun_vec, intensity, ambient = _sun(
         torch.from_numpy(crater_dtm).unsqueeze(0).unsqueeze(0),
         torch.from_numpy(crater_ortho).unsqueeze(0).unsqueeze(0)
-            .expand(1, 3, -1, -1),
+        .expand(1, 3, -1, -1),
         crater_valid.float(),
     )
 
@@ -579,9 +579,9 @@ def _collect_real_data(H=128) -> dict:
     _draw_idx = _rng_ord.choice(ord_num_pairs, size=ord_draw, replace=False)
     ord_pairs = {
         "yi": (_idx_i[_draw_idx] // _W).astype(np.int32),
-        "xi": (_idx_i[_draw_idx] %  _W).astype(np.int32),
+        "xi": (_idx_i[_draw_idx] % _W).astype(np.int32),
         "yj": (_idx_j[_draw_idx] // _W).astype(np.int32),
-        "xj": (_idx_j[_draw_idx] %  _W).astype(np.int32),
+        "xj": (_idx_j[_draw_idx] % _W).astype(np.int32),
         "ordered": _ordered[_draw_idx],
         "violations": _violations[_draw_idx],
     }
@@ -661,12 +661,14 @@ def _save_panel(path: Path, arr: np.ndarray, cmap: str = "mako",
         ax.imshow(arr, interpolation="nearest")
     else:
         ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xticks([]);
+    ax.set_yticks([])
     for sp in ax.spines.values():
         if frame_color is None:
             sp.set_visible(False)
         else:
-            sp.set_color(frame_color); sp.set_linewidth(3)
+            sp.set_color(frame_color);
+            sp.set_linewidth(3)
     if extra_draw is not None:
         extra_draw(ax)
     fig.savefig(path, bbox_inches="tight", pad_inches=0.02, dpi=dpi)
@@ -683,7 +685,8 @@ def _save_hist(path: Path, samples: np.ndarray, *,
     ax.set_yticks([])
     ax.tick_params(axis="x", labelsize=7.5)
     for s in ax.spines.values():
-        s.set_color("#999"); s.set_linewidth(0.6)
+        s.set_color("#999");
+        s.set_linewidth(0.6)
     if title:
         ax.set_title(title, fontsize=8.5, pad=4)
     fig.savefig(path, bbox_inches="tight", pad_inches=0.03, dpi=dpi)
@@ -700,12 +703,14 @@ def _save_strip(path: Path, arrays: list[np.ndarray], *,
         axs = [axs]
     for i, (ax, arr) in enumerate(zip(axs, arrays)):
         ax.imshow(arr, cmap=cmap, interpolation="nearest")
-        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xticks([]);
+        ax.set_yticks([])
         for sp in ax.spines.values():
             if frame_color is None:
                 sp.set_visible(False)
             else:
-                sp.set_color(frame_color); sp.set_linewidth(1.5)
+                sp.set_color(frame_color);
+                sp.set_linewidth(1.5)
         if labels:
             ax.set_title(labels[i], fontsize=9)
     fig.subplots_adjust(left=0, right=1, top=0.88, bottom=0, wspace=0.04)
@@ -886,22 +891,22 @@ def _h(text: str) -> str:
     quotes and never interpolate user text inside attribute values.
     """
     return (text.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;"))
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
 
 
 def _image_node(
-    g: graphviz.Digraph,
-    node_id: str,
-    image_path: Path,
-    *,
-    title: str,
-    captions: list[tuple[str, str]] | None = None,
-    header_color: str = "#1a6b7c",
-    accent_color: str | None = None,
-    img_width: str = "1.9",
-    title_pt: int = 10,
-    caption_pt: int = 9,
+        g: graphviz.Digraph,
+        node_id: str,
+        image_path: Path,
+        *,
+        title: str,
+        captions: list[tuple[str, str]] | None = None,
+        header_color: str = "#1a6b7c",
+        accent_color: str | None = None,
+        img_width: str = "1.9",
+        title_pt: int = 10,
+        caption_pt: int = 9,
 ):
     """Node = image on top + coloured-caption rows below, rendered via HTML label.
 
@@ -942,16 +947,16 @@ def _image_node(
 
 
 def _text_node(
-    g: graphviz.Digraph,
-    node_id: str,
-    text_lines: list[str],
-    *,
-    fill: str,
-    text_color: str = "#ffffff",
-    shape: str = "box",
-    penwidth: str = "1.3",
-    fontsize: int = 10,
-    bold_first: bool = True,
+        g: graphviz.Digraph,
+        node_id: str,
+        text_lines: list[str],
+        *,
+        fill: str,
+        text_color: str = "#ffffff",
+        shape: str = "box",
+        penwidth: str = "1.3",
+        fontsize: int = 10,
+        bold_first: bool = True,
 ):
     """Rounded coloured node. First line bold, subsequent lines normal."""
     if not text_lines:
@@ -1383,7 +1388,6 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
                     header_color=C["node_latent"],
                     captions=[("centered relative relief", C["text"])])
 
-
     # -----------------------------------------------------
     # VAE Encode
     # -----------------------------------------------------
@@ -1549,15 +1553,18 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
                     captions=[
                         (f"sampled pairs  (margin = {data['ord_margin']:.02f})",
                          C["text"]),
-                        (f"violation rate = {100*data['ord_violation_rate']:.1f}%",
+                        (f"violation rate = {100 * data['ord_violation_rate']:.1f}%",
                          C["text"]),
                         ("weight: w_o = 1.0  ·  from step 0",
                          C["node_loss_pix"]),
                     ])
 
-        c.edge("decode", "p_photo"); c.edge("decode", "p_grad")
-        c.edge("decode", "p_norm");  c.edge("decode", "p_ffl")
-        c.edge("decode", "p_huber"); c.edge("decode", "p_lap")
+        c.edge("decode", "p_photo");
+        c.edge("decode", "p_grad")
+        c.edge("decode", "p_norm");
+        c.edge("decode", "p_ffl")
+        c.edge("decode", "p_huber");
+        c.edge("decode", "p_lap")
         c.edge("decode", "p_ord")
 
     dot.edge("unet", "decode", xlabel=" vθ + z_t ")

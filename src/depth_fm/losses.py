@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class PhotoclinometricLoss(nn.Module):
     """State-of-the-art photoclinometric loss for planetary DTM estimation.
 

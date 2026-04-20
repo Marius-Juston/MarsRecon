@@ -34,12 +34,12 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Callable
 
+import matplotlib.patches as mpatches
 from matplotlib.figure import Figure
 
 from depth_fm.litdata_datamodule import _build_litdata_loaders
 from depth_fm.losses import PhotoclinometricLoss, AbsoluteDepthLoss, LaplacianLoss, \
     OrdinalRankingLoss
-import matplotlib.patches as mpatches
 
 # ---------------------------------------------------------------------------
 # GLOBAL GDAL/IO OPTIMIZATIONS (For 256-Core / NVMe setups)
@@ -331,7 +331,7 @@ def visualize_laplacian_loss(
                 pr_lap = loss_fn.laplacian(pred)
                 lap_err = (pr_lap - gt_lap).abs()
 
-                logger.info(f"Laplacian loss: {loss_fn(pred,dtm):.3f}")
+                logger.info(f"Laplacian loss: {loss_fn(pred, dtm):.3f}")
 
                 # Shared diverging scale across GT and pred so colours are comparable
                 combined = torch.cat([gt_lap, pr_lap], dim=0)
@@ -581,7 +581,8 @@ def visualize_random_flips_and_rotations(dataloader, output_dir: Path, num_sampl
     ]
 
     # 2. Generate a grid for each sample
-    for sample_idx, sample in tqdm(enumerate(samples), total=len(samples), desc="Generating Sun Vector Augmentation Validation"):
+    for sample_idx, sample in tqdm(enumerate(samples), total=len(samples),
+                                   desc="Generating Sun Vector Augmentation Validation"):
         fig, axes = plt.subplots(len(transformations), 3, figsize=(15, 5 * len(transformations)))
         plt.subplots_adjust(wspace=0.1, hspace=0.3)
 

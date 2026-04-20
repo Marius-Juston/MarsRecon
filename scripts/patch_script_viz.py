@@ -818,8 +818,6 @@ def make_publication_figure(
     # --- (C) sweep: patch count vs patch_overlap (mean across strips) ---
     axC = fig.add_subplot(gs[1, 0])
 
-
-
     mean_opt = []
     mean_simp = []
 

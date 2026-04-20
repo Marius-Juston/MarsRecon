@@ -47,7 +47,6 @@ import random
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
-from warnings import deprecated
 
 import numpy as np
 import pandas as pd
@@ -61,6 +60,7 @@ from scipy import ndimage
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm  # Highly recommended to see progress during the one-time build
+from typing_extensions import deprecated
 
 from dataset.hirise_sampler import HiRISEGeoSampler
 from dataset.mars_hirise_dtm import MarsHiRISEDTM
@@ -840,8 +840,10 @@ def is_tin_artifact(elevation: torch.Tensor, valid_mask: torch.Tensor,
 
     return max_local_density
 
+
 # FIXME the problem is that this had z sun vector be negative
-@deprecated("Use estimate_sun_vector_irls instead, this does not calculate the z sun vector correctly and can render it to have negative values.")
+@deprecated(
+    "Use estimate_sun_vector_irls instead, this does not calculate the z sun vector correctly and can render it to have negative values.")
 def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: torch.Tensor) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -913,10 +915,6 @@ def estimate_sun_vector_ols(dtm: torch.Tensor, ortho: torch.Tensor, valid_mask: 
     sun_vec = F.normalize(k, p=2, dim=0)
 
     return sun_vec, intensity, ambient
-
-
-import torch
-import torch.nn.functional as F
 
 
 @torch.no_grad()
@@ -1337,7 +1335,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             image_norm = self.ortho_normalizer.normalize(image_resized)
 
             sun_vec, intensity, ambient = estimate_sun_vector_irls(dtm_norm.normed_residual, image_norm,
-                                                                  valid_mask_resized)
+                                                                   valid_mask_resized)
 
             sun_x = sun_vec[0].item()
             sun_y = sun_vec[1].item()
