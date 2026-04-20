@@ -439,7 +439,7 @@ class HiRISEGeoSampler(GeoSampler):
             replacement: bool = False,
             reuse_cache: bool = True,
             # ── New optimal-mode parameters ──
-            center_mode: Literal["simple", "optimal"] = "simple",
+            center_mode: Literal["simple", "optimal"] = "optimal",
             patch_overlap: float = 0.0,
             packing_phase_steps: int = 20,
             valid_region_rays: int = 3,
