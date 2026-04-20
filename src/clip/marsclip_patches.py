@@ -37,6 +37,7 @@ PATCH_SCALE_FEATURE_NAMES: tuple[str, ...] = (
 )
 
 DEFAULT_PATCH_VALID_FRACTION = 0.5
+_PIXEL_VALID_EPS = 1e-6
 
 _PRODUCT_RE = re.compile(r"_(COLOR|RED)\s*$")
 
@@ -44,6 +45,31 @@ _PRODUCT_RE = re.compile(r"_(COLOR|RED)\s*$")
 def _normalize_obs_id_set(obs_ids: Sequence[str]) -> set[str]:
     """Normalize a sequence of observation ids into a string set."""
     return {str(obs_id) for obs_id in obs_ids}
+
+
+def _compute_pixel_valid_mask(
+    image: torch.Tensor,
+    *,
+    color_only: bool,
+    eps: float = _PIXEL_VALID_EPS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute a pixel-valid mask and per-band support mask from an image tensor.
+
+    For normalized imagery, valid pixels can be negative, so validity must be based on
+    absolute magnitude rather than `image > 0`. In `color_only` mode, pixels supported
+    by only a single spectral band are treated as invalid to suppress obvious
+    single-band edge artifacts that otherwise leak into the reconstruction target.
+    """
+    if image.ndim != 3:
+        raise ValueError("image must have shape (C, H, W)")
+
+    pixel_active = image.abs() > float(eps)
+    valid_mask = pixel_active.any(dim=0)
+
+    if color_only and image.shape[0] >= 3:
+        valid_mask = valid_mask & (pixel_active.sum(dim=0) >= 2)
+
+    return valid_mask, pixel_active
 
 
 def _filter_observation_metadata_to_color(
@@ -678,8 +704,11 @@ class MarsCLIPPatchDataset(Dataset):
         sample = self._load_patch_sample(patch_row, x_step=x_step, y_step=y_step)
 
         image: torch.Tensor = sample["image"]
-        valid_mask = (image > 1e-6).any(dim=0)
-        band_valid_fraction = (image > 1e-6).float().mean(dim=(1, 2))
+        valid_mask, pixel_active = _compute_pixel_valid_mask(
+            image,
+            color_only=self.color_only,
+        )
+        band_valid_fraction = pixel_active.float().mean(dim=(1, 2))
         overall_valid_fraction = float(valid_mask.float().mean())
         band_presence_mask = torch.tensor(
             [

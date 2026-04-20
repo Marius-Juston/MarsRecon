@@ -17,7 +17,10 @@ if str(_SRC) not in sys.path:
 from clip.fb_mae_train_utils import build_fb_mae_dataloader
 from clip.satmae_bridge import build_satmae_model
 from clip.train_marsclip_satmae import (
+    _apply_spectral_dropout,
     _filter_batch_by_validity,
+    _refine_valid_mask_from_image,
+    _satmae_forward_with_valid_mask,
     init_wandb_logger,
     resolve_effective_lr,
     resolve_run_output_dir,
@@ -114,7 +117,11 @@ def _make_samples(num_samples: int = 4, image_size: int = 16) -> list[dict[str, 
 def test_filter_batch_by_validity_keeps_only_valid_samples():
     batch = next(iter(build_fb_mae_dataloader(_make_samples(4), batch_size=4, shuffle=False)))
 
-    filtered, stats = _filter_batch_by_validity(batch, require_patch_valid=True)
+    filtered, stats = _filter_batch_by_validity(
+        batch,
+        require_patch_valid=True,
+        min_valid_fraction=0.8,
+    )
 
     assert filtered is not None
     assert filtered["image"].shape[0] == 2
@@ -122,10 +129,120 @@ def test_filter_batch_by_validity_keeps_only_valid_samples():
     assert stats["dropped_samples"] == pytest.approx(2.0)
 
 
+def test_filter_batch_by_validity_recomputes_from_refined_mask():
+    batch = {
+        "image": torch.tensor(
+            [
+                [
+                    [[0.0, 0.4], [0.0, 0.1]],
+                    [[0.9, 0.3], [0.0, 0.2]],
+                    [[0.0, 0.5], [0.0, 0.0]],
+                ],
+                [
+                    [[0.2, 0.2], [0.2, 0.2]],
+                    [[0.2, 0.2], [0.2, 0.2]],
+                    [[0.2, 0.2], [0.2, 0.2]],
+                ],
+            ],
+            dtype=torch.float32,
+        ),
+        "valid_mask": torch.ones(2, 2, 2, dtype=torch.bool),
+        "metadata": [
+            {"patch_id": "patch_bad", "is_patch_valid": True, "min_valid_fraction": 0.8},
+            {"patch_id": "patch_good", "is_patch_valid": True, "min_valid_fraction": 0.8},
+        ],
+    }
+
+    filtered, stats = _filter_batch_by_validity(
+        batch,
+        require_patch_valid=True,
+        min_valid_fraction=0.8,
+    )
+
+    assert filtered is not None
+    assert filtered["image"].shape[0] == 1
+    assert filtered["metadata"][0]["patch_id"] == "patch_good"
+    assert stats["kept_samples"] == pytest.approx(1.0)
+    assert stats["dropped_samples"] == pytest.approx(1.0)
+
+
 def test_resolve_effective_lr_matches_satmae_blr_scaling():
     lr = resolve_effective_lr(batch_size=64, accum_iter=2, base_lr=1e-3, explicit_lr=None)
 
     assert lr == pytest.approx(5e-4)
+
+
+def test_satmae_forward_with_valid_mask_masks_invalid_patch_from_loss():
+    model = build_satmae_model(
+        None,
+        img_size=16,
+        patch_size=8,
+        in_chans=3,
+        embed_dim=32,
+        depth=1,
+        num_heads=4,
+        decoder_embed_dim=16,
+        decoder_depth=1,
+        decoder_num_heads=4,
+        norm_pix_loss=True,
+    )
+    images = torch.rand(1, 3, 16, 16)
+    valid_mask = torch.ones(1, 16, 16, dtype=torch.bool)
+    valid_mask[:, :8, :8] = False
+
+    loss, pred, mask, patch_valid_mask = _satmae_forward_with_valid_mask(
+        model,
+        images,
+        valid_mask,
+        mask_ratio=0.5,
+        min_valid_fraction=0.8,
+    )
+
+    assert pred.shape == (1, 4, 3 * 8 * 8)
+    assert patch_valid_mask.shape == (1, 4)
+    assert patch_valid_mask[0].tolist() == [False, True, True, True]
+    assert bool(mask[0, 0].item()) is True
+    assert torch.isfinite(loss)
+
+
+def test_apply_spectral_dropout_only_changes_valid_pixels():
+    torch.manual_seed(0)
+    images = torch.arange(3 * 4 * 4, dtype=torch.float32).view(1, 3, 4, 4)
+    valid_mask = torch.ones(1, 4, 4, dtype=torch.bool)
+    valid_mask[:, 0, 0] = False
+
+    dropped = _apply_spectral_dropout(
+        images,
+        valid_mask,
+        dropout_prob=1.0,
+        max_channels=1,
+    )
+
+    assert dropped.shape == images.shape
+    assert torch.equal(dropped[:, :, 0, 0], images[:, :, 0, 0])
+    assert not torch.equal(dropped, images)
+
+
+def test_refine_valid_mask_from_image_filters_single_band_pixels():
+    images = torch.tensor(
+        [
+            [
+                [[0.0, 0.4], [0.0, -0.1]],
+                [[0.9, 0.3], [0.0, 0.2]],
+                [[0.0, 0.5], [0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    valid_mask = torch.ones(1, 2, 2, dtype=torch.bool)
+
+    refined = _refine_valid_mask_from_image(images, valid_mask)
+
+    assert refined.shape == valid_mask.shape
+    assert not bool(refined[0, 0, 0])  # single-band support only
+    assert bool(refined[0, 0, 1])      # three-band support
+    assert not bool(refined[0, 1, 0])  # all-zero nodata
+    assert bool(refined[0, 1, 1])      # two-band support remains valid
 
 
 def test_resolve_run_output_dir_refuses_non_empty_directory(tmp_path):

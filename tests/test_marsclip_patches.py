@@ -21,6 +21,7 @@ from clip.marsclip_patches import (
     DEFAULT_PATCH_VALID_FRACTION,
     PATCH_SCALE_FEATURE_NAMES,
     MarsCLIPPatchDataset,
+    _compute_pixel_valid_mask,
     _filter_observation_metadata_to_color,
     _filter_geo_dataset_to_obs_ids,
     _filter_patch_records_to_color,
@@ -132,6 +133,41 @@ def test_build_patch_observation_metadata_prefers_color_and_keeps_red_only():
     assert bool(obs_b["has_red"])
     assert not bool(obs_b["has_blue_green"])
     assert int(obs_b["channel_count"]) == 1
+
+
+def test_compute_pixel_valid_mask_uses_abs_magnitude_for_normalized_pixels():
+    image = torch.tensor(
+        [
+            [[-0.5, 0.0], [0.0, 0.0]],
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[0.0, 0.0], [0.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    valid_mask, pixel_active = _compute_pixel_valid_mask(image, color_only=False)
+
+    assert pixel_active[0, 0, 0]
+    assert bool(valid_mask[0, 0])
+    assert not bool(valid_mask[0, 1])
+
+
+def test_compute_pixel_valid_mask_filters_single_band_pixels_in_color_only_mode():
+    image = torch.tensor(
+        [
+            [[0.0, 0.4], [0.0, 0.1]],
+            [[0.9, 0.3], [0.0, 0.2]],
+            [[0.0, 0.5], [0.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    valid_mask, _ = _compute_pixel_valid_mask(image, color_only=True)
+
+    assert not bool(valid_mask[0, 0])  # single-band support only
+    assert bool(valid_mask[0, 1])      # three-band support
+    assert not bool(valid_mask[1, 0])  # all-zero nodata
+    assert bool(valid_mask[1, 1])      # two-band support still counts as valid
 
 
 def test_build_patch_records_tracks_dominant_observation_and_overlap(mars_crs):
