@@ -35,7 +35,7 @@ data:
   sampler:
     size: 0.018
     length: null   # patches per epoch (null = all available)
-#    center_mode: "optimal"
+    center_mode: "optimal"
 
   # Train/val/test split
   split_fractions: [0.8, 0.1, 0.1]
