@@ -36,6 +36,8 @@ from dataset.mars_hirise_base import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_HIRISE_DTM_VIZ_OUT = pathlib.Path("/scratch/marsrecon_runs/dataset_viz/hirise_dtm")
+
 # ---------------------------------------------------------------------------
 # DTM-specific constants
 # ---------------------------------------------------------------------------
@@ -1078,6 +1080,15 @@ def main(argv=None) -> None:  # pragma: no cover
         "-d", action=argparse.BooleanOptionalAction,
         help="Whether to generate 3D visualisation plots of the surface",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=DEFAULT_HIRISE_DTM_VIZ_OUT,
+        help=(
+            "Directory for generated DTM coverage/sample figures "
+            f"(default: {DEFAULT_HIRISE_DTM_VIZ_OUT})"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -1113,7 +1124,7 @@ def main(argv=None) -> None:  # pragma: no cover
         reuse_cache=True,
     )
 
-    output_path = pathlib.Path("Figures_DTM")
+    output_path = args.output_dir
     output_path.mkdir(parents=True, exist_ok=True)
 
     fig = dataset.plot_coverage()

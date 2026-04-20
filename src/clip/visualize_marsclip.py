@@ -22,6 +22,10 @@ from matplotlib import pyplot as plt
 from clip.marsclip_dataset import MarsCLIPDataset
 from clip.marsclip_patches import DEFAULT_PATCH_VALID_FRACTION, MarsCLIPPatchDataset
 
+DEFAULT_MARSCLIP_PREVIEW_OUT = pathlib.Path(
+    "/scratch/marsrecon_runs/clip_viz/marsclip_preview.png"
+)
+
 
 def _to_display_rgb(image: torch.Tensor) -> np.ndarray:
     arr = image.detach().cpu().numpy()
@@ -110,7 +114,12 @@ def save_sample_preview(
 def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Preview MarsCLIP observation samples.")
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))
-    parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("marsclip_preview.png"))
+    parser.add_argument(
+        "--out",
+        type=pathlib.Path,
+        default=DEFAULT_MARSCLIP_PREVIEW_OUT,
+        help=f"Output preview path (default: {DEFAULT_MARSCLIP_PREVIEW_OUT})",
+    )
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument(

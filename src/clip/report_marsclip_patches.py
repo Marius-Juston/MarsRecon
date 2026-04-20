@@ -21,6 +21,10 @@ from clip.marsclip_patches import (
 )
 from clip.visualize_marsclip import save_sample_preview
 
+DEFAULT_PATCH_REPORT_OUT = pathlib.Path(
+    "/scratch/marsrecon_runs/clip_reports/marsclip_patch_report"
+)
+
 
 def save_patch_report(
     dataset: MarsCLIPPatchDataset,
@@ -64,7 +68,8 @@ def main() -> None:  # pragma: no cover
     parser.add_argument(
         "--out-dir",
         type=pathlib.Path,
-        default=pathlib.Path("marsclip_patch_report"),
+        default=DEFAULT_PATCH_REPORT_OUT,
+        help=f"Output directory for preview/report artifacts (default: {DEFAULT_PATCH_REPORT_OUT})",
     )
     parser.add_argument(
         "--bbox",

@@ -33,6 +33,8 @@ from dataset.mars_hirise_base import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_HIRISE_VIZ_OUT = pathlib.Path("/scratch/marsrecon_runs/dataset_viz/hirise")
+
 # ---------------------------------------------------------------------------
 # Channel / band constants
 # ---------------------------------------------------------------------------
@@ -745,13 +747,22 @@ def main(argv=None) -> None:  # pragma: no cover
         "-s", "--seed", type=int, default=42,
         help="seed",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=DEFAULT_HIRISE_VIZ_OUT,
+        help=(
+            "Directory for generated coverage/sample figures "
+            f"(default: {DEFAULT_HIRISE_VIZ_OUT})"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    normalization_path = "dataset_stats/dataset_stats.json"
+    normalization_path = "dataset_stats/image/dataset_stats.json"
 
     if args.olympus:
         dataset = MarsHiRISE(
@@ -772,7 +783,7 @@ def main(argv=None) -> None:  # pragma: no cover
             normalization_path=normalization_path,
         )
 
-    output_path = pathlib.Path("Figures")
+    output_path = args.output_dir
     output_path.mkdir(parents=True, exist_ok=True)
 
     fig = dataset.plot_coverage()
