@@ -533,6 +533,60 @@ def _collect_real_data(H=128) -> dict:
     pred_ortho = crater_ortho + 0.06 * rng.standard_normal(crater_ortho.shape)
     pred_ortho = np.clip(pred_ortho, 0, 1.3)
 
+    # ---- NEW: synthetic pred DTM for Huber / Laplacian / Ordinal --------
+    # A plausible prediction: GT + low-frequency noise + small global bias,
+    # matching the noise model used by _make_synthetic_pred in the viz code.
+    _noise_hw = max(crater_dtm.shape[0] // 8, 1)
+    _lf_noise = ndimage.zoom(
+        rng.standard_normal((_noise_hw, _noise_hw)),
+        crater_dtm.shape[0] / _noise_hw, order=3,
+    )[: crater_dtm.shape[0], : crater_dtm.shape[1]]
+    _bias = rng.standard_normal() * 0.03
+    pred_dtm = np.clip(crater_dtm + 0.08 * _lf_noise + _bias, -1.0, 1.0).astype(np.float32)
+
+    # ---- Huber loss (signed error map + per-pixel huber value) ----------
+    huber_delta = 0.1
+    huber_err = (pred_dtm - crater_dtm).astype(np.float32)
+    _absr = np.abs(huber_err)
+    huber_map = np.where(
+        _absr <= huber_delta,
+        0.5 * _absr ** 2,
+        huber_delta * (_absr - 0.5 * huber_delta),
+    ).astype(np.float32)
+
+    # ---- Laplacian (5-point stencil, matches LaplacianLoss) -------------
+    # Discrete Laplacian of the GT crater: concave/convex signature.
+    gt_laplacian = ndimage.laplace(crater_dtm).astype(np.float32)
+    pred_laplacian = ndimage.laplace(pred_dtm).astype(np.float32)
+    lap_err = np.abs(pred_laplacian - gt_laplacian).astype(np.float32)
+
+    # ---- Ordinal ranking: sample pairs, compute violations --------------
+    ord_margin = 0.02
+    ord_num_pairs = 2000
+    ord_draw = 220  # pairs to actually draw in the viz
+    _H, _W = crater_dtm.shape
+    _N = _H * _W
+    _rng_ord = np.random.default_rng(1234)
+    _idx_i = _rng_ord.integers(0, _N, size=ord_num_pairs)
+    _idx_j = _rng_ord.integers(0, _N, size=ord_num_pairs)
+    _gt_flat = crater_dtm.ravel()
+    _pr_flat = pred_dtm.ravel()
+    _gt_diff = _gt_flat[_idx_i] - _gt_flat[_idx_j]
+    _pr_diff = _pr_flat[_idx_i] - _pr_flat[_idx_j]
+    _ordered = np.abs(_gt_diff) > ord_margin
+    _violations = _ordered & (np.sign(_gt_diff) * _pr_diff <= 0)
+    # Sub-sample for drawing so the overlay stays legible
+    _draw_idx = _rng_ord.choice(ord_num_pairs, size=ord_draw, replace=False)
+    ord_pairs = {
+        "yi": (_idx_i[_draw_idx] // _W).astype(np.int32),
+        "xi": (_idx_i[_draw_idx] %  _W).astype(np.int32),
+        "yj": (_idx_j[_draw_idx] // _W).astype(np.int32),
+        "xj": (_idx_j[_draw_idx] %  _W).astype(np.int32),
+        "ordered": _ordered[_draw_idx],
+        "violations": _violations[_draw_idx],
+    }
+    ord_violation_rate = float(_violations.sum() / max(_ordered.sum(), 1))
+
     return {
         # preprocessing chain
         "rough_clean": rough,
@@ -578,6 +632,18 @@ def _collect_real_data(H=128) -> dict:
         "v_tgt_norm": v_tgt_norm,
         "v_pred_norm": v_pred_norm,
         "pred_ortho": pred_ortho,
+        # NEW: Huber / Laplacian / Ordinal loss ingredients
+        "pred_dtm": pred_dtm,
+        "huber_err": huber_err,
+        "huber_map": huber_map,
+        "huber_delta": huber_delta,
+        "gt_laplacian": gt_laplacian,
+        "pred_laplacian": pred_laplacian,
+        "lap_err": lap_err,
+        "ord_pairs": ord_pairs,
+        "ord_margin": ord_margin,
+        "ord_num_pairs": ord_num_pairs,
+        "ord_violation_rate": ord_violation_rate,
     }
 
 
@@ -740,6 +806,59 @@ def _save_panels(data: dict, out_dir: Path) -> dict[str, Path]:
                 frame_color=C["node_loss_pix"])
     _save_panel(_p("render_pred"), data["pred_ortho"], cmap="gray",
                 frame_color=C["node_loss_pix"])
+
+    # --------------------------------------------------------------
+    # NEW: Huber / Laplacian / Ordinal panels
+    # --------------------------------------------------------------
+
+    # Huber: signed error map on diverging scale, clipped at ±2*delta so the
+    # L1/L2 transition band is visually centred. This matches exactly what
+    # `AbsoluteDepthLoss.per_pixel_loss` operates on.
+    _hd = data["huber_delta"]
+    _err = data["huber_err"]
+    _err_clip = np.clip(_err, -2 * _hd, 2 * _hd)
+    _save_panel(_p("huber_err"), _err_clip, cmap="RdBu_r",
+                vmin=-2 * _hd, vmax=2 * _hd,
+                frame_color=C["node_loss_pix"])
+
+    # Laplacian: GT curvature on a symmetric diverging scale. Crater bowls
+    # appear blue (concave), rims red (convex), flat regions white — this is
+    # the signal the Laplacian loss forces the prediction to match.
+    _lvl = float(np.nanpercentile(np.abs(data["gt_laplacian"]), 99) + 1e-6)
+    _save_panel(_p("laplacian_gt"), data["gt_laplacian"], cmap="RdBu_r",
+                vmin=-_lvl, vmax=_lvl,
+                frame_color=C["node_loss_pix"])
+
+    # Ordinal: pair scatter overlay on the crater ortho. Green = correct
+    # ordering, red = violation. Matches the visualization in the
+    # OrdinalRankingLoss inspection plot.
+    _pairs = data["ord_pairs"]
+    _ortho_bg = data["crater_ortho"]
+
+    def _draw_pairs(ax):
+        ordered = _pairs["ordered"]
+        viols = _pairs["violations"]
+        yi, xi = _pairs["yi"], _pairs["xi"]
+        yj, xj = _pairs["yj"], _pairs["xj"]
+        # Draw ambiguous (grey) first, then correct (green), then violations (red)
+        for k in range(len(yi)):
+            if not ordered[k]:
+                ax.plot([xi[k], xj[k]], [yi[k], yj[k]], "-",
+                        color="#888888", linewidth=0.35, alpha=0.55, zorder=1)
+        for k in range(len(yi)):
+            if ordered[k] and not viols[k]:
+                ax.plot([xi[k], xj[k]], [yi[k], yj[k]], "-",
+                        color="#22cc55", linewidth=0.55, alpha=0.85, zorder=2)
+        for k in range(len(yi)):
+            if viols[k]:
+                ax.plot([xi[k], xj[k]], [yi[k], yj[k]], "-",
+                        color="#ff2a2a", linewidth=1.1, alpha=0.95, zorder=3)
+        ax.set_xlim(0, _ortho_bg.shape[1])
+        ax.set_ylim(_ortho_bg.shape[0], 0)
+
+    _save_panel(_p("ordinal_overlay"), _ortho_bg, cmap="gray",
+                frame_color=C["node_loss_pix"],
+                extra_draw=_draw_pairs)
 
     return paths
 
@@ -1130,6 +1249,22 @@ def build_pipeline_overview(data: dict, paths: dict[str, Path],
                    ["𝓛_FFL   (pixel, optional)",
                     "focal-frequency penalty"],
                    fill=C["node_loss_pix"])
+        # ---- NEW: Huber / Laplacian / Ordinal losses ----
+        _text_node(c4, "l_huber",
+                   ["𝓛_Huber   (pixel)",
+                    "Huber_δ (D_pred − D_GT),  δ = 0.1",
+                    "absolute depth accuracy in [-1, 1]"],
+                   fill=C["node_loss_pix"])
+        _text_node(c4, "l_lap",
+                   ["𝓛_Lap   (pixel)",
+                    "‖ ∇²D_pred − ∇²D_GT ‖₁",
+                    "curvature: crater bowls & rims"],
+                   fill=C["node_loss_pix"])
+        _text_node(c4, "l_ord",
+                   ["𝓛_Ord   (pixel)",
+                    "pairwise hinge on sampled pairs",
+                    "noise-robust relative ordering"],
+                   fill=C["node_loss_pix"])
 
         c4.node("l_total",
                 label="<<FONT FACE='Helvetica-Bold' POINT-SIZE='11' "
@@ -1137,8 +1272,12 @@ def build_pipeline_overview(data: dict, paths: dict[str, Path],
                       "<BR/><FONT FACE='Helvetica' POINT-SIZE='9' "
                       "COLOR='#ffffff'>w_v·𝓛_vel + w_p·𝓛_photo + "
                       "w_g·𝓛_grad + w_n·𝓛_norm + w_f·𝓛_FFL</FONT>"
+                      "<BR/><FONT FACE='Helvetica' POINT-SIZE='9' "
+                      "COLOR='#ffffff'>+ w_h·𝓛_Huber + w_ℓ·𝓛_Lap + "
+                      "w_o·𝓛_Ord</FONT>"
                       "<BR/><FONT FACE='Helvetica' POINT-SIZE='8' "
-                      "COLOR='#ffffff'>yaml: 1.0 | 1.5 | 100 | 1.0 | 0</FONT>>",
+                      "COLOR='#ffffff'>yaml: 1.0 | 1.5 | 100 | 1.0 | 0 | "
+                      "3.0 | 0.05 | 1.0</FONT>>",
                 shape="hexagon", style="filled",
                 fillcolor=C["text"], color=C["text"],
                 fontcolor="white", penwidth="1.6")
@@ -1148,6 +1287,9 @@ def build_pipeline_overview(data: dict, paths: dict[str, Path],
         c4.edge("l_grad", "l_total")
         c4.edge("l_norm", "l_total")
         c4.edge("l_ffl", "l_total")
+        c4.edge("l_huber", "l_total")
+        c4.edge("l_lap", "l_total")
+        c4.edge("l_ord", "l_total")
 
     # =======================================================
     # PHASE 5 — Optimiser + Artifacts
@@ -1378,9 +1520,45 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
                          C["text"]),
                         ("Gibbs ringing  ·  weight: w_f = 0", C["node_loss_pix"]),
                     ])
+        # ---- NEW: Huber / Laplacian / Ordinal image nodes ----
+        _image_node(c, "p_huber", paths["huber_err"],
+                    title="𝓛_Huber  —  absolute depth",
+                    header_color=C["node_loss_pix"],
+                    captions=[
+                        ("signed err  D_pred − D_GT  (red = over, blue = under)",
+                         C["text"]),
+                        (f"Huber_δ, δ = {data['huber_delta']:.2f}  "
+                         f"→ L2 near 0, L1 in tails",
+                         C["text"]),
+                        ("weight: w_h = 3.0  ·  from step 0",
+                         C["node_loss_pix"]),
+                    ])
+        _image_node(c, "p_lap", paths["laplacian_gt"],
+                    title="𝓛_Lap  —  curvature (∇²d)",
+                    header_color=C["node_loss_pix"],
+                    captions=[
+                        ("∇²D_GT  —  blue = concave, red = convex",
+                         C["text"]),
+                        ("‖ ∇²D_pred − ∇²D_GT ‖₁", C["text"]),
+                        ("weight: w_ℓ = 0.05  ·  from step 0",
+                         C["node_loss_pix"]),
+                    ])
+        _image_node(c, "p_ord", paths["ordinal_overlay"],
+                    title="𝓛_Ord  —  relative ordering",
+                    header_color=C["node_loss_pix"],
+                    captions=[
+                        (f"sampled pairs  (margin = {data['ord_margin']:.02f})",
+                         C["text"]),
+                        (f"violation rate = {100*data['ord_violation_rate']:.1f}%",
+                         C["text"]),
+                        ("weight: w_o = 1.0  ·  from step 0",
+                         C["node_loss_pix"]),
+                    ])
 
         c.edge("decode", "p_photo"); c.edge("decode", "p_grad")
         c.edge("decode", "p_norm");  c.edge("decode", "p_ffl")
+        c.edge("decode", "p_huber"); c.edge("decode", "p_lap")
+        c.edge("decode", "p_ord")
 
     dot.edge("unet", "decode", xlabel=" vθ + z_t ")
 
@@ -1393,8 +1571,12 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
                    "<BR/><FONT FACE='Helvetica' POINT-SIZE='9' "
                    "COLOR='#ffffff'>w_v·𝓛_vel + w_p·𝓛_photo + "
                    "w_g·𝓛_grad + w_n·𝓛_norm + w_f·𝓛_FFL</FONT>"
+                   "<BR/><FONT FACE='Helvetica' POINT-SIZE='9' "
+                   "COLOR='#ffffff'>+ w_h·𝓛_Huber + w_ℓ·𝓛_Lap + "
+                   "w_o·𝓛_Ord</FONT>"
                    "<BR/><FONT FACE='Helvetica' POINT-SIZE='8' "
-                   "COLOR='#ffffff'>yaml: 1.0 / 1.5 / 100 / 1.0 / 0</FONT>>",
+                   "COLOR='#ffffff'>yaml: 1.0 / 1.5 / 100 / 1.0 / 0 / "
+                   "3.0 / 0.05 / 1.0</FONT>>",
              shape="hexagon", style="filled",
              fillcolor=C["text"], color=C["text"],
              fontcolor="white", penwidth="1.6")
@@ -1404,6 +1586,9 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
     dot.edge("p_grad", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_norm", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_ffl", "l_total", color=C["node_loss_pix"], penwidth="1.3")
+    dot.edge("p_huber", "l_total", color=C["node_loss_pix"], penwidth="1.3")
+    dot.edge("p_lap", "l_total", color=C["node_loss_pix"], penwidth="1.3")
+    dot.edge("p_ord", "l_total", color=C["node_loss_pix"], penwidth="1.3")
 
     _text_node(dot, "adamw",
                ["AdamW  +  cosine LR",
