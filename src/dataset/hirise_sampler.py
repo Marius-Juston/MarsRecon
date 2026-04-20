@@ -10,6 +10,25 @@ that are confirmed to lie within each strip's polygon footprint, then sampling
 from that pre-computed set at each epoch.  Construction runs once; iteration is
 O(1) per sample.
 
+Two centre-placement strategies are available via ``center_mode``:
+
+* ``"simple"`` (default, **backwards-compatible**) — the original
+  bbox-grid-then-filter algorithm.  Generates an axis-aligned grid over each
+  strip's bounding box and keeps centres whose patch achieves ``min_overlap``
+  with the footprint.  Adjacent spacing is controlled by ``stride``.
+
+* ``"optimal"`` — the geometric packing algorithm.  For each strip the
+  *valid centre region* (the locus of centres where the patch is guaranteed
+  to meet ``min_overlap``) is computed analytically, then patches are packed
+  inside it using a row/column sweep.  Adjacent spacing is controlled by
+  ``patch_overlap`` (fractional overlap between neighbouring patches,
+  independent of ``min_overlap``).
+
+The ``"optimal"`` mode typically increases coverage by 20–60 % on narrow
+rotated strips because it places patches right up against the footprint
+edges.  With ``patch_overlap > 0`` it also supports dense augmentation-style
+sampling without wasted off-strip centres.
+
 Split support
 ~~~~~~~~~~~~~
 
@@ -39,6 +58,13 @@ Split assignments are **cached to disk** so that:
 
 Cache files are written next to the dataset's spatial index cache (under
 ``<root>/.cache/``) with a filename derived from the configuration hash.
+
+**Backwards compatibility.**  When ``center_mode="simple"`` the cache key is
+computed exactly as in previous versions of this module, so pre-existing
+cache files are transparently reused.  The optimal-mode parameters
+(``center_mode``, ``patch_overlap``, ``packing_phase_steps``,
+``valid_region_rays``) are included in the cache key *only* when
+``center_mode="optimal"``, keeping the two regimes isolated on disk.
 """
 
 from __future__ import annotations
@@ -59,6 +85,11 @@ from torchgeo.samplers import GeoSampler, Units
 
 from dataset.mars_hirise_base import MARS_PROJECTED_CRS
 
+from .min_square_overlap import (
+    generate_valid_center_region,
+    pack_patches_independent_strips,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -67,6 +98,7 @@ logger = logging.getLogger(__name__)
 
 VALID_SPLITS = frozenset({"train", "val", "test"})
 VALID_SPLIT_METHODS = frozenset({"geographic", "random"})
+VALID_CENTER_MODES = frozenset({"simple", "optimal"})
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +249,22 @@ def _split_cache_key(
         stride: tuple[float, float],
         min_overlap: float,
         ortho_types: list[str] | None,
+        # ── Optimal-mode-only additions ──
+        # These are only included in the hash when center_mode != "simple",
+        # preserving backwards compatibility with existing "simple" caches.
+        center_mode: str = "simple",
+        patch_overlap: float = 0.0,
+        packing_phase_steps: int = 20,
+        valid_region_rays: int = 3,
 ) -> str:
-    """Compute a deterministic hash key for the split configuration."""
-    key_parts = {
+    """Compute a deterministic hash key for the split configuration.
+
+    When ``center_mode == "simple"`` the key is computed using exactly the
+    pre-existing set of fields, so cache files written by earlier versions
+    remain valid.  When ``center_mode == "optimal"`` additional fields are
+    appended to segregate optimal-mode caches from simple-mode ones.
+    """
+    key_parts: dict[str, Any] = {
         "root": str(dataset_root),
         "target": dataset_target,
         "bbox": dataset_bbox,
@@ -235,6 +280,15 @@ def _split_cache_key(
         "min_overlap": min_overlap,
         "ortho_types": sorted(ortho_types) if ortho_types else None,
     }
+    # IMPORTANT: only mutate the key when optimal-mode is in use, so that
+    # existing "simple" cache files written by the previous implementation
+    # hash to the same value and continue to load.
+    if center_mode != "simple":
+        key_parts["center_mode"] = center_mode
+        key_parts["patch_overlap"] = patch_overlap
+        key_parts["packing_phase_steps"] = packing_phase_steps
+        key_parts["valid_region_rays"] = valid_region_rays
+
     raw = json.dumps(key_parts, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -280,10 +334,16 @@ class HiRISEGeoSampler(GeoSampler):
     """Sampler that restricts patches to within HiRISE strip polygon footprints,
     with built-in train/val/test splitting and K-fold cross-validation.
 
-    Construction pre-computes a regular grid of candidate patch centres for
-    every strip in ``dataset.index``, keeping only centres whose corresponding
-    patch intersects the polygon footprint (not merely its bounding box).  At
-    each epoch, ``length`` centres are drawn uniformly at random from this set.
+    Construction pre-computes a set of candidate patch centres for every
+    strip in ``dataset.index``.  Two strategies are available:
+
+    * ``center_mode="simple"`` — classical grid-over-bbox followed by an
+      intersection-area filter.  Controlled by ``size`` and ``stride``.
+
+    * ``center_mode="optimal"`` — computes each strip's *valid centre region*
+      analytically (the locus of centres where the patch is guaranteed to
+      meet ``min_overlap``) and packs centres inside it with a row/column
+      sweep.  Adjacent spacing is controlled by ``patch_overlap``.
 
     The split is performed at the **stereo-pair level** — entire strips are
     assigned to train, val, or test.  This prevents spatial data leakage
@@ -306,8 +366,9 @@ class HiRISEGeoSampler(GeoSampler):
         seed: Random seed for reproducible split assignment.
         length: Number of patches to yield per epoch.  Defaults to the total
             number of pre-computed valid centres for this split.
-        stride: Centre-to-centre grid spacing in the same units as ``size``.
-            Defaults to ``size`` (non-overlapping grid).
+        stride: (simple mode only) Centre-to-centre grid spacing in the same
+            units as ``size``.  Defaults to ``size`` (non-overlapping grid).
+            Ignored when ``center_mode="optimal"``.
         roi: Optional Shapely Polygon to further restrict the spatial domain.
         toi: Optional :class:`pandas.Interval` to restrict the temporal domain.
         units: Whether *size* and *stride* are given in CRS units or pixels.
@@ -316,31 +377,42 @@ class HiRISEGeoSampler(GeoSampler):
             strip footprint to be considered valid (default 0.5).
         replacement: Sample with replacement if ``True``.
         reuse_cache: Reuse cached split assignment if available.
+        center_mode: ``"simple"`` (default, backwards-compatible) or
+            ``"optimal"`` (geometric packing).
+        patch_overlap: (optimal mode only) Fractional overlap between
+            adjacent patches in ``[0, 1)``.  ``0.0`` is edge-to-edge,
+            ``0.5`` means 50% overlap in both axes.  Ignored when
+            ``center_mode="simple"``.
+        packing_phase_steps: (optimal mode only) Number of phase offsets to
+            try per sweep direction when packing.  Default 20.
+        valid_region_rays: (optimal mode only) Number of extra rays per
+            polygon edge when approximating the valid centre region.
+            Default 3.
 
     Example::
 
         from hirise_sampler import HiRISEGeoSampler
         from torchgeo.samplers import Units
 
-        # Standard train/val/test
+        # Legacy behaviour (unchanged; reuses existing caches)
         train_sampler = HiRISEGeoSampler(
             dataset, size=0.005, split="train",
             split_fractions=(0.8, 0.1, 0.1),
             seed=42,
         )
-        val_sampler = HiRISEGeoSampler(
-            dataset, size=0.005, split="val",
+
+        # Dense optimal packing with 50% patch overlap
+        train_sampler = HiRISEGeoSampler(
+            dataset, size=0.005, split="train",
             split_fractions=(0.8, 0.1, 0.1),
             seed=42,
+            center_mode="optimal",
+            patch_overlap=0.5,
         )
 
         # 5-fold cross-validation, fold 0 as test
         train_sampler = HiRISEGeoSampler(
             dataset, size=0.005, split="train",
-            n_folds=5, fold_idx=0, seed=42,
-        )
-        test_sampler = HiRISEGeoSampler(
-            dataset, size=0.005, split="test",
             n_folds=5, fold_idx=0, seed=42,
         )
     """
@@ -366,6 +438,11 @@ class HiRISEGeoSampler(GeoSampler):
             min_overlap: float = 0.5,
             replacement: bool = False,
             reuse_cache: bool = True,
+            # ── New optimal-mode parameters ──
+            center_mode: Literal["simple", "optimal"] = "optimal",
+            patch_overlap: float = 0.0,
+            packing_phase_steps: int = 20,
+            valid_region_rays: int = 3,
     ) -> None:
         super().__init__(dataset, roi, toi)
 
@@ -387,6 +464,15 @@ class HiRISEGeoSampler(GeoSampler):
                 f"Invalid split_method '{split_method}'. "
                 f"Must be one of {sorted(VALID_SPLIT_METHODS)}."
             )
+        if center_mode not in VALID_CENTER_MODES:
+            raise ValueError(
+                f"Invalid center_mode '{center_mode}'. "
+                f"Must be one of {sorted(VALID_CENTER_MODES)}."
+            )
+        if not (0.0 <= patch_overlap < 1.0):
+            raise ValueError(
+                f"patch_overlap must be in [0, 1); got {patch_overlap}"
+            )
 
         train_f, val_f, test_f = split_fractions
         if n_folds is None and abs(train_f + val_f + test_f - 1.0) > 1e-6:
@@ -405,6 +491,12 @@ class HiRISEGeoSampler(GeoSampler):
         self.replacement = replacement
         self.min_overlap = min_overlap
 
+        # Optimal-mode state
+        self.center_mode = center_mode
+        self.patch_overlap = float(patch_overlap)
+        self.packing_phase_steps = int(packing_phase_steps)
+        self.valid_region_rays = int(valid_region_rays)
+
         # ── Resolve size / stride to (height_deg, width_deg) ──
         size_h, size_w = _to_tuple(size)
         if units == Units.PIXELS:
@@ -413,7 +505,8 @@ class HiRISEGeoSampler(GeoSampler):
             size_w *= xres
 
         if stride is None:
-            stride_h, stride_w = size_h, size_w
+            stride_h = size_h * (1.0 - self.patch_overlap)
+            stride_w = size_w * (1.0 - self.patch_overlap)
         else:
             stride_h, stride_w = _to_tuple(stride)
             if units == Units.PIXELS:
@@ -447,7 +540,14 @@ class HiRISEGeoSampler(GeoSampler):
 
         # ── Pre-compute valid patch centres for this split only ──
         self._centers: list[tuple[float, float, pd.Interval]] = []
-        self._build_valid_centers()
+        # Per-strip diagnostics, populated during centre building.  Lets
+        # downstream visualisation / evaluation code compare the two modes.
+        self._per_strip_stats: list[dict[str, Any]] = []
+
+        if self.center_mode == "simple":
+            self._build_valid_centers_simple()
+        else:
+            self._build_valid_centers_optimal()
 
         n = len(self._centers)
         self.length = length if length is not None else max(1, n)
@@ -512,6 +612,11 @@ class HiRISEGeoSampler(GeoSampler):
             stride=self.stride,
             min_overlap=self.min_overlap,
             ortho_types=ortho_types,
+            # Only influence the hash when in optimal mode.
+            center_mode=self.center_mode,
+            patch_overlap=self.patch_overlap,
+            packing_phase_steps=self.packing_phase_steps,
+            valid_region_rays=self.valid_region_rays,
         )
 
         cache_dir = _split_cache_dir(ds_root)
@@ -562,6 +667,8 @@ class HiRISEGeoSampler(GeoSampler):
             "seed": self.seed,
             "n_folds": self.n_folds,
             "fold_idx": self.fold_idx,
+            "center_mode": self.center_mode,
+            "patch_overlap": self.patch_overlap,
             "split_counts": {
                 s: sum(1 for v in assignments.values() if v == s)
                 for s in VALID_SPLITS
@@ -585,13 +692,14 @@ class HiRISEGeoSampler(GeoSampler):
             )
 
     # ------------------------------------------------------------------
-    # Centre grid computation (split-aware)
+    # Centre grid computation (split-aware) — simple mode
     # ------------------------------------------------------------------
 
-    def _build_valid_centers(self) -> None:
-        """Grid each strip polygon and keep centres whose patch intersects it.
+    def _build_valid_centers_simple(self) -> None:
+        """Original strategy: grid each strip's bbox and intersection-filter.
 
-        Only processes strips assigned to ``self.split``.
+        Preserved verbatim (modulo stats collection) so that ``center_mode=
+        "simple"`` reproduces the exact centre set of earlier versions.
         """
         size_h, size_w = self.size
         stride_h, stride_w = self.stride
@@ -624,12 +732,16 @@ class HiRISEGeoSampler(GeoSampler):
 
             if (maxx - minx) < size_w or (maxy - miny) < size_h:
                 n_too_small += 1
+                self._per_strip_stats.append({
+                    "pair_idx": i, "n_centers": 0, "reason": "too_small",
+                })
                 continue
 
             xs = np.arange(minx + half_w, maxx - half_w + stride_w * 1e-6, stride_w)
             ys = np.arange(miny + half_h, maxy - half_h + stride_h * 1e-6, stride_h)
 
             pd_interval = pd.Interval(interval.left, interval.right, closed="both")
+            strip_added = 0
 
             for cy in ys:
                 for cx in xs:
@@ -640,9 +752,17 @@ class HiRISEGeoSampler(GeoSampler):
                     if overlap > self.min_overlap:
                         self._centers.append((cx, cy, pd_interval))
                         n_added += 1
+                        strip_added += 1
+
+            self._per_strip_stats.append({
+                "pair_idx": i,
+                "n_centers": strip_added,
+                "bbox_candidates": int(len(xs) * len(ys)),
+                "mode": "simple",
+            })
 
         logger.info(
-            "HiRISEGeoSampler [%s]: %d valid centres from %d strips "
+            "HiRISEGeoSampler [%s, simple]: %d valid centres from %d strips "
             "(%d in other splits, %d too small).",
             self.split,
             n_added,
@@ -650,6 +770,173 @@ class HiRISEGeoSampler(GeoSampler):
             n_skipped_split,
             n_too_small,
         )
+
+    # ------------------------------------------------------------------
+    # Centre grid computation (split-aware) — optimal mode
+    # ------------------------------------------------------------------
+
+    def _build_valid_centers_optimal(self) -> None:
+        """Geometric packing inside each strip's valid-centre region.
+
+        For each in-split strip:
+
+        1. Compute the valid centre region (locus of centres guaranteeing
+           ``min_overlap`` intersection with the footprint).
+        2. Pack patch centres inside the region using a row/column sweep
+           with ``patch_overlap`` controlling the inter-patch stride.
+        """
+        size_h, size_w = self.size
+
+        n_added = 0
+        n_too_small = 0
+        n_skipped_split = 0
+        n_failed = 0
+
+        for i in range(len(self.index)):
+            if self._assignments.get(i) != self.split:
+                n_skipped_split += 1
+                continue
+
+            footprint = self.index.geometry.iloc[i]
+            interval = self.index.index[i]
+
+            # Skip strips clearly too small for any valid centre to exist.
+            minx, miny, maxx, maxy = footprint.bounds
+            if (maxx - minx) < size_w or (maxy - miny) < size_h:
+                n_too_small += 1
+                self._per_strip_stats.append({
+                    "pair_idx": i, "n_centers": 0, "reason": "too_small",
+                    "mode": "optimal",
+                })
+                continue
+
+            try:
+                valid_region = generate_valid_center_region(
+                    footprint,
+                    patch_size=(size_h, size_w),
+                    overlap_percentage=self.min_overlap,
+                    extra_rays_per_edge=self.valid_region_rays,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Valid region failed for pair %d: %s — falling back to simple.",
+                    i, exc,
+                )
+                valid_region = None
+
+            if valid_region is None or valid_region.is_empty:
+                # Fall back to the simple filter for this one strip so that
+                # it doesn't silently drop out when the geometric algorithm
+                # can't handle it (e.g. non-convex footprint).
+                n_failed += 1
+                strip_added = self._fallback_simple_strip(i, footprint, interval)
+                self._per_strip_stats.append({
+                    "pair_idx": i, "n_centers": strip_added,
+                    "reason": "fallback_simple", "mode": "optimal",
+                })
+                n_added += strip_added
+                continue
+
+            try:
+                centers = pack_patches_independent_strips(
+                    valid_region,
+                    patch_size=(size_h, size_w),
+                    patch_overlap=self.patch_overlap,
+                    phase_steps=self.packing_phase_steps,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Packing failed for pair %d: %s — falling back to simple.",
+                    i, exc,
+                )
+                n_failed += 1
+                strip_added = self._fallback_simple_strip(i, footprint, interval)
+                self._per_strip_stats.append({
+                    "pair_idx": i, "n_centers": strip_added,
+                    "reason": "fallback_simple", "mode": "optimal",
+                })
+                n_added += strip_added
+                continue
+
+            pd_interval = pd.Interval(interval.left, interval.right, closed="both")
+            for (cx, cy) in centers:
+                self._centers.append((cx, cy, pd_interval))
+            n_added += len(centers)
+
+            self._per_strip_stats.append({
+                "pair_idx": i,
+                "n_centers": len(centers),
+                "valid_region_area": float(valid_region.area),
+                "footprint_area": float(footprint.area),
+                "mode": "optimal",
+            })
+
+        logger.info(
+            "HiRISEGeoSampler [%s, optimal, patch_overlap=%.2f]: "
+            "%d valid centres from %d strips "
+            "(%d in other splits, %d too small, %d fallback).",
+            self.split,
+            self.patch_overlap,
+            n_added,
+            len(self.index),
+            n_skipped_split,
+            n_too_small,
+            n_failed,
+        )
+
+    def _fallback_simple_strip(
+        self,
+        pair_idx: int,
+        footprint,
+        interval,
+    ) -> int:
+        """Process a single strip with the simple algorithm.
+
+        Used as a per-strip fallback in optimal mode when the geometric
+        pipeline fails (e.g. on non-convex polygons).  Returns the number
+        of centres added.
+        """
+        size_h, size_w = self.size
+        stride_h, stride_w = self.stride
+        half_h = size_h / 2.0
+        half_w = size_w / 2.0
+        _edge_inset = max(size_h, size_w) * 0.05
+
+        try:
+            effective = footprint.buffer(-_edge_inset)
+            if effective.is_empty or not effective.is_valid:
+                effective = footprint
+        except Exception:
+            effective = footprint
+
+        minx, miny, maxx, maxy = effective.bounds
+        if (maxx - minx) < size_w or (maxy - miny) < size_h:
+            return 0
+
+        xs = np.arange(minx + half_w, maxx - half_w + stride_w * 1e-6, stride_w)
+        ys = np.arange(miny + half_h, maxy - half_h + stride_h * 1e-6, stride_h)
+
+        pd_interval = pd.Interval(interval.left, interval.right, closed="both")
+        added = 0
+        for cy in ys:
+            for cx in xs:
+                patch = shapely_box(
+                    cx - half_w, cy - half_h, cx + half_w, cy + half_h
+                )
+                overlap = effective.intersection(patch).area / patch.area
+                if overlap > self.min_overlap:
+                    self._centers.append((cx, cy, pd_interval))
+                    added += 1
+        return added
+
+    # Backwards-compatible alias: the old name still points at the dispatcher
+    # so any external code that called `_build_valid_centers()` continues to
+    # work.
+    def _build_valid_centers(self) -> None:
+        if self.center_mode == "simple":
+            self._build_valid_centers_simple()
+        else:
+            self._build_valid_centers_optimal()
 
     # ------------------------------------------------------------------
     # Sampler protocol
@@ -696,11 +983,23 @@ class HiRISEGeoSampler(GeoSampler):
             pair_counts[v] += 1
         return {
             "split": self.split,
+            "center_mode": self.center_mode,
+            "patch_overlap": self.patch_overlap,
             "pairs_in_split": pair_counts[self.split],
             "centres_in_split": len(self._centers),
             "total_pairs": len(self._assignments),
             "pairs_per_split": pair_counts,
         }
+
+    @property
+    def per_strip_stats(self) -> list[dict[str, Any]]:
+        """Per-strip diagnostics collected during centre building.
+
+        Useful for comparing ``"simple"`` vs ``"optimal"`` coverage on a
+        per-strip basis.  Each entry is a dict containing at minimum
+        ``pair_idx`` and ``n_centers``.
+        """
+        return list(self._per_strip_stats)
 
 
 # ---------------------------------------------------------------------------

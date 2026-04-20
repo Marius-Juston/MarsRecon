@@ -35,6 +35,7 @@ data:
   sampler:
     size: 0.018
     length: null   # patches per epoch (null = all available)
+    center_mode: "optimal"
 
   # Train/val/test split
   split_fractions: [0.8, 0.1, 0.1]
@@ -108,15 +109,22 @@ training:
     velocity_weight: 1.0
     normals_weight: 1.0
     normals_start_step: 0
-    grad_weight: 500.0         # multi-scale gradient loss (no extra install)
+    grad_weight: 2.0         # multi-scale gradient loss (no extra install)
     grad_start_step: 0
     grad_scales: [1, 2, 4]
     # Focal Frequency Loss (requires: pip install focal-frequency-loss)
     freq_weight: 0.0
     freq_start_step: 1000
     freq_alpha: 1.0
-    photo_weight: 50.0
+    photo_weight: 2.0
     photo_start_step: 0
+
+    huber_weight: 1.0
+    huber_start_step: 0.0       # well-conditioned from scratch
+    laplacian_weight: 1.0
+    laplacian_start_step: 0.0    # alongside normals
+    ordinal_weight: 1.0
+    ordinal_start_step: 0.0      # robust from scratch
 
     use_confidence_weighting: true
 

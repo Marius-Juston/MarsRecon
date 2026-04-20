@@ -84,6 +84,27 @@ def _valid_stats(arr: np.ndarray, mask: np.ndarray | None = None):
     return np.percentile(data, 2), np.percentile(data, 98)
 
 
+def _apply_mask(arr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+    """Return a copy of `arr` with invalid pixels set to NaN.
+
+    Accepts a float mask in [0, 1] or a bool mask; threshold at 0.5.
+    If mask is None, just returns the input unchanged (but cast to
+    float so downstream NaN assignment is safe).
+    """
+    if mask is None:
+        return arr
+    out = arr.astype(np.float32, copy=True)
+    m = np.asarray(mask)
+    if m.dtype != bool:
+        m = m > 0.5
+    # Broadcast mask to arr's spatial shape if needed
+    if m.shape != out.shape[: m.ndim]:
+        # Last-resort: if shapes don't align, skip masking rather than crash
+        return out
+    out[~m] = np.nan
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Core Physical Utilities
 # ---------------------------------------------------------------------------
@@ -116,6 +137,7 @@ def plot_prediction_triptych(
         gt_dtm: np.ndarray,
         title: str = "",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Three-panel figure: input orthoimage | predicted DTM | GT DTM.
 
@@ -123,8 +145,12 @@ def plot_prediction_triptych(
         image: (H, W) or (H, W, 3) input orthoimage
         pred_dtm: (H, W) predicted elevation
         gt_dtm: (H, W) ground-truth elevation
+        mask: optional (H, W) valid-data mask; invalid pixels shown as NaN
     """
     set_neurips_style()
+
+    pred_dtm = _apply_mask(pred_dtm, mask)
+    gt_dtm = _apply_mask(gt_dtm, mask)
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
@@ -179,6 +205,7 @@ def plot_cross_sections(
         gt_dtm: np.ndarray,
         title: str = "",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Four directional cross-sections through the heightmap centre.
 
@@ -186,6 +213,8 @@ def plot_cross_sections(
     diagonal NE→SW (↙).
     """
     set_neurips_style()
+    pred_dtm = _apply_mask(pred_dtm, mask)
+    gt_dtm = _apply_mask(gt_dtm, mask)
     H, W = pred_dtm.shape
     cy, cx = H // 2, W // 2
 
@@ -250,9 +279,13 @@ def plot_error_heatmap(
         gt_dtm: np.ndarray,
         title: str = "",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Per-pixel absolute error map with marginal statistics."""
     set_neurips_style()
+
+    pred_dtm = _apply_mask(pred_dtm, mask)
+    gt_dtm = _apply_mask(gt_dtm, mask)
 
     valid = np.isfinite(pred_dtm) & np.isfinite(gt_dtm)
     error = np.abs(pred_dtm - gt_dtm)
@@ -309,6 +342,7 @@ def plot_flow_evolution(
         gt_dtm: np.ndarray,
         title: str = "Flow matching evolution",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Show predicted DTM at multiple ODE timesteps.
 
@@ -316,8 +350,13 @@ def plot_flow_evolution(
         intermediates: dict mapping t → (H, W) predicted depth at that timestep.
             Example: {0.0: z_img, 0.25: ..., 0.5: ..., 0.75: ..., 1.0: z_pred}
         gt_dtm: (H, W) ground-truth
+        mask: optional (H, W) valid-data mask
     """
     set_neurips_style()
+
+    gt_dtm = _apply_mask(gt_dtm, mask)
+    if mask is not None:
+        intermediates = {t: _apply_mask(v, mask) for t, v in intermediates.items()}
 
     t_values = sorted(intermediates.keys())
     n = len(t_values) + 1  # +1 for GT
@@ -461,7 +500,8 @@ def plot_patch_gallery(
     """Grid of patches: each row = [image, pred, GT, error].
 
     Args:
-        patches: list of dicts with keys "image", "pred", "gt", "tile_id", "rmse"
+        patches: list of dicts with keys "image", "pred", "gt", "tile_id",
+            "rmse", and optionally "mask" (valid-data mask per patch).
     """
     set_neurips_style()
     n = len(patches)
@@ -475,12 +515,17 @@ def plot_patch_gallery(
 
     for i, patch in enumerate(patches):
         img = patch["image"]
-        pred = patch["pred"]
-        gt = patch["gt"]
+        pred_raw = patch["pred"]
+        gt_raw = patch["gt"]
         tile_id = patch.get("tile_id", "")
         rmse_val = patch.get("rmse", 0)
 
-        valid = np.isfinite(gt)
+        # Apply per-patch mask (if present) so nodata regions don't
+        # dominate the percentile stretch or the error map.
+        pred = _apply_mask(pred_raw, patch.get("mask"))
+        gt = _apply_mask(gt_raw, patch.get("mask"))
+
+        valid = np.isfinite(gt) & np.isfinite(pred)
         vmin, vmax = _valid_stats(gt, valid)
         error = np.abs(pred - gt)
         error[~valid] = np.nan
@@ -524,9 +569,23 @@ def plot_normal_maps(
         gt_dtm: np.ndarray,
         title: str = "",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Side-by-side surface normal maps (RGB-encoded) with spatial scaling."""
     set_neurips_style()
+
+    # Fill invalid pixels with the local mean BEFORE computing gradients,
+    # so we don't cause huge synthetic gradients at nodata boundaries,
+    # then mask them out for display.
+    if mask is not None:
+        m = np.asarray(mask)
+        if m.dtype != bool:
+            m = m > 0.5
+        p_fill = np.where(m, pred_dtm, np.nanmean(pred_dtm[m]) if m.any() else 0.0)
+        g_fill = np.where(m, gt_dtm, np.nanmean(gt_dtm[m]) if m.any() else 0.0)
+    else:
+        m = None
+        p_fill, g_fill = pred_dtm, gt_dtm
 
     def _normals_rgb(z):
         normals = compute_surface_normals(z)
@@ -534,11 +593,17 @@ def plot_normal_maps(
 
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 
-    axes[0].imshow(np.clip(_normals_rgb(pred_dtm), 0, 1))
+    pred_rgb = np.clip(_normals_rgb(p_fill), 0, 1)
+    gt_rgb = np.clip(_normals_rgb(g_fill), 0, 1)
+    if m is not None:
+        pred_rgb = np.where(m[..., None], pred_rgb, np.nan)
+        gt_rgb = np.where(m[..., None], gt_rgb, np.nan)
+
+    axes[0].imshow(pred_rgb)
     axes[0].set_title("Predicted normals")
     axes[0].axis("off")
 
-    axes[1].imshow(np.clip(_normals_rgb(gt_dtm), 0, 1))
+    axes[1].imshow(gt_rgb)
     axes[1].set_title("GT normals")
     axes[1].axis("off")
 
@@ -560,11 +625,17 @@ def plot_elevation_scatter(
         title: str = "",
         save_path: str | Path | None = None,
         subsample: int = 5000,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Scatter plot of predicted vs GT elevation with density coloring."""
     set_neurips_style()
 
     valid = np.isfinite(pred_dtm) & np.isfinite(gt_dtm)
+    if mask is not None:
+        m = np.asarray(mask)
+        if m.dtype != bool:
+            m = m > 0.5
+        valid = valid & m
     p = pred_dtm[valid]
     g = gt_dtm[valid]
 
@@ -847,6 +918,15 @@ def plot_lunar_lambert_comparison(
     if valid_mask_t is None:
         valid_mask_t = torch.ones_like(gt_dtm_t)
 
+    # Scrub NaN/Inf from the depth tensors before passing them into the
+    # loss function. The internal _zscore does `x * valid_mask`, and
+    # NaN * 0 = NaN in IEEE 754, so a single nodata pixel would poison
+    # the whole render via the per-image mean. We replace NaN in
+    # invalid regions with 0 — the mask will exclude them from stats.
+    pred_dtm_t = torch.nan_to_num(pred_dtm_t, nan=0.0, posinf=0.0, neginf=0.0)
+    gt_dtm_t = torch.nan_to_num(gt_dtm_t, nan=0.0, posinf=0.0, neginf=0.0)
+    real_ortho_t = torch.nan_to_num(real_ortho_t, nan=0.0, posinf=0.0, neginf=0.0)
+
     mask_bool = (valid_mask_t > 0.5).squeeze()
 
     # 1. Convert real ortho to grayscale for SSIM comparison
@@ -874,24 +954,43 @@ def plot_lunar_lambert_comparison(
     z_ortho = loss_fn._zscore(ortho_gray, valid_mask_t)
 
     # --- Move to CPU for Matplotlib ---
-    def prep_for_display(t: torch.Tensor, normalize_vis: bool = False) -> np.ndarray:
-        arr = t.squeeze().cpu().numpy().astype(np.float32)
-        mask_np = mask_bool.cpu().numpy()
+    def prep_for_display(
+            x: torch.Tensor,
+            mask: np.ndarray | None = None,
+            pct_low: float = 2.0,
+            pct_high: float = 98.0,
+            normalize_vis: bool = False
+    ) -> np.ndarray:
+        """Percentile-stretch a (1,1,H,W) or (1,H,W) tensor to [0,1] for display."""
+        arr = x.detach().cpu().numpy().squeeze()
+        # The render is unclamped and can contain NaN/Inf from degenerate normals
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
+        if mask is not None:
+            valid = arr[mask]
+            if valid.size > 0:
+                lo, hi = np.percentile(valid, [pct_low, pct_high])
+            else:
+                lo, hi = float(arr.min()), float(arr.max())
+        else:
+            lo, hi = np.percentile(arr, [pct_low, pct_high])
+
+        if hi - lo < 1e-6:
+            hi = lo + 1e-6
         if normalize_vis:
-            valid_pixels = arr[mask_np]
-            lo, hi = (valid_pixels.min(), valid_pixels.max()) if valid_pixels.size > 0 else (arr.min(), arr.max())
-            hi = max(hi, lo + 1e-6)
             arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
 
-        arr[~mask_np] = np.nan
+        if mask is not None:
+            arr[~mask] = np.nan
         return arr
 
-    r_ortho_np = prep_for_display(ortho_gray, normalize_vis=True)
-    r_pred_np = prep_for_display(render_pred, normalize_vis=True)
-    r_gt_np = prep_for_display(render_gt, normalize_vis=True)
-    z_pred_np = prep_for_display(z_pred, normalize_vis=False)
-    z_ortho_np = prep_for_display(z_ortho, normalize_vis=False)
+    mask_bool_n = mask_bool.numpy()
+
+    r_ortho_np = prep_for_display(ortho_gray, mask=mask_bool_n, normalize_vis=True)
+    r_pred_np = prep_for_display(render_pred, mask=mask_bool_n, normalize_vis=True)
+    r_gt_np = prep_for_display(render_gt, mask=mask_bool_n, normalize_vis=True)
+    z_pred_np = prep_for_display(z_pred, mask=mask_bool_n, normalize_vis=False)
+    z_ortho_np = prep_for_display(z_ortho, mask=mask_bool_n, normalize_vis=False)
 
     # 5. The TRUE Structural Error Map the network feels
     loss_map = np.abs(z_pred_np - z_ortho_np)
@@ -1040,9 +1139,13 @@ def plot_uncertainty_map(
         img: np.ndarray,
         title: str = "Epistemic Uncertainty",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Triptych: Input Image | Predicted DTM | Epistemic Variance (Uncertainty)."""
     set_neurips_style()
+
+    pred_dtm = _apply_mask(pred_dtm, mask)
+    var_dtm = _apply_mask(var_dtm, mask)
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
@@ -1090,16 +1193,29 @@ def plot_geomorphometric_analysis(
         gt_dtm: np.ndarray,
         title: str = "Geomorphometric Analysis: Edges & Curvature",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Triptych: Edge Boundaries | Predicted Laplacian | Error in Laplacian."""
     from scipy.ndimage import gaussian_filter
     set_neurips_style()
 
+    # Fill invalid pixels before derivatives to avoid synthetic edges at
+    # the nodata boundary, then mask for display.
+    if mask is not None:
+        m = np.asarray(mask)
+        if m.dtype != bool:
+            m = m > 0.5
+        p_fill = np.where(m, pred_dtm, np.nanmean(pred_dtm[m]) if m.any() else 0.0)
+        g_fill = np.where(m, gt_dtm, np.nanmean(gt_dtm[m]) if m.any() else 0.0)
+    else:
+        m = None
+        p_fill, g_fill = pred_dtm, gt_dtm
+
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
 
     # 1. Edge Boundaries Plot (DBF Visualization)
-    dy_p, dx_p = np.gradient(pred_dtm)
-    dy_g, dx_g = np.gradient(gt_dtm)
+    dy_p, dx_p = np.gradient(p_fill)
+    dy_g, dx_g = np.gradient(g_fill)
     grad_p = np.sqrt(dx_p ** 2 + dy_p ** 2)
     grad_g = np.sqrt(dx_g ** 2 + dy_g ** 2)
 
@@ -1109,16 +1225,20 @@ def plot_geomorphometric_analysis(
     edge_viz[grad_g > thresh] = [0.2, 0.4, 0.8]  # GT edges (Blue)
     edge_viz[grad_p > thresh] = [0.8, 0.2, 0.2]  # Pred edges (Red)
     edge_viz[(grad_g > thresh) & (grad_p > thresh)] = [0.6, 0.1, 0.6]  # Overlap (Purple)
+    if m is not None:
+        edge_viz[~m] = np.nan
 
     axes[0].imshow(edge_viz, interpolation="nearest")
     axes[0].set_title("Structural Edges\n(Blue: GT, Red: Pred, Purple: Match)")
     axes[0].axis("off")
 
     # 2. Laplacian (Curvature)
-    pred_s = gaussian_filter(pred_dtm, sigma=1.0)
+    pred_s = gaussian_filter(p_fill, sigma=1.0)
     d2y, _ = np.gradient(np.gradient(pred_s)[0])
     _, d2x = np.gradient(np.gradient(pred_s)[1])
     laplacian_p = d2x + d2y
+    if m is not None:
+        laplacian_p = np.where(m, laplacian_p, np.nan)
 
     v_lim = np.nanpercentile(np.abs(laplacian_p), 98)
     im_lap = axes[1].imshow(
@@ -1129,7 +1249,7 @@ def plot_geomorphometric_analysis(
     fig.colorbar(im_lap, ax=axes[1], shrink=0.8, label=r"$\nabla^2 z$")
 
     # 3. Laplacian Error (TIN Artifact / Terracing Identifier)
-    gt_s = gaussian_filter(gt_dtm, sigma=1.0)
+    gt_s = gaussian_filter(g_fill, sigma=1.0)
     d2y_g, _ = np.gradient(np.gradient(gt_s)[0])
     _, d2x_g = np.gradient(np.gradient(gt_s)[1])
     laplacian_g = d2x_g + d2y_g
@@ -1158,9 +1278,17 @@ def plot_radial_psd_curves(
         valid_mask: np.ndarray | None = None,
         title: str = "Radial Power Spectral Density",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Log-log plot of radial PSD comparing synthetic vs true terrain frequencies."""
     set_neurips_style()
+
+    # Accept either `mask` (new, consistent name) or `valid_mask` (legacy)
+    if valid_mask is None and mask is not None:
+        m = np.asarray(mask)
+        if m.dtype != bool:
+            m = m > 0.5
+        valid_mask = m
 
     if valid_mask is None:
         valid_mask = np.isfinite(pred_dtm) & np.isfinite(gt_dtm)
@@ -1259,17 +1387,35 @@ def plot_slope_error_map(
         img: np.ndarray,
         title: str = "Geomorphometric DoD (Slope Error)",
         save_path: str | Path | None = None,
+        mask: np.ndarray | None = None,
 ) -> plt.Figure:
     """Triptych: Ortho | GT Slope | Absolute Slope Error."""
     set_neurips_style()
+
+    # Fill invalid pixels before gradient, then mask display. This
+    # prevents the nodata boundary from producing a spurious slope
+    # spike that would dominate the 98th percentile.
+    if mask is not None:
+        m = np.asarray(mask)
+        if m.dtype != bool:
+            m = m > 0.5
+        p_fill = np.where(m, pred_dtm, np.nanmean(pred_dtm[m]) if m.any() else 0.0)
+        g_fill = np.where(m, gt_dtm, np.nanmean(gt_dtm[m]) if m.any() else 0.0)
+    else:
+        m = None
+        p_fill, g_fill = pred_dtm, gt_dtm
 
     def _compute_slope(z):
         dy, dx = np.gradient(z)
         return np.degrees(np.arctan(np.sqrt(dx ** 2 + dy ** 2)))
 
-    slope_pred = _compute_slope(pred_dtm)
-    slope_gt = _compute_slope(gt_dtm)
+    slope_pred = _compute_slope(p_fill)
+    slope_gt = _compute_slope(g_fill)
     slope_error = np.abs(slope_pred - slope_gt)
+
+    if m is not None:
+        slope_gt = np.where(m, slope_gt, np.nan)
+        slope_error = np.where(m, slope_error, np.nan)
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
