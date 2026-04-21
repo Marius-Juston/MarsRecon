@@ -4,6 +4,7 @@ data/
 *.TAB
 *.JP2
 
+src/reconstruction/
 outputs/
 
 *.ckpt
