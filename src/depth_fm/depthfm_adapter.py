@@ -1647,7 +1647,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
         # Filter the dataframe to only keep good patches
         # You can easily adjust these thresholds in the future without rebuilding the cache!
         clean_df = df[
-            (df["seam_score"] < 2.4) &
+            # (df["seam_score"] < 2.4) &
             (df['is_valid_data'] == True) &
             (df['valid_ratio'] >= 0.5) &
             (df['residual'] >= 0.1) &
@@ -1766,9 +1766,9 @@ class DepthFMHiRISEAdapterCached(Dataset):
             intensity_val = intensity.item()
             ambient_val = ambient.item()
 
-            result = detect_seam_artifact(
-                image_resized, dtm_resized, valid_mask_resized, return_diagnostics=False
-            )
+            # result = detect_seam_artifact(
+            #     image_resized, dtm_resized, valid_mask_resized, return_diagnostics=False
+            # )
 
             return {
                 "idx": idx,
@@ -1783,7 +1783,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
                 "intensity": intensity_val,
                 "ambient": ambient_val,
                 "num_merges": len(sample['meta']),
-                "seam_score": result.composite_score
+                # "seam_score": result.composite_score
             }
 
         except Exception as e:
