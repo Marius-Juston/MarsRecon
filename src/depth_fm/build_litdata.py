@@ -482,10 +482,7 @@ if __name__ == "__main__":
     if final_repo_id:
         # Extract the exact config parts used for the hash and format as YAML
         relevant_config = {
-            "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
-            "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
-            "resolution": config.data.get("resolution", 512),
-            "dtm_normalization": config.data.get("dtm_normalization", "relative"),
+            "data": OmegaConf.to_container(config.data, resolve=True),
         }
         config_yaml_str = OmegaConf.to_yaml(relevant_config)
 
