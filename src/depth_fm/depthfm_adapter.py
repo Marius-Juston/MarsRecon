@@ -1612,7 +1612,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             "sampler_hash": str(self.sampler.cache_hash)
         }
 
-        if self.clip:
+        if not self.clip:
             key_parts["clip"] = self.clip
 
         raw = json.dumps(key_parts, sort_keys=True, default=str)

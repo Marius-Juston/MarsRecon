@@ -1726,7 +1726,7 @@ def get_litdata_cache_key(config) -> str:
 
     clip = config.data.get("clip", False)
 
-    if clip:
+    if not clip:
         key_parts["clip"] = clip
 
     raw = json.dumps(key_parts, sort_keys=True, default=str)

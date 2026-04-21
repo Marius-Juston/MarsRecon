@@ -55,6 +55,8 @@ data:
   random_flip: true
   brightness_jitter: 0.0
 
+  clip: true
+
   signal_boost: 1.0
 
 training:
