@@ -688,7 +688,7 @@ def fill_voids_gmrf(
     return filled_img_t, filled_dtm_t, eroded
 
 
-def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float = 0.5) -> tuple[float, np.ndarray]:
+def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float = 0.3) -> tuple[float, np.ndarray]:
     """
     Analyzes the seam heatmap to see if the high-scoring pixels form
     a network of distinct straight lines (handles corners).
@@ -706,12 +706,13 @@ def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float
     lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=50,
                             minLineLength=40, maxLineGap=10)
 
+    line_mask = np.zeros_like(binary_map)
+
     if lines is None:
-        return 0.0  # No straight lines found at all
+        return 0.0, line_mask  # No straight lines found at all
 
     # 4. Calculate what percentage of the high-scoring pixels belong to these straight segments
     # Create a blank mask to draw the found Hough lines
-    line_mask = np.zeros_like(binary_map)
     for line in lines:
         x1, y1, x2, y2 = line[0]
         cv2.line(line_mask, (x1, y1), (x2, y2), 255, thickness=2)
@@ -719,7 +720,7 @@ def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float
     # Count pixels that are BOTH in the original binary map AND covered by the Hough lines
     valid_signal_pixels = np.count_nonzero(binary_map)
     if valid_signal_pixels == 0:
-        return 0.0
+        return 0.0, line_mask
 
     structured_pixels = np.count_nonzero(cv2.bitwise_and(binary_map, line_mask))
 
@@ -745,6 +746,7 @@ class SeamResult:
     span: float  # <--- Checks length (kills craters)
     sparsity: float  # <--- Checks density (kills dunes)
     composite_score: float
+    is_seam:bool
     # heavy arrays, only populated when return_diagnostics=True
     seam_heatmap: Optional[np.ndarray] = None
     cohens_d_heatmap: Optional[np.ndarray] = None
@@ -785,7 +787,7 @@ class SeamResult:
         return y1, x1, y2, x2
 
 
-def compute_artifact_multipliers(seam_heatmap: np.ndarray, valid_mask: np.ndarray) -> tuple[
+def compute_artifact_multipliers(seam_heatmap: np.ndarray, valid_mask: np.ndarray, threshold: float= 0.2) -> tuple[
     float, float, np.ndarray, np.ndarray]:
     """
     Calculates two structural multipliers (0.0 to 1.0):
@@ -795,8 +797,8 @@ def compute_artifact_multipliers(seam_heatmap: np.ndarray, valid_mask: np.ndarra
     max_val = np.max(seam_heatmap)
     if max_val <= 0: return 0.0, 1.0
 
-    # Isolate the core 40% of the strongest signal
-    hot_mask = (seam_heatmap > max_val * 0.4)
+    # Isolate the core 20% of the strongest signal
+    hot_mask = (seam_heatmap > max_val * threshold)
 
     # --- 1. SPARSITY (Defeats repeating textures like dunes) ---
     hot_area = np.count_nonzero(hot_mask & valid_mask)
@@ -1012,6 +1014,7 @@ def detect_seam_artifact(
         ortho_weight: float = 1.0,
         dtm_weight: float = 0.3,
         erosion_kernel: int = 9,
+        seam_threshold: float = 2.4,
         return_diagnostics: bool = False,
 ) -> SeamResult:
     """
@@ -1046,7 +1049,8 @@ def detect_seam_artifact(
         seam_score=0.0, ortho_score=0.0, dtm_score=0.0, cohens_d=0.0,
         best_angle_rad=0.0, best_y=H // 2, best_x=W // 2,
         line_length=line_length, num_angles=num_angles,
-        composite_score=0, sparsity=0, span=0
+        composite_score=0, sparsity=0, span=0,
+        is_seam=False
     )
 
     if ev_f.sum() < 100:
@@ -1120,7 +1124,6 @@ def detect_seam_artifact(
     # argmax in (A, H, W) for batch 0
     cm0 = combined_masked[0]
     flat = cm0.flatten().argmax()
-    A = num_angles
     a_idx = int(flat // (H * W))
     rem = int(flat % (H * W))
     y_idx = rem // W
@@ -1133,9 +1136,12 @@ def detect_seam_artifact(
     heatmap[heatmap < 0] = 0.0
 
     valid_np = ev_f[0, 0].cpu().numpy().astype(bool)
-    span, sparsity, diag_hot_mask, diag_labels = compute_artifact_multipliers(heatmap, valid_np)
 
-    linearity, diag_hough_lines = compute_piecewise_linearity(heatmap, threshold_ratio=0.5)
+    threshold = 0.25
+
+    span, sparsity, diag_hot_mask, diag_labels = compute_artifact_multipliers(heatmap, valid_np, threshold)
+
+    linearity, diag_hough_lines = compute_piecewise_linearity(heatmap, threshold_ratio=threshold)
 
     isolation_score, diag_iso_profile = compute_spatial_isolation(
         score_map=cm0.amax(dim=0),
@@ -1146,6 +1152,7 @@ def detect_seam_artifact(
     )
 
     isolation_mult = min(max((isolation_score - 1.5) / 1.5, 0.0), 1.0)
+    composite_score = seam_score * (0.5 + 0.5 * span) * sparsity * linearity * isolation_mult
 
     result = SeamResult(
         seam_score=seam_score,
@@ -1159,7 +1166,8 @@ def detect_seam_artifact(
         span=span,  # <--- Add to output
         sparsity=sparsity,  # <--- Add to output,
         num_angles=num_angles,
-        composite_score=seam_score * (0.5 + 0.5 * span) * sparsity * linearity * isolation_mult
+        composite_score=composite_score,
+        is_seam=composite_score > seam_threshold
     )
 
     if return_diagnostics:
@@ -1633,6 +1641,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
         # Filter the dataframe to only keep good patches
         # You can easily adjust these thresholds in the future without rebuilding the cache!
         clean_df = df[
+            (df["seam_score"] < 2.4) &
             (df['is_valid_data'] == True) &
             (df['valid_ratio'] >= 0.5) &
             (df['residual'] >= 0.1) &
@@ -1751,6 +1760,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             intensity_val = intensity.item()
             ambient_val = ambient.item()
 
+            result = detect_seam_artifact(
+                image_resized, dtm_resized, valid_mask_resized, return_diagnostics=False
+            )
+
             return {
                 "idx": idx,
                 "is_valid_data": True,
@@ -1763,7 +1776,8 @@ class DepthFMHiRISEAdapterCached(Dataset):
                 "sun_z": sun_z,
                 "intensity": intensity_val,
                 "ambient": ambient_val,
-                "num_merges": len(sample['meta'])
+                "num_merges": len(sample['meta']),
+                "seam_score": result.composite_score
             }
 
         except Exception as e:
