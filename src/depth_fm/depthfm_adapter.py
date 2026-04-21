@@ -698,13 +698,19 @@ def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float
     heatmap_norm = cv2.normalize(seam_heatmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     _, binary_map = cv2.threshold(heatmap_norm, int(255 * threshold_ratio), 255, cv2.THRESH_BINARY)
 
+    # --- FIX 3: Bridge missing line segments BEFORE edge detection ---
+    # A 15x15 closing kernel will merge blobs that are separated by up to ~15 pixels,
+    # healing fragmented seams into a continuous solid line.
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    closed_map = cv2.morphologyEx(binary_map, cv2.MORPH_CLOSE, close_kernel)
+
     # 2. Extract the skeleton/edges of the high-scoring regions
-    edges = cv2.Canny(binary_map, 50, 150, apertureSize=3)
+    edges = cv2.Canny(closed_map, 50, 150, apertureSize=3)
 
     # 3. Probabilistic Hough Transform to find line segments
     # Adjust minLineLength based on your expected tile size
-    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=50,
-                            minLineLength=40, maxLineGap=10)
+    lines = cv2.HoughLinesP(edges, rho=2, theta=np.pi / 180, threshold=50,
+                            minLineLength=40, maxLineGap=30)
 
     line_mask = np.zeros_like(binary_map)
 
@@ -715,7 +721,7 @@ def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float
     # Create a blank mask to draw the found Hough lines
     for line in lines:
         x1, y1, x2, y2 = line[0]
-        cv2.line(line_mask, (x1, y1), (x2, y2), 255, thickness=2)
+        cv2.line(line_mask, (x1, y1), (x2, y2), 255, thickness=4)
 
     # Count pixels that are BOTH in the original binary map AND covered by the Hough lines
     valid_signal_pixels = np.count_nonzero(binary_map)
