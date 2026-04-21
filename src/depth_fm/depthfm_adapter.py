@@ -1543,6 +1543,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             random_jitter: bool = False,
             brightness_jitter: float = 0.1,
             stats_path: str | None = None,
+            clip: bool = False,
             use_manifest: bool = True,
             manifest_workers: int = 16,  # Set this high to build the cache fast
             manifest_dir: str = ".cache/manifests",
