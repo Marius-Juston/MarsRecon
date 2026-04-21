@@ -222,6 +222,12 @@ def get_litdata_cache_key(config) -> str:
         "resolution": config.data.get("resolution", 512),
         "dtm_normalization": config.data.get("dtm_normalization", "relative"),
     }
+
+    clip = config.data.get("clip", False)
+
+    if not clip:
+        key_parts["clip"] = clip
+
     raw = json.dumps(key_parts, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
