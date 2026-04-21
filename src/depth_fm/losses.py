@@ -11,6 +11,7 @@ Auxiliary losses (all operate in pixel space on the predicted clean depth):
 """
 
 import logging
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +361,7 @@ class PhotoclinometricLoss(nn.Module):
         return loss
 
     @staticmethod
+    @lru_cache
     def _gaussian_kernel(size: int, sigma: float, device, dtype=None) -> torch.Tensor:
         coords = torch.arange(size, dtype=torch.float32, device=device) - size // 2
         g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
