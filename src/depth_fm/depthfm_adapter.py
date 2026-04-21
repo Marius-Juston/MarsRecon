@@ -44,10 +44,13 @@ import json
 import logging
 import math
 import random
+from dataclasses import dataclass, asdict
 from functools import lru_cache
 from pathlib import Path
+from typing import Dict, Optional
 from typing import Literal
 
+import cv2
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -59,7 +62,7 @@ from pykrige.uk import UniversalKriging
 from scipy import ndimage
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-from tqdm import tqdm  # Highly recommended to see progress during the one-time build
+from tqdm import tqdm
 from typing_extensions import deprecated
 
 from dataset.hirise_sampler import HiRISEGeoSampler
@@ -685,10 +688,7 @@ def fill_voids_gmrf(
     return filled_img_t, filled_dtm_t, eroded
 
 
-import cv2
-
-
-def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float = 0.5) -> float:
+def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float = 0.5) -> tuple[float, np.ndarray]:
     """
     Analyzes the seam heatmap to see if the high-scoring pixels form
     a network of distinct straight lines (handles corners).
@@ -725,11 +725,7 @@ def compute_piecewise_linearity(seam_heatmap: np.ndarray, threshold_ratio: float
 
     # 5. Return the ratio. True seams (even with corners) will be close to 1.0
     # Natural curves will fall apart in the Hough transform and score low.
-    return structured_pixels / valid_signal_pixels
-
-
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional
+    return structured_pixels / valid_signal_pixels, line_mask
 
 
 # ---------------------------------------------------------------------------
@@ -754,10 +750,17 @@ class SeamResult:
     cohens_d_heatmap: Optional[np.ndarray] = None
     per_angle_max: Optional[np.ndarray] = None
 
+    diag_hot_mask: Optional[np.ndarray] = None
+    diag_closed_components: Optional[np.ndarray] = None
+    diag_hough_lines: Optional[np.ndarray] = None
+    diag_isolation_profile: Optional[tuple] = None
+
     def to_dict(self, drop_arrays: bool = True) -> Dict:
         d = asdict(self)
         if drop_arrays:
-            for k in ("seam_heatmap", "cohens_d_heatmap", "per_angle_max"):
+            for k in ("seam_heatmap", "cohens_d_heatmap", "per_angle_max",
+                      "diag_hot_mask", "diag_closed_components",
+                      "diag_hough_lines", "diag_isolation_profile"):
                 d.pop(k, None)
         return d
 
@@ -782,12 +785,8 @@ class SeamResult:
         return y1, x1, y2, x2
 
 
-import cv2
-import numpy as np
-import math
-
-
-def compute_artifact_multipliers(seam_heatmap: np.ndarray, valid_mask: np.ndarray) -> tuple[float, float]:
+def compute_artifact_multipliers(seam_heatmap: np.ndarray, valid_mask: np.ndarray) -> tuple[
+    float, float, np.ndarray, np.ndarray]:
     """
     Calculates two structural multipliers (0.0 to 1.0):
     1. span_ratio: Defeats short craters. True seams cross the whole tile (high span).
@@ -815,7 +814,7 @@ def compute_artifact_multipliers(seam_heatmap: np.ndarray, valid_mask: np.ndarra
     kernel = np.ones((9, 9), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
 
     span_ratio = 0.0
     if num_labels > 1:
@@ -835,21 +834,22 @@ def compute_artifact_multipliers(seam_heatmap: np.ndarray, valid_mask: np.ndarra
         max_possible_span = float(max(H, W))
         span_ratio = min(max_span / max_possible_span, 1.0)
 
-    return float(span_ratio), float(sparsity)
+    return float(span_ratio), float(sparsity), hot_mask, labels
+
 
 def compute_spatial_isolation(
-    score_map: torch.Tensor,
-    valid_mask: torch.Tensor,
-    best_x: int,
-    best_y: int,
-    angle_rad: float,
-    profile_length: int = 50,
-    exclusion_zone: int = 12
-) -> float:
+        score_map: torch.Tensor,
+        valid_mask: torch.Tensor,
+        best_x: int,
+        best_y: int,
+        angle_rad: float,
+        profile_length: int = 50,
+        exclusion_zone: int = 12
+) -> tuple[float, Optional[tuple]]:
     """
     Takes a perpendicular slice across the seam.
-    Returns ratio of the central peak to the surrounding parallel background.
-    High score (> 3.0) = Isolated Seam. Low score (< 2.0) = Repeating Dunes/Ridges.
+    Returns ratio of the central peak to the surrounding parallel background,
+    plus the raw profile data arrays for visualization.
     """
     H, W = score_map.shape
     device = score_map.device
@@ -869,7 +869,7 @@ def compute_spatial_isolation(
     grid_x = grid_x[in_bounds]
     grid_y = grid_y[in_bounds]
 
-    if len(t) == 0: return 0.0
+    if len(t) == 0: return 0.0, None
 
     # Normalize for grid_sample [-1, 1]
     norm_x = (grid_x / (W - 1)) * 2 - 1
@@ -887,17 +887,26 @@ def compute_spatial_isolation(
     center_mask = (t.abs() <= exclusion_zone) & (v_samples > 0)
     bg_mask = (t.abs() > exclusion_zone) & (v_samples > 0)
 
-    if not center_mask.any(): return 0.0
-    if not bg_mask.any(): return 5.0 # If there is no valid background, assume it's an isolated edge
+    # Package profile data for viz
+    profile_data = (
+        t.cpu().numpy(),
+        samples.cpu().numpy(),
+        center_mask.cpu().numpy(),
+        bg_mask.cpu().numpy()
+    )
+
+    if not center_mask.any(): return 0.0, profile_data
+    if not bg_mask.any(): return 5.0, profile_data  # If there is no valid background, assume it's an isolated edge
 
     # Compare the max of the suspected seam to the average of the surrounding terrain
     center_max = samples[center_mask].amax().item()
     bg_mean = samples[bg_mask].mean().item()
 
     if bg_mean < 1e-6:
-        return 20.0 # Extremely isolated (avoids division by zero)
+        return 20.0, profile_data  # Extremely isolated (avoids division by zero)
 
-    return center_max / bg_mean
+    return center_max / bg_mean, profile_data
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -1089,9 +1098,6 @@ def detect_seam_artifact(
     # Calculate DTM Cohen's d
     dtm_cohens_d = (mu_l_dtm - mu_r_dtm).abs() / pooled_dtm_std
 
-
-
-
     min_line = min_valid_ratio * line_length
     min_side = min_valid_ratio * line_length * 0.5
     valid_q = (line_cnt >= min_line) & (n_l >= min_side) & (n_r >= min_side)
@@ -1127,11 +1133,11 @@ def detect_seam_artifact(
     heatmap[heatmap < 0] = 0.0
 
     valid_np = ev_f[0, 0].cpu().numpy().astype(bool)
-    span, sparsity = compute_artifact_multipliers(heatmap, valid_np)
+    span, sparsity, diag_hot_mask, diag_labels = compute_artifact_multipliers(heatmap, valid_np)
 
-    linearity = compute_piecewise_linearity(heatmap, threshold_ratio=0.5)
+    linearity, diag_hough_lines = compute_piecewise_linearity(heatmap, threshold_ratio=0.5)
 
-    isolation_score = compute_spatial_isolation(
+    isolation_score, diag_iso_profile = compute_spatial_isolation(
         score_map=cm0.amax(dim=0),
         valid_mask=ev_f[0, 0],
         best_x=int(x_idx),
@@ -1153,7 +1159,7 @@ def detect_seam_artifact(
         span=span,  # <--- Add to output
         sparsity=sparsity,  # <--- Add to output,
         num_angles=num_angles,
-        composite_score = seam_score * (0.5 + 0.5 * span) * sparsity * linearity * isolation_mult
+        composite_score=seam_score * (0.5 + 0.5 * span) * sparsity * linearity * isolation_mult
     )
 
     if return_diagnostics:
@@ -1163,9 +1169,15 @@ def detect_seam_artifact(
         # per-angle scalar: max over spatial
         per_angle = cm0.amax(dim=(1, 2)).cpu().numpy()
         per_angle[per_angle < 0] = 0.0
+
         result.seam_heatmap = heatmap
         result.cohens_d_heatmap = d_heatmap
         result.per_angle_max = per_angle
+
+        result.diag_hot_mask = diag_hot_mask
+        result.diag_closed_components = diag_labels
+        result.diag_hough_lines = diag_hough_lines
+        result.diag_isolation_profile = diag_iso_profile
 
     return result
 
