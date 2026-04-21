@@ -1123,12 +1123,12 @@ class DepthFMLightningModule(L.LightningModule):
 
                 # Maintain best 5 (Assuming higher photo_consistency is better)
                 self._best_val_patches.append(patch_data)
-                self._best_val_patches.sort(key=lambda x: x["score"], reverse=True)
+                self._best_val_patches.sort(key=lambda x: x["score"], reverse=False)
                 self._best_val_patches = self._best_val_patches[:5]
 
                 # Maintain worst 5
                 self._worst_val_patches.append(patch_data)
-                self._worst_val_patches.sort(key=lambda x: x["score"], reverse=False)
+                self._worst_val_patches.sort(key=lambda x: x["score"], reverse=True)
                 self._worst_val_patches = self._worst_val_patches[:5]
 
         flow_intermediates = None
@@ -1565,12 +1565,12 @@ class DepthFMLightningModule(L.LightningModule):
 
                 # Maintain best 5 (Assuming higher photo_consistency is better)
                 self._best_test_patches.append(patch_data)
-                self._best_test_patches.sort(key=lambda x: x["score"], reverse=True)
+                self._best_test_patches.sort(key=lambda x: x["score"], reverse=False)
                 self._best_test_patches = self._best_test_patches[:5]
 
                 # Maintain worst 5
                 self._worst_test_patches.append(patch_data)
-                self._worst_test_patches.sort(key=lambda x: x["score"], reverse=False)
+                self._worst_test_patches.sort(key=lambda x: x["score"], reverse=True)
                 self._worst_test_patches = self._worst_test_patches[:5]
 
         self._trace(f"Exiting test_step for batch {batch_idx}")
