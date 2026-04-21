@@ -106,6 +106,7 @@ def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"
     for f in formats:
         new_path = path.with_suffix(f)
         fig.savefig(new_path, **kwargs)
+        logger.info(f"Saved {new_path}")
 
 
 def _make_synthetic_pred(
@@ -869,6 +870,9 @@ def render_sample_diagnostics(
 def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16):
     """Enhanced drop-in replacement. Saves a top-N/bottom-N diagnostic grid."""
     import torch.nn.functional as F
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    import numpy as np
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -923,17 +927,18 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16
     selected = evaluated[:n] + evaluated[-n:]
     half = len(selected) // 2
 
-    # compose a tall figure: one 6-panel row per sample
+    # compose a tall figure: expanded to 8 columns for new structural diagnostics
     total_rows = len(selected)
-    fig, axes = plt.subplots(total_rows, 6, figsize=(22, 4.2 * total_rows),
-                             gridspec_kw={"width_ratios": [1, 1, 1, 1, 1, 0.9]})
+    cols = 8
+    fig, axes = plt.subplots(total_rows, cols, figsize=(28, 4.2 * total_rows),
+                             gridspec_kw={"width_ratios": [1, 1, 1, 1, 1, 1, 1, 0.9]})
     if total_rows == 1:
         axes = axes[None, :]
 
     for row, item in enumerate(selected):
         H, W = item["mask"].shape
         mask_bool = item["mask"].astype(bool)
-        res: SeamResult = item["result"]
+        res = item["result"]
         rgb = _prep_ortho_rgb(item["img"])
         rgb[~mask_bool] = np.nan
         dtm_disp = _apply_mask(np.clip((item["dtm"] + 1) / 2, 0, 1), mask_bool)
@@ -941,6 +946,7 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16
         p2, p98 = np.nanpercentile(grad_masked, [2, 98]) if np.any(~np.isnan(grad_masked)) else (0, 1)
         grad_disp = np.clip((grad_masked - p2) / (p98 - p2 + 1e-8), 0, 1)
 
+        # Base Visualizations
         axes[row, 0].imshow(rgb)
         _draw_best_line(axes[row, 0], res, H, W)
         axes[row, 1].imshow(dtm_disp, cmap="terrain", vmin=0, vmax=1)
@@ -953,20 +959,41 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16
             vmax = float(np.nanpercentile(h, 99)) if np.any(~np.isnan(h)) else 1.0
             axes[row, 3].imshow(h, cmap="inferno", vmin=0, vmax=max(vmax, 1e-6))
             _draw_best_line(axes[row, 3], res, H, W, color="#00ffff")
+
         if res.cohens_d_heatmap is not None:
             d = res.cohens_d_heatmap.copy()
             d[~mask_bool] = np.nan
             axes[row, 4].imshow(d, cmap="viridis", vmin=0,
                                 vmax=max(1.0, float(np.nanpercentile(d, 99)) if np.any(~np.isnan(d)) else 1.0))
 
-        for ax in axes[row, :5]:
+        # New Diagnostic: Span / Connected Components
+        if hasattr(res, 'diag_closed_components') and res.diag_closed_components is not None:
+            cc = res.diag_closed_components.copy()
+            cc_disp = np.ma.masked_where(cc == 0, cc)  # Hide background
+            axes[row, 5].imshow(cc_disp, cmap="tab20", interpolation="nearest")
+        else:
+            axes[row, 5].text(0.5, 0.5, "No Span Data", ha='center', va='center')
+
+        # New Diagnostic: Linearity (Hough lines superimposed on sparsity hot-mask)
+        if hasattr(res, 'diag_hot_mask') and res.diag_hot_mask is not None:
+            hm = res.diag_hot_mask.astype(float)
+            axes[row, 6].imshow(hm, cmap="Reds", vmin=0, vmax=1)
+
+            if hasattr(res, 'diag_hough_lines') and res.diag_hough_lines is not None:
+                hl = res.diag_hough_lines.astype(float)
+                hl_disp = np.ma.masked_where(hl == 0, hl)
+                axes[row, 6].imshow(hl_disp, cmap="cool", vmin=0, vmax=1, alpha=0.8)
+        else:
+            axes[row, 6].text(0.5, 0.5, "No Linearity Data", ha='center', va='center')
+
+        for ax in axes[row, :cols - 1]:
             ax.axis("off")
 
-        # polar panel: have to replace the cartesian axis with polar
+        # Polar Panel: replace cartesian with polar
         pa = res.per_angle_max
-        pos = axes[row, 5].get_position()
-        axes[row, 5].remove()
-        pax = fig.add_subplot(total_rows, 6, row * 6 + 6, projection="polar")
+        pos = axes[row, cols - 1].get_position()
+        axes[row, cols - 1].remove()
+        pax = fig.add_subplot(total_rows, cols, row * cols + cols, projection="polar")
         pax.set_position(pos)
         if pa is not None and len(pa):
             angles = np.linspace(0, np.pi, len(pa), endpoint=False)
@@ -981,21 +1008,23 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16
         pax.grid(alpha=0.3)
 
         if row == 0:
-            for ax, t in zip(axes[0, :5],
-                             ["Ortho+line", "DTM+line", "Ortho grad",
-                              "Seam response", "Cohen's d"]):
-                ax.set_title(t)
-            pax.set_title("per-angle")
+            titles = ["Ortho+line", "DTM+line", "Ortho grad",
+                      "Seam response", "Cohen's d", "Span (CCs)", "Linearity"]
+            for ax, t in zip(axes[0, :cols - 1], titles):
+                ax.set_title(t, fontweight='bold', pad=10)
+            pax.set_title("Per-Angle", fontweight='bold', pad=10)
 
-        cls = "HIGH" if row < half else "LOW"
-        color = "red" if row < half else "green"
+        threshold = res.is_seam
+
+        # Dynamic label extracting structural multipliers
+        cls = "HIGH" if threshold else "LOW"
+        color = "red" if threshold else "green"
         label = (
             f"#{row}  {cls}\n"
             f"comp={res.composite_score:6.1f}\n"
-            f"span={res.span:4.2f}\n"
-            f"spars={res.sparsity:4.2f}\n"
+            f"span={getattr(res, 'span', 0.0):4.2f}\n"
+            f"spars={getattr(res, 'sparsity', 0.0):4.2f}\n"
             f"seam={res.seam_score:6.1f}\n"
-            f"ortho={res.ortho_score:4.2f}\n"
             f"d={res.cohens_d:4.2f}\n"
             f"θ={np.degrees(res.best_angle_rad):.0f}°"
         )
@@ -1005,9 +1034,7 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16
                           va="center", ha="right", color=color)
 
     save_path = output_dir / "seam_artifact_inspection.png"
-    fig.savefig(save_path, bbox_inches="tight", dpi=120, facecolor="white")
-    plt.close(fig)
-    logger.info(f"Saved diagnostic grid to {save_path}")
+    save_fig(fig, save_path)
     return save_path
 
 
