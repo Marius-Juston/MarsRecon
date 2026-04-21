@@ -321,9 +321,11 @@ class GlobalLogNormalizer:
         ref_scale: Reference scale in metres. Values at ±ref_scale
             map to ±1.0 in the normalised space. Use the p90 or p95
             of your detrended residual distribution.
+        clip: Whether or not to clip the range to be withing [-1, 1] explicitly
     """
 
-    def __init__(self, ref_scale: float):
+    def __init__(self, ref_scale: float, clip: bool = False):
+        self.clip = clip
         self.ref_scale = ref_scale
         self._log2 = float(np.log(2.0))
         self._inv_log2 = 1.0 / self._log2
@@ -363,7 +365,9 @@ class GlobalLogNormalizer:
                 * torch.log1p(residual.abs() / self.ref_scale)
                 * self._inv_log2
         )
-        normed = torch.clamp(normed, -1.0, 1.0)
+
+        if self.clip:
+            normed = torch.clamp(normed, -1.0, 1.0)
         normed = torch.where(valid, normed, torch.zeros_like(normed))
 
         return TrainingNormResult(

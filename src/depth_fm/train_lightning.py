@@ -1723,6 +1723,12 @@ def get_litdata_cache_key(config) -> str:
         "resolution": config.data.get("resolution", 512),
         "dtm_normalization": config.data.get("dtm_normalization", "relative"),
     }
+
+    clip = config.data.get("clip", False)
+
+    if clip:
+        key_parts["clip"] = clip
+
     raw = json.dumps(key_parts, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -1775,6 +1781,7 @@ def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -
     )
 
     resolution = config.data.get("resolution", 512)
+    clip = config.data.get("clip", False)
     dtm_norm = config.data.get("dtm_normalization", "relative")
     stats_path = config.data.get("stats_path")
     num_workers = tc.get("num_workers", _WORKERS_PER_GPU)
@@ -1796,6 +1803,7 @@ def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -
             random_flip=is_train,
             brightness_jitter=config.data.get("brightness_jitter", 0.1) if is_train else 0.0,
             stats_path=stats_path,
+            clip=clip
         )
         loader = DataLoader(
             adapter,
@@ -2454,17 +2462,17 @@ def main():
                 for split_name, loader in loaders.items():
                     compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
             if all_viz or args.view_thumbnails:
-                generate_thumbnail_grids(loaders["val"], output_dir=output_path, num_samples=8)
+                generate_thumbnail_grids(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_loss_physics:
-                visualize_loss_physics(loaders["val"], output_dir=output_path, num_samples=8)
+                visualize_loss_physics(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_loss_components:
-                visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
+                visualize_loss_components(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_invalid_fill:
                 visualize_invalid_fill(loaders["train"], output_dir=output_path, num_samples=16)
             if all_viz or args.view_seam_artifacts:
-                visualize_seam_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+                visualize_seam_artifacts(loaders["train"], output_dir=output_path, num_samples=200)
             if all_viz or args.view_tin_artifacts:
-                visualize_tin_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+                visualize_tin_artifacts(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_solar_distribution:
                 visualize_solar_distribution(loaders["train"], output_dir=output_path)
             if all_viz or args.view_augmentations:

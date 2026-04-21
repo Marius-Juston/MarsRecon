@@ -315,6 +315,8 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     dtm_norm = config.data.get("dtm_normalization", "relative")
     stats_path = config.data.get("stats_path")
 
+    clip = config.data.get("clip", False)
+
     manifest_cache_dir = dataset_root / ".cache" / "manifests"
     manifest_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -340,6 +342,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
         random_flip=False,
         brightness_jitter=0.0,
         stats_path=stats_path,
+        clip=clip,
         use_manifest=True,
         manifest_workers=min(workers, 94),
         manifest_dir=str(manifest_cache_dir),

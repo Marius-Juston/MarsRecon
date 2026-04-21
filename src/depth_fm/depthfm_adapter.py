@@ -1564,6 +1564,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
         self.use_manifest = use_manifest
         self.manifest_workers = manifest_workers
         self.manifest_dir = self.base.root / Path(manifest_dir)
+        self.clip = clip
 
         # Load global quantiles
         (
@@ -1574,7 +1575,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
         # TODO instead of local patch ortho normalizer, it should be a per-strip normalization. Sadly infrastructure does not handle this well yet
         self.ortho_normalizer = LocalStripOrthoNormalizer(self.img_p02, self.img_p98)
-        self.evel_normalizer = GlobalLogNormalizer(self.elev_scale)
+        self.evel_normalizer = GlobalLogNormalizer(self.elev_scale, clip=clip)
 
         # Pre-materialise sampler indices
         self._raw_indices = list(sampler)
@@ -1597,6 +1598,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             "dataset_hash": str(self.base.spatial_index_cache),
             "sampler_hash": str(self.sampler.cache_hash)
         }
+
+        if self.clip:
+            key_parts["clip"] = self.clip
+
         raw = json.dumps(key_parts, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -1834,7 +1839,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
         # Brightness jitter
         if getattr(self, 'is_train', False) and getattr(self, 'bright_jitter', 0) > 0:
             factor = 1.0 + random.uniform(-self.bright_jitter, self.bright_jitter)
-            image = (image * factor).clamp(-1.0, 1.0)
+            image = (image * factor)
+
+            if self.clip:
+                image = torch.clip(image, -1.0, 1.0)
 
             # Scale the physical lighting parameters so the loss physics still match the augmented image
             intensity *= factor
