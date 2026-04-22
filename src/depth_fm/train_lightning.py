@@ -925,12 +925,13 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16
     evaluated.sort(key=lambda s: s["result"].composite_score, reverse=True)
     n = min(num_samples, len(evaluated))
     selected = evaluated[:n] + evaluated[-n:]
-    half = len(selected) // 2
 
     # compose a tall figure: expanded to 8 columns for new structural diagnostics
     total_rows = len(selected)
     cols = 8
-    fig, axes = plt.subplots(total_rows, cols, figsize=(28, 4.2 * total_rows),
+    scale = 4
+
+    fig, axes = plt.subplots(total_rows, cols, figsize=(cols * scale, scale * total_rows),
                              gridspec_kw={"width_ratios": [1, 1, 1, 1, 1, 1, 1, 0.9]})
     if total_rows == 1:
         axes = axes[None, :]
@@ -1034,7 +1035,7 @@ def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16
                           va="center", ha="right", color=color)
 
     save_path = output_dir / "seam_artifact_inspection.png"
-    save_fig(fig, save_path)
+    save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
     return save_path
 
 
