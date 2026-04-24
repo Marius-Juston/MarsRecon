@@ -46,7 +46,7 @@ from clip.fb_mae_train_utils import (
 )
 from clip.fb_mae import (
     DEFAULT_PATCH_VALID_FRACTION,
-    compute_valid_patch_mask,
+    compute_patch_valid_fraction,
     normalize_patch_targets,
     patchify_valid_mask,
 )
@@ -470,6 +470,36 @@ def _prefer_valid_random_masking(
     return x_masked, mask, ids_restore
 
 
+def _compute_token_validity_weights(
+    patch_valid_fraction: torch.Tensor,
+    *,
+    min_valid_fraction: float,
+    enabled: bool,
+    exponent: float,
+) -> torch.Tensor:
+    """Convert per-token valid fractions into loss weights.
+
+    When disabled, this reproduces the existing hard-threshold behavior:
+    valid tokens receive weight 1 and invalid tokens receive weight 0.
+
+    When enabled, valid tokens are weighted continuously by
+    ``patch_valid_fraction ** exponent`` while tokens below the threshold still
+    receive weight 0.
+    """
+    if not (0.0 <= min_valid_fraction <= 1.0):
+        raise ValueError("min_valid_fraction must satisfy 0 <= value <= 1.")
+    if exponent <= 0.0:
+        raise ValueError("exponent must be > 0.")
+
+    patch_valid_fraction = patch_valid_fraction.clamp(0.0, 1.0)
+    valid_tokens = patch_valid_fraction >= float(min_valid_fraction)
+    if not enabled:
+        return valid_tokens.to(dtype=patch_valid_fraction.dtype)
+
+    weights = patch_valid_fraction.pow(float(exponent))
+    return weights * valid_tokens.to(dtype=patch_valid_fraction.dtype)
+
+
 def _satmae_forward_with_valid_mask(
     model: nn.Module,
     imgs: torch.Tensor,
@@ -477,6 +507,8 @@ def _satmae_forward_with_valid_mask(
     *,
     mask_ratio: float,
     min_valid_fraction: float = DEFAULT_PATCH_VALID_FRACTION,
+    token_validity_weighting: bool = False,
+    token_validity_weight_exponent: float = 2.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run SatMAE while excluding invalid pixels/patches from masking and loss."""
     patch_size = int(model.patch_embed.patch_size[0])
@@ -485,11 +517,8 @@ def _satmae_forward_with_valid_mask(
     x = model.patch_embed(imgs)
     x = x + model.pos_embed[:, 1:, :]
 
-    patch_valid_mask = compute_valid_patch_mask(
-        valid_mask,
-        patch_size,
-        min_valid_fraction=float(min_valid_fraction),
-    ).to(device=x.device)
+    patch_valid_fraction = compute_patch_valid_fraction(valid_mask, patch_size).to(device=x.device)
+    patch_valid_mask = patch_valid_fraction >= float(min_valid_fraction)
     x_masked, mask, ids_restore = _prefer_valid_random_masking(x, patch_valid_mask, mask_ratio)
 
     cls_token = model.cls_token + model.pos_embed[:, :1, :]
@@ -510,9 +539,16 @@ def _satmae_forward_with_valid_mask(
     valid = valid_pixel_mask.to(dtype=pred.dtype)
     valid_counts = valid.sum(dim=-1).clamp_min(1.0)
     per_patch_loss = ((pred - target).pow(2) * valid).sum(dim=-1) / valid_counts
-    loss_mask = mask.bool() & patch_valid_mask
-    if loss_mask.any():
-        loss = (per_patch_loss * loss_mask.to(dtype=per_patch_loss.dtype)).sum() / loss_mask.sum()
+
+    token_validity_weights = _compute_token_validity_weights(
+        patch_valid_fraction.to(dtype=per_patch_loss.dtype),
+        min_valid_fraction=float(min_valid_fraction),
+        enabled=bool(token_validity_weighting),
+        exponent=float(token_validity_weight_exponent),
+    ).to(device=per_patch_loss.device)
+    masked_token_weights = mask.to(dtype=per_patch_loss.dtype) * token_validity_weights
+    if torch.any(masked_token_weights > 0):
+        loss = (per_patch_loss * masked_token_weights).sum() / masked_token_weights.sum()
     else:
         loss = per_patch_loss.sum() * 0.0
 
@@ -580,6 +616,8 @@ def _forward_mars_satmae_batch(
     mask_ratio: float,
     valid_mask_aware: bool,
     min_valid_fraction: float,
+    token_validity_weighting: bool,
+    token_validity_weight_exponent: float,
     spectral_dropout_prob: float,
     spectral_dropout_max_channels: int,
     training: bool,
@@ -603,6 +641,8 @@ def _forward_mars_satmae_batch(
             valid_mask,
             mask_ratio=mask_ratio,
             min_valid_fraction=min_valid_fraction,
+            token_validity_weighting=token_validity_weighting,
+            token_validity_weight_exponent=token_validity_weight_exponent,
         )
         return loss, pred, mask
 
@@ -640,6 +680,7 @@ def _stretch_preview_rgb(
     image: torch.Tensor,
     valid_mask: torch.Tensor,
     *,
+    reference_image: torch.Tensor | None = None,
     low_pct: float = 2.0,
     high_pct: float = 98.0,
     eps: float = 1e-6,
@@ -658,6 +699,8 @@ def _stretch_preview_rgb(
         valid_mask = valid_mask.unsqueeze(1)
     if valid_mask.ndim != 4:
         raise ValueError("Expected valid_mask tensor with shape (B, 1, H, W) or (B, H, W).")
+    if reference_image is not None and reference_image.shape != image.shape:
+        raise ValueError("reference_image must match image shape when provided.")
 
     # Force invalid pixels to 0 so they don't influence percentiles.
     mask = valid_mask.to(dtype=torch.bool)
@@ -667,11 +710,12 @@ def _stretch_preview_rgb(
     batch, channels, _, _ = out.shape
     # Compute percentiles per (B, C) on CPU for stability and to avoid GPU sync overhead.
     out_cpu = out.detach().cpu()
+    ref_cpu = reference_image.detach().cpu() if reference_image is not None else out_cpu
     mask_cpu = mask.detach().cpu()
 
     for b in range(batch):
         for c in range(channels):
-            values = out_cpu[b, c][mask_cpu[b, 0]].flatten()
+            values = ref_cpu[b, c][mask_cpu[b, 0]].flatten()
             if values.numel() < 10:
                 continue
             p_low = torch.quantile(values, low_pct / 100.0)
@@ -687,6 +731,42 @@ def _stretch_preview_rgb(
     return out_cpu.to(device=image.device, dtype=image.dtype)
 
 
+def _prepare_preview_display(
+    image: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    """Convert Mars multispectral tensors into a more interpretable display view.
+
+    HiRISE color products are stored as (NIR, RED, BLUE-GREEN). Rendering those
+    bands directly as RGB is valid false color, but it can make early MAE
+    reconstructions look misleadingly magenta. For training-time inspection we
+    therefore allow a structural display mode that repeats the RED channel as
+    grayscale.
+    """
+    if image.ndim != 4:
+        raise ValueError("Expected image tensor with shape (B, C, H, W).")
+
+    channels = image.shape[1]
+    if channels == 1:
+        return image.repeat(1, 3, 1, 1)
+    if channels < 3:
+        base = image[:, :1].repeat(1, 3, 1, 1)
+        return base
+
+    if mode == "false_color":
+        return image[:, :3]
+    if mode == "approx_natural":
+        red = image[:, 1:2]
+        blue_green = image[:, 2:3]
+        return torch.cat([red, blue_green, blue_green], dim=1)
+    if mode == "red_grayscale":
+        red = image[:, 1:2]
+        return red.repeat(1, 3, 1, 1)
+
+    raise ValueError(f"Unsupported preview display mode: {mode}")
+
+
 @torch.no_grad()
 def save_reconstruction_preview(
     *,
@@ -700,6 +780,9 @@ def save_reconstruction_preview(
     dataset_normalization_stats: tuple[torch.Tensor, torch.Tensor] | None,
     valid_mask_aware: bool,
     min_valid_fraction: float,
+    preview_display_mode: str = "red_grayscale",
+    token_validity_weighting: bool = False,
+    token_validity_weight_exponent: float = 2.0,
     max_items: int = 4,
 ) -> pathlib.Path | None:
     """Save a lightweight reconstruction preview from the first valid batch."""
@@ -743,6 +826,8 @@ def save_reconstruction_preview(
             mask_ratio=mask_ratio,
             valid_mask_aware=valid_mask_aware,
             min_valid_fraction=min_valid_fraction,
+            token_validity_weighting=token_validity_weighting,
+            token_validity_weight_exponent=token_validity_weight_exponent,
             spectral_dropout_prob=0.0,
             spectral_dropout_max_channels=0,
             training=False,
@@ -762,20 +847,47 @@ def save_reconstruction_preview(
     mask_img = model.unpatchify(mask_tokens, patch_size, in_chans)
     valid_mask_4d = valid_mask.unsqueeze(1).bool()
 
-    image_disp = _denormalize_preview_image(images, valid_mask_4d, dataset_normalization_stats)
-    pred_disp = _denormalize_preview_image(pred_img, valid_mask_4d, dataset_normalization_stats)
-    masked_disp = _denormalize_preview_image(images * (1.0 - mask_img), valid_mask_4d, dataset_normalization_stats)
-    composite_disp = _denormalize_preview_image(
+    image_disp_raw = _denormalize_preview_image(images, valid_mask_4d, dataset_normalization_stats)
+    pred_disp_raw = _denormalize_preview_image(pred_img, valid_mask_4d, dataset_normalization_stats)
+    masked_disp_raw = _denormalize_preview_image(
+        images * (1.0 - mask_img), valid_mask_4d, dataset_normalization_stats
+    )
+    composite_disp_raw = _denormalize_preview_image(
         images * (1.0 - mask_img) + pred_img * mask_img,
         valid_mask_4d,
         dataset_normalization_stats,
     )
 
-    # Per-channel stretch for more faithful visualization (matches validate_sampling thumbnails).
-    image_disp = _stretch_preview_rgb(image_disp, valid_mask_4d)
-    pred_disp = _stretch_preview_rgb(pred_disp, valid_mask_4d)
-    masked_disp = _stretch_preview_rgb(masked_disp, valid_mask_4d)
-    composite_disp = _stretch_preview_rgb(composite_disp, valid_mask_4d)
+    image_disp_view = _prepare_preview_display(image_disp_raw, mode=preview_display_mode)
+    pred_disp_view = _prepare_preview_display(pred_disp_raw, mode=preview_display_mode)
+    masked_disp_view = _prepare_preview_display(masked_disp_raw, mode=preview_display_mode)
+    composite_disp_view = _prepare_preview_display(
+        composite_disp_raw,
+        mode=preview_display_mode,
+    )
+
+    # Stretch all panels using the original input's per-channel statistics so
+    # hue differences reflect the model output instead of per-panel renormalization.
+    image_disp = _stretch_preview_rgb(
+        image_disp_view,
+        valid_mask_4d,
+        reference_image=image_disp_view,
+    )
+    pred_disp = _stretch_preview_rgb(
+        pred_disp_view,
+        valid_mask_4d,
+        reference_image=image_disp_view,
+    )
+    masked_disp = _stretch_preview_rgb(
+        masked_disp_view,
+        valid_mask_4d,
+        reference_image=image_disp_view,
+    )
+    composite_disp = _stretch_preview_rgb(
+        composite_disp_view,
+        valid_mask_4d,
+        reference_image=image_disp_view,
+    )
 
     rows = min(int(max_items), image_disp.shape[0])
     fig, axes = plt.subplots(rows, 4, figsize=(12, 3.2 * rows))
@@ -801,7 +913,15 @@ def save_reconstruction_preview(
                 fontsize=8,
             )
 
-    fig.suptitle("SatMAE Mars reconstruction preview", fontsize=12)
+    display_titles = {
+        "false_color": "false colour (NIR->R, RED->G, BG->B)",
+        "approx_natural": "approx natural colour (RED, BG, BG)",
+        "red_grayscale": "RED-channel grayscale",
+    }
+    fig.suptitle(
+        f"SatMAE Mars reconstruction preview — {display_titles.get(preview_display_mode, preview_display_mode)}",
+        fontsize=12,
+    )
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=160)
@@ -809,6 +929,69 @@ def save_reconstruction_preview(
     if was_training:
         model.train()
     return out_path
+
+
+def _preview_variant_path(
+    out_path: pathlib.Path,
+    *,
+    mode: str,
+    primary_mode: str,
+) -> pathlib.Path:
+    """Return a stable filename for a preview display variant."""
+    if mode == primary_mode:
+        return out_path
+    return out_path.with_name(f"{out_path.stem}_{mode}{out_path.suffix}")
+
+
+def save_reconstruction_preview_variants(
+    *,
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    mask_ratio: float,
+    out_path: pathlib.Path,
+    amp_enabled: bool,
+    require_patch_valid: bool,
+    dataset_normalization_stats: tuple[torch.Tensor, torch.Tensor] | None,
+    valid_mask_aware: bool,
+    min_valid_fraction: float,
+    preview_display_mode: str = "red_grayscale",
+    preview_secondary_display_mode: str | None = "false_color",
+    token_validity_weighting: bool = False,
+    token_validity_weight_exponent: float = 2.0,
+    max_items: int = 4,
+) -> dict[str, pathlib.Path]:
+    """Save one or more preview display variants for the same reconstruction batch."""
+    modes = [preview_display_mode]
+    if preview_secondary_display_mode is not None and preview_secondary_display_mode not in modes:
+        modes.append(preview_secondary_display_mode)
+
+    saved: dict[str, pathlib.Path] = {}
+    for mode in modes:
+        variant_path = _preview_variant_path(
+            out_path,
+            mode=mode,
+            primary_mode=preview_display_mode,
+        )
+        written = save_reconstruction_preview(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            mask_ratio=mask_ratio,
+            out_path=variant_path,
+            amp_enabled=amp_enabled,
+            require_patch_valid=require_patch_valid,
+            dataset_normalization_stats=dataset_normalization_stats,
+            valid_mask_aware=valid_mask_aware,
+            min_valid_fraction=min_valid_fraction,
+            preview_display_mode=mode,
+            token_validity_weighting=token_validity_weighting,
+            token_validity_weight_exponent=token_validity_weight_exponent,
+            max_items=max_items,
+        )
+        if written is not None:
+            saved[mode] = written
+    return saved
 
 
 def train_one_epoch(
@@ -829,6 +1012,8 @@ def train_one_epoch(
     require_patch_valid: bool,
     valid_mask_aware: bool,
     min_valid_fraction: float,
+    token_validity_weighting: bool,
+    token_validity_weight_exponent: float,
     spectral_dropout_prob: float,
     spectral_dropout_max_channels: int,
     progress_path: pathlib.Path | None = None,
@@ -875,6 +1060,8 @@ def train_one_epoch(
                 mask_ratio=mask_ratio,
                 valid_mask_aware=valid_mask_aware,
                 min_valid_fraction=min_valid_fraction,
+                token_validity_weighting=token_validity_weighting,
+                token_validity_weight_exponent=token_validity_weight_exponent,
                 spectral_dropout_prob=spectral_dropout_prob,
                 spectral_dropout_max_channels=spectral_dropout_max_channels,
                 training=True,
@@ -953,6 +1140,8 @@ def evaluate_epoch(
     require_patch_valid: bool,
     valid_mask_aware: bool,
     min_valid_fraction: float,
+    token_validity_weighting: bool,
+    token_validity_weight_exponent: float,
     max_batches: int | None = None,
     progress_path: pathlib.Path | None = None,
     progress_log_interval: int = 10,
@@ -992,6 +1181,8 @@ def evaluate_epoch(
                 mask_ratio=mask_ratio,
                 valid_mask_aware=valid_mask_aware,
                 min_valid_fraction=min_valid_fraction,
+                token_validity_weighting=token_validity_weighting,
+                token_validity_weight_exponent=token_validity_weight_exponent,
                 spectral_dropout_prob=0.0,
                 spectral_dropout_max_channels=0,
                 training=False,
@@ -1085,13 +1276,17 @@ def run_training(
     require_patch_valid: bool,
     valid_mask_aware: bool = True,
     min_valid_fraction: float = DEFAULT_PATCH_VALID_FRACTION,
+    token_validity_weighting: bool = False,
+    token_validity_weight_exponent: float = 2.0,
     spectral_dropout_prob: float = 0.0,
     spectral_dropout_max_channels: int = 1,
     config: dict[str, Any],
     preview_loader: torch.utils.data.DataLoader | None,
     reconstruction_dir: pathlib.Path,
     dataset_normalization_stats: tuple[torch.Tensor, torch.Tensor] | None,
+    preview_display_mode: str = "red_grayscale",
     reconstruction_max_items: int,
+    preview_secondary_display_mode: str | None = "false_color",
     progress_log_interval: int = 10,
     wandb_logger: WandbLogger | None = None,
 ) -> dict[str, Any]:
@@ -1138,6 +1333,8 @@ def run_training(
             require_patch_valid=require_patch_valid,
             valid_mask_aware=valid_mask_aware,
             min_valid_fraction=min_valid_fraction,
+            token_validity_weighting=token_validity_weighting,
+            token_validity_weight_exponent=token_validity_weight_exponent,
             spectral_dropout_prob=spectral_dropout_prob,
             spectral_dropout_max_channels=spectral_dropout_max_channels,
             progress_path=progress_path,
@@ -1181,6 +1378,8 @@ def run_training(
                 require_patch_valid=require_patch_valid,
                 valid_mask_aware=valid_mask_aware,
                 min_valid_fraction=min_valid_fraction,
+                token_validity_weighting=token_validity_weighting,
+                token_validity_weight_exponent=token_validity_weight_exponent,
                 max_batches=val_max_batches,
                 progress_path=progress_path,
                 progress_log_interval=progress_log_interval,
@@ -1217,7 +1416,7 @@ def run_training(
                     config=config,
                 )
                 if preview_loader is not None:
-                    best_preview = save_reconstruction_preview(
+                    best_previews = save_reconstruction_preview_variants(
                         model=model,
                         dataloader=preview_loader,
                         device=device,
@@ -1228,15 +1427,23 @@ def run_training(
                         dataset_normalization_stats=dataset_normalization_stats,
                         valid_mask_aware=valid_mask_aware,
                         min_valid_fraction=min_valid_fraction,
+                        preview_display_mode=preview_display_mode,
+                        preview_secondary_display_mode=preview_secondary_display_mode,
+                        token_validity_weighting=token_validity_weighting,
+                        token_validity_weight_exponent=token_validity_weight_exponent,
                         max_items=reconstruction_max_items,
                     )
-                    if wandb_logger is not None and best_preview is not None:
-                        wandb_logger.log_image(
-                            "reconstructions/best",
-                            best_preview,
-                            step=epoch_wandb_step,
-                            caption=f"Best reconstruction preview at epoch {epoch + 1}",
-                        )
+                    if wandb_logger is not None:
+                        for mode, best_preview in best_previews.items():
+                            key = "reconstructions/best"
+                            if mode != preview_display_mode:
+                                key = f"{key}_{mode}"
+                            wandb_logger.log_image(
+                                key,
+                                best_preview,
+                                step=epoch_wandb_step,
+                                caption=f"Best reconstruction preview at epoch {epoch + 1} ({mode})",
+                            )
 
         if checkpoint_every > 0 and ((epoch + 1) % checkpoint_every == 0 or (epoch + 1) == epochs):
             save_satmae_checkpoint(
@@ -1251,7 +1458,7 @@ def run_training(
             )
 
         if preview_loader is not None:
-            epoch_preview = save_reconstruction_preview(
+            epoch_previews = save_reconstruction_preview_variants(
                 model=model,
                 dataloader=preview_loader,
                 device=device,
@@ -1262,15 +1469,23 @@ def run_training(
                 dataset_normalization_stats=dataset_normalization_stats,
                 valid_mask_aware=valid_mask_aware,
                 min_valid_fraction=min_valid_fraction,
+                preview_display_mode=preview_display_mode,
+                preview_secondary_display_mode=preview_secondary_display_mode,
+                token_validity_weighting=token_validity_weighting,
+                token_validity_weight_exponent=token_validity_weight_exponent,
                 max_items=reconstruction_max_items,
             )
-            if wandb_logger is not None and epoch_preview is not None:
-                wandb_logger.log_image(
-                    "reconstructions/epoch",
-                    epoch_preview,
-                    step=epoch_wandb_step,
-                    caption=f"Epoch {epoch + 1} reconstruction preview",
-                )
+            if wandb_logger is not None:
+                for mode, epoch_preview in epoch_previews.items():
+                    key = "reconstructions/epoch"
+                    if mode != preview_display_mode:
+                        key = f"{key}_{mode}"
+                    wandb_logger.log_image(
+                        key,
+                        epoch_preview,
+                        step=epoch_wandb_step,
+                        caption=f"Epoch {epoch + 1} reconstruction preview ({mode})",
+                    )
 
         save_satmae_checkpoint(
             checkpoint_path,
@@ -1336,7 +1551,7 @@ def run_training(
         progress_path,
     )
     if preview_loader is not None:
-        final_preview = save_reconstruction_preview(
+        final_previews = save_reconstruction_preview_variants(
             model=model,
             dataloader=preview_loader,
             device=device,
@@ -1347,15 +1562,23 @@ def run_training(
             dataset_normalization_stats=dataset_normalization_stats,
             valid_mask_aware=valid_mask_aware,
             min_valid_fraction=min_valid_fraction,
+            preview_display_mode=preview_display_mode,
+            preview_secondary_display_mode=preview_secondary_display_mode,
+            token_validity_weighting=token_validity_weighting,
+            token_validity_weight_exponent=token_validity_weight_exponent,
             max_items=reconstruction_max_items,
         )
-        if wandb_logger is not None and final_preview is not None:
-            wandb_logger.log_image(
-                "reconstructions/final",
-                final_preview,
-                step=int(epochs * steps_per_epoch),
-                caption="Final reconstruction preview",
-            )
+        if wandb_logger is not None:
+            for mode, final_preview in final_previews.items():
+                key = "reconstructions/final"
+                if mode != preview_display_mode:
+                    key = f"{key}_{mode}"
+                wandb_logger.log_image(
+                    key,
+                    final_preview,
+                    step=int(epochs * steps_per_epoch),
+                    caption=f"Final reconstruction preview ({mode})",
+                )
     if wandb_logger is not None:
         wandb_logger.finish(summary)
     return summary
@@ -1546,6 +1769,8 @@ def main() -> None:
     parser.add_argument("--dominant-obs-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--valid-mask-aware", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--token-min-valid-fraction", type=float, default=DEFAULT_PATCH_VALID_FRACTION)
+    parser.add_argument("--token-validity-weighting", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--token-validity-weight-exponent", type=float, default=2.0)
     parser.add_argument("--spectral-dropout-prob", type=float, default=0.0)
     parser.add_argument("--spectral-dropout-max-channels", type=int, default=1)
 
@@ -1585,6 +1810,18 @@ def main() -> None:
 
     parser.add_argument("--save-reconstructions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reconstruction-max-items", type=int, default=4)
+    parser.add_argument(
+        "--preview-display-mode",
+        type=str,
+        default="red_grayscale",
+        choices=("red_grayscale", "false_color", "approx_natural"),
+    )
+    parser.add_argument(
+        "--preview-secondary-display-mode",
+        type=str,
+        default="false_color",
+        choices=("none", "red_grayscale", "false_color", "approx_natural"),
+    )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
 
     # Pretrained init plumbing.
@@ -1956,8 +2193,11 @@ def main() -> None:
             "filter_invalid_patches": bool(args.filter_invalid_patches),
             "valid_mask_aware": bool(args.valid_mask_aware),
             "token_min_valid_fraction": float(args.token_min_valid_fraction),
+            "token_validity_weighting": bool(args.token_validity_weighting),
+            "token_validity_weight_exponent": float(args.token_validity_weight_exponent),
             "spectral_dropout_prob": float(args.spectral_dropout_prob),
             "spectral_dropout_max_channels": int(args.spectral_dropout_max_channels),
+            "val_max_batches": int(args.val_max_batches) if args.val_max_batches is not None else None,
             "run_name": args.run_name,
             "out_dir": str(out_dir),
             "out_root": str(args.out_root),
@@ -1968,6 +2208,10 @@ def main() -> None:
             "wandb_dir": str(args.wandb_dir) if args.wandb_dir is not None else None,
             "save_reconstructions": bool(args.save_reconstructions),
             "reconstruction_max_items": int(args.reconstruction_max_items),
+            "preview_display_mode": args.preview_display_mode,
+            "preview_secondary_display_mode": None
+            if args.preview_secondary_display_mode == "none"
+            else args.preview_secondary_display_mode,
             "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint is not None else None,
             "init_mode": args.init_mode,
             "init_pos_embed": args.init_pos_embed,
@@ -2021,12 +2265,18 @@ def main() -> None:
             require_patch_valid=args.filter_invalid_patches,
             valid_mask_aware=args.valid_mask_aware,
             min_valid_fraction=args.token_min_valid_fraction,
+            token_validity_weighting=args.token_validity_weighting,
+            token_validity_weight_exponent=args.token_validity_weight_exponent,
             spectral_dropout_prob=args.spectral_dropout_prob,
             spectral_dropout_max_channels=args.spectral_dropout_max_channels,
             config=config,
             preview_loader=preview_loader,
             reconstruction_dir=reconstruction_dir,
             dataset_normalization_stats=dataset_normalization_stats,
+            preview_display_mode=args.preview_display_mode,
+            preview_secondary_display_mode=None
+            if args.preview_secondary_display_mode == "none"
+            else args.preview_secondary_display_mode,
             reconstruction_max_items=args.reconstruction_max_items,
             progress_log_interval=args.progress_log_interval,
             wandb_logger=wandb_logger,

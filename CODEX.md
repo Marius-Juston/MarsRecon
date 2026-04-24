@@ -44,25 +44,43 @@ Do not touch:
 Best completed Stage A reconstruction run so far:
 
 - run dir:
-  - `/scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_035331_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v1`
+  - `/scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_123744_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v2-strict80`
 - W&B:
-  - `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/robbis5a`
+  - `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/a8mfnetk`
 - config:
   - `image_size=256`
   - `patch_size_px=8`
   - `mask_ratio=0.5`
   - `epochs=20`
   - `valid_mask_aware=true`
-  - `token_min_valid_fraction=0.5`
+  - `token_min_valid_fraction=0.8`
   - `spectral_dropout_prob=0.0`
 - result:
-  - best val loss `0.1479`
+  - best val loss `0.1342`
 
 Interpretation:
 
 - This is the strongest completed run quantitatively so far.
-- It is structurally better than the earlier `128/p8` and `128/p4` runs.
-- It still leaves some residual green/purple contamination near nodata-like regions.
+- It improved on the earlier `256/p8 validmask-v1` run (`0.1479 -> 0.1342`) while changing only the strictness of validity filtering.
+- The improvement is real but visually subtle:
+  - reconstruction style is broadly similar
+  - nodata-related contamination appears somewhat cleaner
+  - broad spectral/color bias is still not fully solved
+- The strict run drops a tiny fraction of training samples rather than changing the whole dataset:
+  - roughly `141` dropped vs `29,555` kept per late epoch
+  - validation still keeps `1024` samples per checkpoint
+
+## Previous Best Completed Run
+
+- run dir:
+  - `/scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_035331_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v1`
+- W&B:
+  - `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/robbis5a`
+- best val loss:
+  - `0.1479`
+- key difference from the new best run:
+  - `token_min_valid_fraction=0.5`
+  - effectively `0` dropped training samples
 
 ## Important Completed Runs
 
@@ -91,6 +109,7 @@ Interpretation:
 
 - `128/p4` reduced visible block size but was not an overall win.
 - `256/p8` plus valid-mask-aware training is the current best direction.
+- Tightening validity handling helped more than another patch-size sweep did.
 
 ## What the Trainer Supports
 
@@ -172,7 +191,7 @@ Still, treat them as diagnostics rather than a formal metric.
 
 - `/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_256_v1/litdata_cache_v1/2815a653281747ba`
 
-That `256` cache is the one used by both the best completed `256/p8` run and the current strict-mask follow-up.
+That `256` cache is the one used by both `256/p8` valid-mask-aware runs.
 
 ## Current W&B Defaults
 
@@ -183,10 +202,17 @@ That `256` cache is the one used by both the best completed `256/p8` run and the
 
 ## Useful Commands
 
-Check the active strict run:
+Check the current best run summary:
 
 ```bash
-cat /scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_123744_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v2-strict80/progress.json
+cat /scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_123744_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v2-strict80/summary.json
+```
+
+Compare the two 256/p8 runs:
+
+```bash
+cat /scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_123744_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v2-strict80/summary.json
+cat /scratch/marsrecon_runs/stage_a/satmae/20260420/20260420_035331_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v1/summary.json
 ```
 
 List the latest Stage A runs:
@@ -223,8 +249,17 @@ The most important local code changes on this branch are:
 
 ## Practical Recommendation
 
-Before choosing another architecture sweep, first compare the current strict-mask run against:
+The repo has now established a strong baseline:
 
-- the completed `256/p8 validmask-v1` run
+- `256/p8`
+- valid-mask-aware training
+- stricter token validity filtering
 
-The key question is whether the stricter mask logic reduces residual green contamination without damaging the stronger structural reconstruction that `256/p8` already achieved.
+The main unresolved issue is no longer gross patchiness.
+It is the remaining spectral/color contamination and nodata/shadow ambiguity.
+
+So the next useful work should focus on:
+
+- better nodata representation
+- better spectral robustness
+- or cleaner ablations that isolate those effects

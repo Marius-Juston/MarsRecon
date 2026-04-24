@@ -18,9 +18,12 @@ from clip.fb_mae_train_utils import build_fb_mae_dataloader
 from clip.satmae_bridge import build_satmae_model
 from clip.train_marsclip_satmae import (
     _apply_spectral_dropout,
+    _compute_token_validity_weights,
     _filter_batch_by_validity,
+    _prepare_preview_display,
     _refine_valid_mask_from_image,
     _satmae_forward_with_valid_mask,
+    _stretch_preview_rgb,
     init_wandb_logger,
     resolve_effective_lr,
     resolve_run_output_dir,
@@ -203,6 +206,80 @@ def test_satmae_forward_with_valid_mask_masks_invalid_patch_from_loss():
     assert patch_valid_mask[0].tolist() == [False, True, True, True]
     assert bool(mask[0, 0].item()) is True
     assert torch.isfinite(loss)
+
+
+def test_compute_token_validity_weights_reproduces_binary_behavior_when_disabled():
+    patch_valid_fraction = torch.tensor([[1.0, 0.8, 0.79]], dtype=torch.float32)
+
+    weights = _compute_token_validity_weights(
+        patch_valid_fraction,
+        min_valid_fraction=0.8,
+        enabled=False,
+        exponent=2.0,
+    )
+
+    assert torch.allclose(weights, torch.tensor([[1.0, 1.0, 0.0]], dtype=torch.float32))
+
+
+def test_compute_token_validity_weights_softens_partially_valid_tokens_when_enabled():
+    patch_valid_fraction = torch.tensor([[1.0, 0.8, 0.79]], dtype=torch.float32)
+
+    weights = _compute_token_validity_weights(
+        patch_valid_fraction,
+        min_valid_fraction=0.8,
+        enabled=True,
+        exponent=2.0,
+    )
+
+    assert torch.allclose(weights, torch.tensor([[1.0, 0.64, 0.0]], dtype=torch.float32))
+
+
+def test_stretch_preview_rgb_can_reuse_reference_image_stats():
+    valid_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    reference = torch.linspace(0.0, 1.0, steps=16, dtype=torch.float32).view(1, 1, 4, 4)
+    target = (reference * 0.5).clone()
+
+    stretched_with_self = _stretch_preview_rgb(target, valid_mask)
+    stretched_with_reference = _stretch_preview_rgb(target, valid_mask, reference_image=reference)
+
+    assert stretched_with_self.max().item() > 0.9
+    assert stretched_with_reference.max().item() < 0.6
+
+
+def test_prepare_preview_display_can_render_red_channel_as_grayscale():
+    image = torch.tensor(
+        [
+            [
+                [[0.9, 0.8], [0.7, 0.6]],
+                [[0.5, 0.4], [0.3, 0.2]],
+                [[0.1, 0.2], [0.3, 0.4]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    display = _prepare_preview_display(image, mode="red_grayscale")
+
+    expected = image[:, 1:2].repeat(1, 3, 1, 1)
+    assert torch.allclose(display, expected)
+
+
+def test_prepare_preview_display_supports_approx_natural_mapping():
+    image = torch.tensor(
+        [
+            [
+                [[0.9, 0.8], [0.7, 0.6]],
+                [[0.5, 0.4], [0.3, 0.2]],
+                [[0.1, 0.2], [0.3, 0.4]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    display = _prepare_preview_display(image, mode="approx_natural")
+
+    expected = torch.cat([image[:, 1:2], image[:, 2:3], image[:, 2:3]], dim=1)
+    assert torch.allclose(display, expected)
 
 
 def test_apply_spectral_dropout_only_changes_valid_pixels():
