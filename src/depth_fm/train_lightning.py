@@ -64,7 +64,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from depth_fm.depthfm_adapter import (
-    DepthFMHiRISEAdapterCached, fill_voids_gmrf, estimate_sun_vector_irls, )
+    DepthFMHiRISEAdapterCached, fill_voids_gmrf, estimate_sun_vector_irls, SeamResult, detect_seam_artifact)
 from depth_fm.lightning_module import DepthFMLightningModule, FasterEMAWeightAveraging
 from depth_fm.visualization import (
     plot_convergence_curves,
@@ -106,6 +106,7 @@ def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"
     for f in formats:
         new_path = path.with_suffix(f)
         fig.savefig(new_path, **kwargs)
+        logger.info(f"Saved {new_path}")
 
 
 def _make_synthetic_pred(
@@ -348,11 +349,10 @@ def visualize_laplacian_loss(
 
                 axes[count, 0].imshow(ortho_d, cmap="gray", vmin=0, vmax=1)
                 axes[count, 1].imshow(dtm_d, cmap="terrain")
-                axes[count, 2].imshow(gt_lap_d, cmap="RdBu_r", vmin=0, vmax=1)
+                axes[count, 2].imshow(gt_lap_d, cmap="RdBu_r")
                 axes[count, 3].imshow(pred_d, cmap="terrain")
-                axes[count, 4].imshow(pr_lap_d, cmap="RdBu_r", vmin=0, vmax=1)
-                axes[count, 5].imshow(err_d, cmap="magma",
-                                      vmin=0, vmax=shared_vlim)
+                axes[count, 4].imshow(pr_lap_d, cmap="RdBu_r")
+                axes[count, 5].imshow(err_d, cmap="magma")
 
                 for ax in axes[count]:
                     ax.axis("off")
@@ -434,7 +434,7 @@ def visualize_ordinal_ranking(
 
                 # Deterministic sampling for reproducible viz
                 gen = torch.Generator(device=device).manual_seed(seed + count)
-                idx_i, idx_j = loss_fn.sample_pairs(1, N, device, generator=gen)
+                idx_i, idx_j = loss_fn.sample_pairs(1, N, device, generator=gen, confidence=mask)
                 stats = loss_fn.pair_stats(pred, dtm, idx_i, idx_j, mask)
 
                 logger.info(f"Laplacian loss: {loss_fn(pred, dtm):.3f}")
@@ -476,7 +476,7 @@ def visualize_ordinal_ranking(
                         col, lw, z = "#888888", 0.2, 1
                     ax_sc.plot([xi[k], xj[k]], [yi[k], yj[k]],
                                "-", color=col, linewidth=lw, zorder=z, alpha=0.8)
-                ax_sc.set_xlim(0, W);
+                ax_sc.set_xlim(0, W)
                 ax_sc.set_ylim(H, 0)
 
                 # Violation heatmap over coarse grid
@@ -733,116 +733,310 @@ def visualize_solar_distribution(dataloader, output_dir: Path, num_batches: int 
     logger.info(f"Individual solar figures saved to {output_dir}")
 
 
+def _prep_ortho_rgb(img_np: np.ndarray) -> np.ndarray:
+    """(C,H,W) float in ~[-1,1] -> (H,W,3) float in [0,1]."""
+    if img_np.ndim == 2:
+        img_np = img_np[None]
+    if img_np.shape[0] == 1:
+        img_np = np.repeat(img_np, 3, axis=0)
+    rgb = np.transpose(img_np[:3], (1, 2, 0))
+    rgb = np.clip((rgb + 1.0) / 2.0, 0.0, 1.0)
+    return rgb
+
+
+def _apply_mask(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    out = arr.copy().astype(np.float32)
+    if out.ndim == 3:
+        out[~mask] = np.nan
+    else:
+        out[~mask] = np.nan
+    return out
+
+
+def _draw_best_line(ax, result: SeamResult, H: int, W: int, color="#ff3b30"):
+    if result.seam_score <= 0:
+        return
+    y1, x1, y2, x2 = result.line_endpoints(clip_hw=(H, W))
+    ax.plot([x1, x2], [y1, y2], color=color, linewidth=2.0, alpha=0.85)
+    # small marker at centroid
+    ax.plot([result.best_x], [result.best_y], marker="o",
+            markersize=4, color=color, alpha=0.9)
+
+
+def render_sample_diagnostics(
+        image_chw: np.ndarray,
+        dtm_hw: np.ndarray,
+        mask_hw: np.ndarray,
+        ortho_grad_hw: np.ndarray,
+        result: SeamResult,
+        *,
+        title: str | None = None,
+        figsize: tuple = (20, 4.2),
+) -> plt.Figure:
+    """Single-sample, 6-panel diagnostic figure."""
+    H, W = mask_hw.shape
+    mask_bool = mask_hw.astype(bool)
+
+    rgb = _prep_ortho_rgb(image_chw)
+    rgb_masked = rgb.copy()
+    rgb_masked[~mask_bool] = np.nan
+
+    dtm_masked = _apply_mask(np.clip((dtm_hw + 1) / 2.0, 0, 1), mask_bool)
+    grad_masked = _apply_mask(ortho_grad_hw, mask_bool)
+    p2, p98 = np.nanpercentile(grad_masked, [2, 98]) if np.any(~np.isnan(grad_masked)) else (0, 1)
+    grad_disp = np.clip((grad_masked - p2) / (p98 - p2 + 1e-8), 0, 1)
+
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(1, 6, width_ratios=[1, 1, 1, 1, 1, 0.9], wspace=0.12)
+
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.imshow(rgb_masked)
+    _draw_best_line(ax0, result, H, W, color="#ff3b30")
+    ax0.set_title("Ortho + seam line")
+    ax0.axis("off")
+
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax1.imshow(dtm_masked, cmap="terrain", vmin=0, vmax=1)
+    _draw_best_line(ax1, result, H, W, color="#ff3b30")
+    ax1.set_title("GT DTM + seam line")
+    ax1.axis("off")
+
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.imshow(grad_disp, cmap="magma")
+    ax2.set_title("Ortho gradient (|∇I|)")
+    ax2.axis("off")
+
+    ax3 = fig.add_subplot(gs[0, 3])
+    heat = result.seam_heatmap
+    if heat is not None:
+        h_disp = heat.copy()
+        h_disp[~mask_bool] = np.nan
+        vmax = float(np.nanpercentile(h_disp, 99)) if np.any(~np.isnan(h_disp)) else 1.0
+        ax3.imshow(h_disp, cmap="inferno", vmin=0, vmax=max(vmax, 1e-6))
+        _draw_best_line(ax3, result, H, W, color="#00ffff")
+    ax3.set_title("Seam response")
+    ax3.axis("off")
+
+    ax4 = fig.add_subplot(gs[0, 4])
+    d_heat = result.cohens_d_heatmap
+    if d_heat is not None:
+        d_disp = d_heat.copy()
+        d_disp[~mask_bool] = np.nan
+        ax4.imshow(d_disp, cmap="viridis", vmin=0,
+                   vmax=max(1.0, float(np.nanpercentile(d_disp, 99)) if np.any(~np.isnan(d_disp)) else 1.0))
+    ax4.set_title("Cohen's d across line")
+    ax4.axis("off")
+
+    ax5 = fig.add_subplot(gs[0, 5], projection="polar")
+    pa = result.per_angle_max
+    if pa is not None and len(pa) > 0:
+        # repeat so the polar plot closes, and double because directions are pi-periodic
+        angles = np.linspace(0, np.pi, len(pa), endpoint=False)
+        angles_full = np.concatenate([angles, angles + np.pi, [angles[0]]])
+        vals_full = np.concatenate([pa, pa, [pa[0]]])
+        ax5.plot(angles_full, vals_full, color="#ff3b30", linewidth=1.5)
+        ax5.fill(angles_full, vals_full, color="#ff3b30", alpha=0.25)
+        # highlight the winning angle
+        ax5.plot([result.best_angle_rad, result.best_angle_rad + np.pi],
+                 [max(pa), max(pa)],
+                 color="#00ffff", linewidth=2.0, alpha=0.9)
+    ax5.set_title(f"per-angle max\nbest={np.degrees(result.best_angle_rad):.0f}°",
+                  fontsize=9)
+    ax5.set_xticklabels([])
+    ax5.set_yticklabels([])
+    ax5.grid(alpha=0.3)
+
+    score_text = (
+        f"seam={result.seam_score:7.2f}   "
+        f"ortho={result.ortho_score:5.2f}   "
+        f"dtm={result.dtm_score:5.2f}   "
+        f"d={result.cohens_d:4.2f}   "
+        f"@({result.best_y},{result.best_x}) "
+        f"θ={np.degrees(result.best_angle_rad):.0f}°"
+    )
+    if title is None:
+        title = score_text
+    else:
+        title = f"{title}   |   {score_text}"
+    fig.suptitle(title, fontsize=11, y=1.02)
+
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# batch mode (backward-compatible entry point)
+# ---------------------------------------------------------------------------
 @torch.no_grad()
 def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16):
-    """
-    Scans a buffer of patches, scores them for seam artifacts, and plots
-    the worst (highest score) vs the best (lowest score) for visual validation.
-    Layout: [Ortho] | [GT DTM] | [Confidence Mask] | [Gradient Map]
-    """
-    from depth_fm.depthfm_adapter import detect_dtm_seam_artifact
+    """Enhanced drop-in replacement. Saves a top-N/bottom-N diagnostic grid."""
+    import torch.nn.functional as F
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    import numpy as np
 
-    logger.info(f"Generating Seam Artifact validation for {num_samples} samples...")
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    evaluated_samples = []
-    scan_limit = len(dataloader.dataset)  # Scan a larger buffer to find actual seams
+    evaluated = []
+    scan_limit = len(dataloader.dataset)
+
+    sobel_x = torch.tensor(
+        [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+        device=device,
+    ).view(1, 1, 3, 3) / 8.0
+    sobel_y = torch.tensor(
+        [[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
+        device=device,
+    ).view(1, 1, 3, 3) / 8.0
 
     with tqdm(total=scan_limit, desc="Scanning for seams") as pbar:
         for batch in dataloader:
             B = batch["image"].shape[0]
             for i in range(B):
-                if len(evaluated_samples) >= scan_limit:
+                if len(evaluated) >= scan_limit:
                     break
+                img = batch["image"][i:i + 1].to(device)
+                dtm = batch["dtm"][i:i + 1, :1].to(device)
+                mask = batch["confidence"][i:i + 1].to(device) > 0.5
 
-                img = batch["image"][i: i + 1].to(device)
-                dtm = batch["dtm"][i: i + 1, :1].to(device)
-                mask = batch["confidence"][i: i + 1].to(device) > 0.5
+                result = detect_seam_artifact(
+                    img, dtm, mask, return_diagnostics=True
+                )
 
-                # Skip empty masks
-                # if not mask.any() or not (~mask).any():
-                #     continue
+                ortho_gray = img.float().mean(dim=1, keepdim=True)
+                safe = ortho_gray.clone()
+                safe[~mask] = 0.0
+                gx = F.conv2d(safe, sobel_x, padding=1)
+                gy = F.conv2d(safe, sobel_y, padding=1)
+                ortho_grad = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
 
-                score = detect_dtm_seam_artifact(dtm, mask)
-
-                # Compute normalized gradient magnitude for visualization
-                sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device).view(1, 1, 3,
-                                                                                                          3) / 8.0
-                sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device).view(1, 1, 3,
-                                                                                                          3) / 8.0
-
-                safe_dtm = dtm.clone()
-                safe_dtm[~mask.bool()] = 0.0
-                grad_x = F.conv2d(safe_dtm, sobel_x, padding=1)
-                grad_y = F.conv2d(safe_dtm, sobel_y, padding=1)
-                grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
-
-                evaluated_samples.append({
-                    "score": score,
+                evaluated.append({
+                    "result": result,
                     "img": img[0].cpu().numpy(),
                     "dtm": dtm[0, 0].cpu().numpy(),
                     "mask": mask[0, 0].cpu().numpy(),
-                    "grad_mag": grad_mag[0, 0].cpu().numpy()
+                    "ortho_grad": ortho_grad[0, 0].cpu().numpy(),
                 })
                 pbar.update(1)
-
-            if len(evaluated_samples) >= scan_limit:
+            if len(evaluated) >= scan_limit:
                 break
 
-    # Sort by score descending
-    evaluated_samples.sort(key=lambda x: x["score"], reverse=True)
+    evaluated.sort(key=lambda s: s["result"].composite_score, reverse=True)
+    n = min(num_samples, len(evaluated))
+    selected = evaluated[:n] + evaluated[-n:]
 
-    num_samples = min(len(evaluated_samples), num_samples)
-
-    # Select the Top N (Most severe seams) and Bottom N (Cleanest terrain)
-    selected = evaluated_samples[:num_samples] + evaluated_samples[-num_samples:]
-    half = len(selected) // 2
-
+    # compose a tall figure: expanded to 8 columns for new structural diagnostics
     total_rows = len(selected)
+    cols = 8
+    scale = 4
 
-    fig, axes = plt.subplots(total_rows, 4, figsize=(16, 4 * total_rows))
-    plt.subplots_adjust(wspace=0.1, hspace=0.3)
+    fig, axes = plt.subplots(total_rows, cols, figsize=(cols * scale, scale * total_rows),
+                             gridspec_kw={"width_ratios": [1, 1, 1, 1, 1, 1, 1, 0.9]})
+    if total_rows == 1:
+        axes = axes[None, :]
 
-    for count, item in enumerate(selected):
-        img_disp = np.clip((np.transpose(item["img"], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
-        dtm_disp = np.clip((item["dtm"] + 1.0) / 2.0, 0.0, 1.0)
-        mask_np = item["mask"].astype(bool)
-        grad_np = item["grad_mag"]
+    for row, item in enumerate(selected):
+        H, W = item["mask"].shape
+        mask_bool = item["mask"].astype(bool)
+        res = item["result"]
+        rgb = _prep_ortho_rgb(item["img"])
+        rgb[~mask_bool] = np.nan
+        dtm_disp = _apply_mask(np.clip((item["dtm"] + 1) / 2, 0, 1), mask_bool)
+        grad_masked = _apply_mask(item["ortho_grad"], mask_bool)
+        p2, p98 = np.nanpercentile(grad_masked, [2, 98]) if np.any(~np.isnan(grad_masked)) else (0, 1)
+        grad_disp = np.clip((grad_masked - p2) / (p98 - p2 + 1e-8), 0, 1)
 
-        # Mask out invalid areas purely for plotting clarity
-        img_disp[~mask_np] = np.nan
-        dtm_disp[~mask_np] = np.nan
-        grad_np[~mask_np] = np.nan
+        # Base Visualizations
+        axes[row, 0].imshow(rgb)
+        _draw_best_line(axes[row, 0], res, H, W)
+        axes[row, 1].imshow(dtm_disp, cmap="terrain", vmin=0, vmax=1)
+        _draw_best_line(axes[row, 1], res, H, W)
+        axes[row, 2].imshow(grad_disp, cmap="magma")
 
-        axes[count, 0].imshow(img_disp, vmin=0, vmax=1)
-        axes[count, 1].imshow(dtm_disp, cmap="terrain", vmin=0, vmax=1)
-        axes[count, 2].imshow(item["mask"], cmap="gray", vmin=0, vmax=1)
+        if res.seam_heatmap is not None:
+            h = res.seam_heatmap.copy()
+            h[~mask_bool] = np.nan
+            vmax = float(np.nanpercentile(h, 99)) if np.any(~np.isnan(h)) else 1.0
+            axes[row, 3].imshow(h, cmap="inferno", vmin=0, vmax=max(vmax, 1e-6))
+            _draw_best_line(axes[row, 3], res, H, W, color="#00ffff")
 
-        # Stretch gradient map for visibility
-        p2, p98 = np.nanpercentile(grad_np, [2, 98]) if np.any(~np.isnan(grad_np)) else (0, 1)
-        grad_disp = np.clip((grad_np - p2) / (p98 - p2 + 1e-8), 0, 1)
-        axes[count, 3].imshow(grad_disp, cmap="magma")
+        if res.cohens_d_heatmap is not None:
+            d = res.cohens_d_heatmap.copy()
+            d[~mask_bool] = np.nan
+            axes[row, 4].imshow(d, cmap="viridis", vmin=0,
+                                vmax=max(1.0, float(np.nanpercentile(d, 99)) if np.any(~np.isnan(d)) else 1.0))
 
-        for ax in axes[count]:
+        # New Diagnostic: Span / Connected Components
+        if hasattr(res, 'diag_closed_components') and res.diag_closed_components is not None:
+            cc = res.diag_closed_components.copy()
+            cc_disp = np.ma.masked_where(cc == 0, cc)  # Hide background
+            axes[row, 5].imshow(cc_disp, cmap="tab20", interpolation="nearest")
+        else:
+            axes[row, 5].text(0.5, 0.5, "No Span Data", ha='center', va='center')
+
+        # New Diagnostic: Linearity (Hough lines superimposed on sparsity hot-mask)
+        if hasattr(res, 'diag_hot_mask') and res.diag_hot_mask is not None:
+            hm = res.diag_hot_mask.astype(float)
+            axes[row, 6].imshow(hm, cmap="Reds", vmin=0, vmax=1)
+
+            if hasattr(res, 'diag_hough_lines') and res.diag_hough_lines is not None:
+                hl = res.diag_hough_lines.astype(float)
+                hl_disp = np.ma.masked_where(hl == 0, hl)
+                axes[row, 6].imshow(hl_disp, cmap="cool", vmin=0, vmax=1, alpha=0.8)
+        else:
+            axes[row, 6].text(0.5, 0.5, "No Linearity Data", ha='center', va='center')
+
+        for ax in axes[row, :cols - 1]:
             ax.axis("off")
 
-        if count == 0:
-            titles = ["Masked Ortho", "Masked GT DTM", "Confidence Mask", "Gradient Map"]
-            for ax, t in zip(axes[0], titles):
-                ax.set_title(t)
+        # Polar Panel: replace cartesian with polar
+        pa = res.per_angle_max
+        pos = axes[row, cols - 1].get_position()
+        axes[row, cols - 1].remove()
+        pax = fig.add_subplot(total_rows, cols, row * cols + cols, projection="polar")
+        pax.set_position(pos)
+        if pa is not None and len(pa):
+            angles = np.linspace(0, np.pi, len(pa), endpoint=False)
+            angles_full = np.concatenate([angles, angles + np.pi, [angles[0]]])
+            vals_full = np.concatenate([pa, pa, [pa[0]]])
+            pax.plot(angles_full, vals_full, color="#ff3b30", linewidth=1.2)
+            pax.fill(angles_full, vals_full, color="#ff3b30", alpha=0.25)
+            pax.plot([res.best_angle_rad, res.best_angle_rad + np.pi],
+                     [max(pa), max(pa)], color="#00ffff", linewidth=2.0)
+        pax.set_xticklabels([])
+        pax.set_yticklabels([])
+        pax.grid(alpha=0.3)
 
-        # Add side-label indicating Seam Score
-        label = "High Score\n(Likely Seam)" if count < half else "Low Score\n(Clean Terrain)"
-        axes[count, 0].text(-0.1, 0.5, f"Score: {item['score']:.2f}\n{label}",
-                            transform=axes[count, 0].transAxes, fontsize=12, fontweight='bold',
-                            va='center', ha='right', color='red' if count < half else 'green')
+        if row == 0:
+            titles = ["Ortho+line", "DTM+line", "Ortho grad",
+                      "Seam response", "Cohen's d", "Span (CCs)", "Linearity"]
+            for ax, t in zip(axes[0, :cols - 1], titles):
+                ax.set_title(t, fontweight='bold', pad=10)
+            pax.set_title("Per-Angle", fontweight='bold', pad=10)
+
+        threshold = res.is_seam
+
+        # Dynamic label extracting structural multipliers
+        cls = "HIGH" if threshold else "LOW"
+        color = "red" if threshold else "green"
+        label = (
+            f"#{row}  {cls}\n"
+            f"comp={res.composite_score:6.1f}\n"
+            f"span={getattr(res, 'span', 0.0):4.2f}\n"
+            f"spars={getattr(res, 'sparsity', 0.0):4.2f}\n"
+            f"seam={res.seam_score:6.1f}\n"
+            f"d={res.cohens_d:4.2f}\n"
+            f"θ={np.degrees(res.best_angle_rad):.0f}°"
+        )
+        axes[row, 0].text(-0.12, 0.5, label,
+                          transform=axes[row, 0].transAxes,
+                          fontsize=10, fontweight="bold", family="monospace",
+                          va="center", ha="right", color=color)
 
     save_path = output_dir / "seam_artifact_inspection.png"
     save_fig(fig, save_path, bbox_inches="tight", dpi=DPI, facecolor="white")
-    plt.close(fig)
-    logger.info(f"Seam artifact visualization saved to: {save_path}")
+    return save_path
 
 
 @torch.no_grad()
@@ -1557,6 +1751,12 @@ def get_litdata_cache_key(config) -> str:
         "resolution": config.data.get("resolution", 512),
         "dtm_normalization": config.data.get("dtm_normalization", "relative"),
     }
+
+    clip = config.data.get("clip", False)
+
+    if not clip:
+        key_parts["clip"] = clip
+
     raw = json.dumps(key_parts, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -1609,6 +1809,7 @@ def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -
     )
 
     resolution = config.data.get("resolution", 512)
+    clip = config.data.get("clip", False)
     dtm_norm = config.data.get("dtm_normalization", "relative")
     stats_path = config.data.get("stats_path")
     num_workers = tc.get("num_workers", _WORKERS_PER_GPU)
@@ -1630,6 +1831,7 @@ def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -
             random_flip=is_train,
             brightness_jitter=config.data.get("brightness_jitter", 0.1) if is_train else 0.0,
             stats_path=stats_path,
+            clip=clip
         )
         loader = DataLoader(
             adapter,
@@ -2288,17 +2490,17 @@ def main():
                 for split_name, loader in loaders.items():
                     compute_mask_statistics(loader, split_name=f"{split_name.capitalize()} Set")
             if all_viz or args.view_thumbnails:
-                generate_thumbnail_grids(loaders["val"], output_dir=output_path, num_samples=8)
+                generate_thumbnail_grids(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_loss_physics:
-                visualize_loss_physics(loaders["val"], output_dir=output_path, num_samples=8)
+                visualize_loss_physics(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_loss_components:
-                visualize_loss_components(loaders["val"], output_dir=output_path, num_samples=8)
+                visualize_loss_components(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_invalid_fill:
                 visualize_invalid_fill(loaders["train"], output_dir=output_path, num_samples=16)
             if all_viz or args.view_seam_artifacts:
-                visualize_seam_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+                visualize_seam_artifacts(loaders["train"], output_dir=output_path, num_samples=200)
             if all_viz or args.view_tin_artifacts:
-                visualize_tin_artifacts(loaders["test"], output_dir=output_path, num_samples=8)
+                visualize_tin_artifacts(loaders["train"], output_dir=output_path, num_samples=8)
             if all_viz or args.view_solar_distribution:
                 visualize_solar_distribution(loaders["train"], output_dir=output_path)
             if all_viz or args.view_augmentations:

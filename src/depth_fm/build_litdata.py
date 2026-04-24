@@ -222,6 +222,12 @@ def get_litdata_cache_key(config) -> str:
         "resolution": config.data.get("resolution", 512),
         "dtm_normalization": config.data.get("dtm_normalization", "relative"),
     }
+
+    clip = config.data.get("clip", False)
+
+    if not clip:
+        key_parts["clip"] = clip
+
     raw = json.dumps(key_parts, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -315,6 +321,8 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     dtm_norm = config.data.get("dtm_normalization", "relative")
     stats_path = config.data.get("stats_path")
 
+    clip = config.data.get("clip", False)
+
     manifest_cache_dir = dataset_root / ".cache" / "manifests"
     manifest_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -340,6 +348,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
         random_flip=False,
         brightness_jitter=0.0,
         stats_path=stats_path,
+        clip=clip,
         use_manifest=True,
         manifest_workers=min(workers, 94),
         manifest_dir=str(manifest_cache_dir),
@@ -436,8 +445,6 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     success_marker.touch()
     logger.info(f"[{split}] Done.")
 
-    del loader
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -475,10 +482,7 @@ if __name__ == "__main__":
     if final_repo_id:
         # Extract the exact config parts used for the hash and format as YAML
         relevant_config = {
-            "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
-            "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
-            "resolution": config.data.get("resolution", 512),
-            "dtm_normalization": config.data.get("dtm_normalization", "relative"),
+            "data": OmegaConf.to_container(config.data, resolve=True),
         }
         config_yaml_str = OmegaConf.to_yaml(relevant_config)
 

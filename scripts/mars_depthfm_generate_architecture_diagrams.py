@@ -86,10 +86,10 @@ try:
         erode_valid_mask as _real_erode,
         fill_voids_gmrf as _real_gmrf,
         is_tin_artifact as _real_tin,
-        detect_dtm_seam_artifact as _real_seam,
+        detect_seam_artifact as _real_seam,
         estimate_sun_vector_irls as _real_sun,
-        compute_topographic_residual as _real_residual,
-    )
+        compute_topographic_residual as _real_residual, detect_seam_artifact,
+)
 
     _USING_REAL_ADAPTER = True
 except Exception:  # pragma: no cover
@@ -187,7 +187,7 @@ def _fallback_gmrf(image, dtm, valid_mask, *,
     Q_vv = Q[np.ix_(void_idx, void_idx)] + nugget * sp.eye(len(void_idx), format="csc")
     Q_vo = Q[np.ix_(void_idx, obs_idx)]
 
-    filled_img = img_np.copy();
+    filled_img = img_np.copy()
     filled_dtm = dtm_np.copy()
     for c in range(dtm_np.shape[0]):
         flat = dtm_np[c].ravel()
@@ -227,7 +227,7 @@ def _fallback_tin(elevation, valid_mask, kernel_size=32):
     return density[valid_win].max().item()
 
 
-def _fallback_seam(elevation, valid_mask,
+def _fallback_seam(image, elevation, valid_mask,
                    line_length=35, num_angles=8, min_valid_ratio=0.5):
     if elevation.dim() == 2:
         elevation = elevation.view(1, 1, *elevation.shape)
@@ -324,8 +324,8 @@ def _tin(e, m, **kw):
     return (_real_tin if _USING_REAL_ADAPTER else _fallback_tin)(e, m, **kw)
 
 
-def _seam(e, m, **kw):
-    return (_real_seam if _USING_REAL_ADAPTER else _fallback_seam)(e, m, **kw)
+def _seam(i, e, m, **kw):
+    return (_real_seam if _USING_REAL_ADAPTER else _fallback_seam)(i, e, m, **kw)
 
 
 def _residual(e, m):
@@ -462,13 +462,13 @@ def _collect_real_data(H=128) -> dict:
     crater_valid = torch.ones_like(crater_t).bool()
     crater_tin = _tin(crater_t, crater_valid, kernel_size=32)
     crater_residual = _residual(crater_t.squeeze(), crater_valid.float().squeeze())
-    crater_seam = _seam(crater_t, crater_valid, line_length=35, num_angles=8)
+    crater_seam = _seam(ortho_t, crater_t, crater_valid, line_length=35, num_angles=8)
 
     # ---- Scene: tile-merge seam (rejected) ------------------------------
     seam_dtm = _seam_terrain(H, seed=23)
     seam_t = torch.from_numpy(seam_dtm).unsqueeze(0).unsqueeze(0)
     seam_valid = torch.ones_like(seam_t).bool()
-    seam_score = _seam(seam_t, seam_valid, line_length=35, num_angles=8)
+    seam_score = _seam(seam_t, seam_t, seam_valid, line_length=35, num_angles=8).composite_score
     seam_residual = _residual(seam_t.squeeze(), seam_valid.float().squeeze())
     seam_tin = _tin(seam_t, seam_valid, kernel_size=32)
 
@@ -486,6 +486,21 @@ def _collect_real_data(H=128) -> dict:
     flat_valid = torch.ones_like(flat_t).bool()
     flat_residual = _residual(flat_t.squeeze(), flat_valid.float().squeeze())
     flat_tin = _tin(flat_t, flat_valid, kernel_size=32)
+
+    # ---- Scene: tile-merge seam (rejected) ------------------------------
+    seam_dtm = _seam_terrain(H, seed=23)
+    seam_t = torch.from_numpy(seam_dtm).unsqueeze(0).unsqueeze(0)
+    seam_valid = torch.ones_like(seam_t).bool()
+
+    # Run your updated adapter function with diagnostics ON
+    seam_res = detect_seam_artifact(
+        ortho_t, seam_t, seam_valid,
+        line_length=35, num_angles=8, return_diagnostics=True
+    )
+    seam_score = seam_res.composite_score
+    seam_heatmap = seam_res.seam_heatmap  # Extract the raw heatmap array
+    seam_cohens_d = seam_res.cohens_d_heatmap
+    seam_endpoints = seam_res.line_endpoints()
 
     # ---- Sun vector OLS on crater ---------------------------------------
     crater_ortho = _lunar_lambert(crater_dtm)
@@ -605,6 +620,13 @@ def _collect_real_data(H=128) -> dict:
         "crater_seam": crater_seam,
         "seam_dtm": seam_dtm,
         "seam_score": seam_score,
+        "seam_heatmap": seam_heatmap,
+        "seam_cohens_d": seam_cohens_d,
+        "seam_endpoints": seam_endpoints,
+        "diag_hot_mask": seam_res.diag_hot_mask,
+        "diag_closed_components": seam_res.diag_closed_components,
+        "diag_hough_lines": seam_res.diag_hough_lines,
+        "diag_isolation_profile": seam_res.diag_isolation_profile,
         "seam_residual": seam_residual,
         "seam_tin": seam_tin,
         "low_cov_dtm": low_cov_dtm,
@@ -661,13 +683,13 @@ def _save_panel(path: Path, arr: np.ndarray, cmap: str = "mako",
         ax.imshow(arr, interpolation="nearest")
     else:
         ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-    ax.set_xticks([]);
+    ax.set_xticks([])
     ax.set_yticks([])
     for sp in ax.spines.values():
         if frame_color is None:
             sp.set_visible(False)
         else:
-            sp.set_color(frame_color);
+            sp.set_color(frame_color)
             sp.set_linewidth(3)
     if extra_draw is not None:
         extra_draw(ax)
@@ -685,7 +707,7 @@ def _save_hist(path: Path, samples: np.ndarray, *,
     ax.set_yticks([])
     ax.tick_params(axis="x", labelsize=7.5)
     for s in ax.spines.values():
-        s.set_color("#999");
+        s.set_color("#999")
         s.set_linewidth(0.6)
     if title:
         ax.set_title(title, fontsize=8.5, pad=4)
@@ -703,13 +725,13 @@ def _save_strip(path: Path, arrays: list[np.ndarray], *,
         axs = [axs]
     for i, (ax, arr) in enumerate(zip(axs, arrays)):
         ax.imshow(arr, cmap=cmap, interpolation="nearest")
-        ax.set_xticks([]);
+        ax.set_xticks([])
         ax.set_yticks([])
         for sp in ax.spines.values():
             if frame_color is None:
                 sp.set_visible(False)
             else:
-                sp.set_color(frame_color);
+                sp.set_color(frame_color)
                 sp.set_linewidth(1.5)
         if labels:
             ax.set_title(labels[i], fontsize=9)
@@ -717,6 +739,32 @@ def _save_strip(path: Path, arrays: list[np.ndarray], *,
     fig.savefig(path, bbox_inches="tight", pad_inches=0.03, dpi=dpi)
     plt.close(fig)
 
+
+def _save_line_plot(path: Path, profile_data: tuple, *,
+                    figsize=(2.4, 2.4), dpi=200, frame_color: str | None = None):
+    """Saves the 1D spatial isolation cross-section as a borderless panel."""
+    t_arr, vals, c_mask, b_mask = profile_data
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    # Leave room for the line but keep it tight
+    ax = fig.add_axes([0.05, 0.05, 0.9, 0.9])
+
+    ax.plot(t_arr, vals, color="#2c3e50", linewidth=1.8)
+    ax.fill_between(t_arr, 0, vals, where=c_mask, color="#e74c3c", alpha=0.4)
+    ax.fill_between(t_arr, 0, vals, where=b_mask, color="#3498db", alpha=0.3)
+
+    ax.set_ylim(bottom=0)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    for sp in ax.spines.values():
+        if frame_color is None:
+            sp.set_visible(False)
+        else:
+            sp.set_color(frame_color)
+            sp.set_linewidth(3)
+
+    fig.savefig(path, bbox_inches="tight", pad_inches=0.02, dpi=dpi)
+    plt.close(fig)
 
 def _save_panels(data: dict, out_dir: Path) -> dict[str, Path]:
     """Render every PNG graphviz will reference, return {key: path} dict."""
@@ -833,6 +881,48 @@ def _save_panels(data: dict, out_dir: Path) -> dict[str, Path]:
     _save_panel(_p("laplacian_gt"), data["gt_laplacian"], cmap="RdBu_r",
                 vmin=-_lvl, vmax=_lvl,
                 frame_color=C["node_loss_pix"])
+
+    # --------------------------------------------------------------
+    # Complex Seam Detection Panels
+    # --------------------------------------------------------------
+    # Use the rocket colormap (dark to bright orange/white) for heatmaps
+    if "seam_heatmap" in data:
+        _save_panel(_p("seam_heatmap"), data["seam_heatmap"], cmap="rocket",
+                    frame_color=C["node_unet"])
+
+    if "seam_cohens_d" in data and data["seam_cohens_d"] is not None:
+        _save_panel(_p("seam_cohens_d"), data["seam_cohens_d"], cmap="mako",
+                    frame_color=C["node_preproc"])
+
+    if "diag_hot_mask" in data and data["diag_hot_mask"] is not None:
+        _save_panel(_p("diag_sparsity"), data["diag_hot_mask"].astype(float),
+                    cmap="Reds", frame_color=C["node_loss_pix"])
+
+    if "diag_closed_components" in data and data["diag_closed_components"] is not None:
+        # Mask out 0 (background) to render CCs over white
+        disp_cc = np.ma.masked_where(data["diag_closed_components"] == 0, data["diag_closed_components"])
+        # Add a white background to the figure via extra_draw or rely on savefig default
+        _save_panel(_p("diag_span"), disp_cc, cmap="tab20", frame_color=C["node_loss_pix"])
+
+    if "diag_hough_lines" in data and data["diag_hough_lines"] is not None:
+        _save_panel(_p("diag_linearity"), data["diag_hough_lines"].astype(float),
+                    cmap="cool", frame_color=C["node_loss_pix"])
+
+    if "diag_isolation_profile" in data and data["diag_isolation_profile"] is not None:
+        _save_line_plot(_p("diag_isolation"), data["diag_isolation_profile"],
+                        frame_color=C["node_loss_pix"])
+
+    if "seam_endpoints" in data:
+        y1, x1, y2, x2 = data["seam_endpoints"]
+
+        def _draw_seam_line(ax):
+            # Draw a bright red line marking the detected seam
+            ax.plot([x1, x2], [y1, y2], color="#ff2a2a", linewidth=3.5, solid_capstyle='round')
+            ax.set_xlim(0, data["seam_dtm"].shape[1])
+            ax.set_ylim(data["seam_dtm"].shape[0], 0)
+
+        _save_panel(_p("seam_hero"), data["seam_dtm"], cmap="mako",
+                    frame_color=C["node_filter"], extra_draw=_draw_seam_line)
 
     # Ordinal: pair scatter overlay on the crater ortho. Green = correct
     # ordering, red = violation. Matches the visualization in the
@@ -1559,13 +1649,15 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
                          C["node_loss_pix"]),
                     ])
 
-        c.edge("decode", "p_photo");
+        c.edge("decode", "p_photo")
         c.edge("decode", "p_grad")
-        c.edge("decode", "p_norm");
+        c.edge("decode", "p_norm")
         c.edge("decode", "p_ffl")
-        c.edge("decode", "p_huber");
+        c.edge("decode", "p_huber")
         c.edge("decode", "p_lap")
         c.edge("decode", "p_ord")
+
+        c.edge("p_norm", "p_photo", label="N_pred")
 
     dot.edge("unet", "decode", xlabel=" vθ + z_t ")
 
@@ -1589,9 +1681,9 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
              fontcolor="white", penwidth="1.6")
 
     dot.edge("l_vel", "l_total", color=C["node_loss_vel"], penwidth="1.4")
-    dot.edge("p_photo", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_grad", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_norm", "l_total", color=C["node_loss_pix"], penwidth="1.3")
+    dot.edge("p_photo", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_ffl", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_huber", "l_total", color=C["node_loss_pix"], penwidth="1.3")
     dot.edge("p_lap", "l_total", color=C["node_loss_pix"], penwidth="1.3")
@@ -1781,6 +1873,174 @@ def build_manifest_filter(data: dict, paths: dict[str, Path],
     dot.render(str(out_base), format="svg", cleanup=True)
 
 
+def build_seam_detector_diagram(data: dict, paths: dict[str, Path],
+                                out_base: Path) -> None:
+    dot = graphviz.Digraph(name="MarsDepthFM_SeamDetection")
+    _apply_base_style(dot, rankdir="TB")
+
+    # =======================================================
+    # STAGE 1: Sharp Gradients & Statistical Shift
+    # =======================================================
+    with dot.subgraph(name="cluster_base") as cb:
+        cb.attr(label="Stage 1: Pixel-Level Signals (Sharp Grad & Cohen's d)",
+                style="solid", color=C["cluster_line"],
+                bgcolor=C["bg_preproc"], fontname="Helvetica-Bold",
+                fontsize="13", fontcolor=C["node_preproc"], labeljust="l")
+
+        _image_node(cb, "s_ortho", paths["reject_seam_ortho"],
+                    title="Ortho (Gray)", header_color=C["node_data"])
+        _image_node(cb, "s_dtm", paths["reject_seam_dtm"],
+                    title="DTM (Rel Relief)", header_color=C["node_data"])
+
+        _text_node(cb, "sharp_grad",
+                   ["_sharp_grad_mag",
+                    "Strict 1D diffs [-1, 1]",
+                    "preserves 1-3 px step edges"],
+                   fill=C["node_preproc"])
+
+        _text_node(cb, "kernels",
+                   ["Oriented Kernels (A=12)",
+                    "line_ker: central ridge",
+                    "left_ker / right_ker: adjacent terrain"],
+                   fill=C["node_preproc"])
+
+        if "seam_cohens_d" in paths:
+            _image_node(cb, "cohens_d", paths["seam_cohens_d"],
+                        title="Cohen's d Heatmap",
+                        header_color=C["node_preproc"],
+                        captions=[("|μ_L - μ_R| / σ_pooled", C["text"])])
+        else:
+            _text_node(cb, "cohens_d",
+                       ["Statistical Shift (Cohen's d)",
+                        "|μ_L - μ_R| / σ_pooled",
+                        "Computed for BOTH Ortho and DTM"],
+                       fill=C["node_preproc"])
+
+        # [FIX] Correcting the routing logic: Both sharp_grad and kernels read from inputs
+        cb.edge("s_ortho", "sharp_grad")
+        cb.edge("s_dtm", "sharp_grad")
+
+        cb.edge("s_ortho", "kernels")
+        cb.edge("s_dtm", "kernels")
+
+        cb.edge("kernels", "cohens_d")
+
+        # Align inputs and operations horizontally to keep the diagram tight
+        cb.body.append("\t{ rank=same; s_ortho; s_dtm; }\n")
+
+    # =======================================================
+    # STAGE 2: Base Heatmap
+    # =======================================================
+    with dot.subgraph(name="cluster_heatmap") as ch:
+        ch.attr(label="Stage 2: Directional Convolution & Base Score",
+                style="solid", color=C["cluster_line"],
+                bgcolor=C["bg_flow"], fontname="Helvetica-Bold",
+                fontsize="13", fontcolor=C["node_unet"], labeljust="l")
+
+        _text_node(ch, "gate",
+                   ["Distribution Gate",
+                    "max(ortho_cohens_d, dtm_cohens_d)",
+                    "clamped to [0.1, 3.0]"],
+                   fill=C["node_unet"])
+
+        _text_node(ch, "combined",
+                   ["Combined Score Map",
+                    "(w_o·Ortho_Grad + w_d·DTM_Grad) × Gate"],
+                   fill=C["node_unet"])
+
+        _image_node(ch, "heatmap", paths["seam_heatmap"],
+                    title="Raw Seam Heatmap",
+                    header_color=C["node_unet"],
+                    captions=[("Argmax over 12 angles", C["text"])])
+
+        ch.edge("gate", "combined")
+        ch.edge("combined", "heatmap")
+
+    # [FIX] Gradients feed the score map; Cohen's D feeds the gate
+    dot.edge("sharp_grad", "combined", color=C["edge"], penwidth="1.4")
+    dot.edge("cohens_d", "gate", color=C["edge"], penwidth="1.4")
+
+    # =======================================================
+    # STAGE 3: Structural Multipliers
+    # =======================================================
+    with dot.subgraph(name="cluster_mults") as cm:
+        cm.attr(label="Stage 3: Structural Multipliers",
+                style="solid", color=C["cluster_line"],
+                bgcolor=C["bg_loss"], fontname="Helvetica-Bold",
+                fontsize="13", fontcolor=C["node_loss_pix"], labeljust="l")
+
+        _image_node(cm, "m_span", paths.get("diag_span", paths["seam_heatmap"]),
+                    title="Span Ratio ∈ [0, 1]",
+                    header_color=C["node_loss_pix"],
+                    captions=[
+                        ("Morphological close & Connected Components", C["text"]),
+                        ("Defeats short, isolated craters", C["text"])
+                    ])
+
+        _image_node(cm, "m_sparse", paths.get("diag_sparsity", paths["seam_heatmap"]),
+                    title="Sparsity Penalty ∈ [0, 1]",
+                    header_color=C["node_loss_pix"],
+                    captions=[
+                        ("exp(-density × 15.0) of Top 40% signal", C["text"]),
+                        ("Defeats repeating textures (dunes)", C["text"])
+                    ])
+
+        _image_node(cm, "m_linear", paths.get("diag_linearity", paths["seam_heatmap"]),
+                    title="Piecewise Linearity ∈ [0, 1]",
+                    header_color=C["node_loss_pix"],
+                    captions=[
+                        ("HoughLinesP on Canny edges", C["text"]),
+                        ("Filters natural chaotic curves", C["text"])
+                    ])
+
+        _image_node(cm, "m_iso", paths.get("diag_isolation", paths["seam_heatmap"]),
+                    title="Spatial Isolation ∈ [0, 1]",
+                    header_color=C["node_loss_pix"],
+                    captions=[
+                        ("Perpendicular cross-section", C["text"]),
+                        ("center_peak / background_mean", C["text"])
+                    ])
+
+        # [FIX] Removed the duplicate line here
+        cm.body.append("\t{ rank=same; m_span; m_sparse; m_linear; m_iso; }\n")
+
+    dot.edge("heatmap", "m_span", color=C["edge"])
+    dot.edge("heatmap", "m_sparse", color=C["edge"])
+    dot.edge("heatmap", "m_linear", color=C["edge"])
+    dot.edge("heatmap", "m_iso", color=C["edge"])
+
+    # =======================================================
+    # OUTPUT: Final Composite Score & Hero Image
+    # =======================================================
+    dot.node("final_score",
+             label="<<FONT FACE='Helvetica-Bold' POINT-SIZE='12' "
+                   "COLOR='#ffffff'>Composite Seam Score</FONT>"
+                   "<BR/><FONT FACE='Helvetica' POINT-SIZE='10' "
+                   "COLOR='#ffffff'>Raw_Score × (0.5 + 0.5×Span) × "
+                   "Sparsity × Linearity × Isolation</FONT>>",
+             shape="hexagon", style="filled",
+             fillcolor=C["node_filter"], color=C["node_filter"],
+             fontcolor="white", penwidth="1.6")
+
+    dot.edge("m_span", "final_score", color=C["node_loss_pix"])
+    dot.edge("m_sparse", "final_score", color=C["node_loss_pix"])
+    dot.edge("m_linear", "final_score", color=C["node_loss_pix"])
+    dot.edge("m_iso", "final_score", color=C["node_loss_pix"])
+
+    # [NEW] The Hero Node to tie it all together visually
+    if "seam_hero" in paths:
+        _image_node(dot, "hero_output", paths["seam_hero"],
+                    title="Final Detected Seam Target",
+                    header_color=C["node_filter"],
+                    img_width="2.6",
+                    captions=[("Pipeline accurately isolates structural seams", C["text"])])
+
+        dot.edge("final_score", "hero_output", color=C["edge"], penwidth="1.8")
+
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    dot.render(str(out_base), format="pdf", cleanup=True)
+    dot.render(str(out_base), format="svg", cleanup=True)
+
 # ===========================================================================
 # MAIN
 # ===========================================================================
@@ -1814,6 +2074,8 @@ def main(out_dir: str | Path = "outputs/figures") -> None:
     build_flow_and_losses(data, paths, out_dir / "flow_and_losses")
     print("  manifest_filter")
     build_manifest_filter(data, paths, out_dir / "manifest_filter")
+    print("  seam_detection_pipeline")
+    build_seam_detector_diagram(data, paths, out_dir / "seam_detection_pipeline")
 
     print("\nOutput files:")
     for name in ("pipeline_overview", "flow_and_losses", "manifest_filter"):

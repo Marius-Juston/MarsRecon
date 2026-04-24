@@ -11,6 +11,7 @@ Auxiliary losses (all operate in pixel space on the predicted clean depth):
 """
 
 import logging
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +361,7 @@ class PhotoclinometricLoss(nn.Module):
         return loss
 
     @staticmethod
+    @lru_cache
     def _gaussian_kernel(size: int, sigma: float, device, dtype=None) -> torch.Tensor:
         coords = torch.arange(size, dtype=torch.float32, device=device) - size // 2
         g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
@@ -803,18 +805,36 @@ class OrdinalRankingLoss(nn.Module):
             N: int,
             device: torch.device,
             generator: torch.Generator | None = None,
+            confidence: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample (idx_i, idx_j) flat indices, each shape (B, num_pairs).
 
         Deterministic if a generator is provided — used by viz for
         reproducible figures.
         """
-        if generator is not None:
-            idx = torch.randint(
-                N, (B, self.num_pairs * 2), device=device, generator=generator
+        if confidence is not None:
+            # Flatten to (B, N) and ensure non-negative weights
+            weights = torch.clamp(confidence.reshape(B, N).float(), min=0.0)
+
+            # Add a tiny epsilon. If a batch element has completely zero confidence,
+            # this prevents a multinomial crash by falling back to uniform sampling.
+            # The invalid pairs will still be safely ignored in pair_stats.
+            weights = weights + 1e-8
+
+            idx = torch.multinomial(
+                weights,
+                self.num_pairs * 2,
+                replacement=True,
+                generator=generator
             )
         else:
-            idx = torch.randint(N, (B, self.num_pairs * 2), device=device)
+            if generator is not None:
+                idx = torch.randint(
+                    N, (B, self.num_pairs * 2), device=device, generator=generator
+                )
+            else:
+                idx = torch.randint(N, (B, self.num_pairs * 2), device=device)
+
         return idx[:, : self.num_pairs], idx[:, self.num_pairs:]
 
     def pair_stats(
@@ -854,6 +874,8 @@ class OrdinalRankingLoss(nn.Module):
 
         ordered = gt_diff.abs() > self.margin
 
+        # We keep this check even with multinomial sampling to catch
+        # the 1e-8 epsilon fallback edge-case where a batch is totally unconfident.
         if confidence is not None:
             conf_flat = confidence.reshape(B, -1).float()
             c_i = conf_flat.gather(1, idx_i)
@@ -880,7 +902,9 @@ class OrdinalRankingLoss(nn.Module):
     ) -> torch.Tensor:
         B = pred.shape[0]
         N = pred.shape[-2] * pred.shape[-1]
-        idx_i, idx_j = self.sample_pairs(B, N, pred.device)
+
+        # Pass confidence explicitly to drive the sampling distribution
+        idx_i, idx_j = self.sample_pairs(B, N, pred.device, confidence=confidence)
         stats = self.pair_stats(pred, gt, idx_i, idx_j, confidence)
 
         n_ordered = stats["ordered"].float().sum()
