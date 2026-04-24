@@ -16,7 +16,6 @@ import sys
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 if __package__ is None or __package__ == "":  # pragma: no cover - direct script execution
@@ -38,16 +37,32 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-def _ranks_from_similarity(similarity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return 1-indexed target ranks for rows and columns."""
+def _ranks_from_similarity(similarity: torch.Tensor, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return 1-indexed positive ranks for rows and columns.
+
+    Positive matches are defined by identical text strings, so duplicate
+    rationales are treated as additional valid retrieval targets.
+    """
     n = similarity.shape[0]
-    target = torch.arange(n, device=similarity.device)
+    text_ids = {text: idx for idx, text in enumerate(sorted(set(texts)))}
+    encoded = torch.tensor([text_ids[text] for text in texts], device=similarity.device)
+    positive_mask = encoded.unsqueeze(1) == encoded.unsqueeze(0)  # (n, n)
 
     row_order = torch.argsort(similarity, dim=1, descending=True)
-    row_rank = (row_order == target.unsqueeze(1)).nonzero(as_tuple=False)[:, 1] + 1
+    row_positive = torch.gather(
+        positive_mask,
+        dim=1,
+        index=row_order,
+    )
+    row_rank = row_positive.to(torch.int64).argmax(dim=1) + 1
 
     col_order = torch.argsort(similarity, dim=0, descending=True)
-    col_rank = (col_order == target.unsqueeze(0)).nonzero(as_tuple=False)[:, 0] + 1
+    col_positive = torch.gather(
+        positive_mask,
+        dim=0,
+        index=col_order,
+    )
+    col_rank = col_positive.to(torch.int64).argmax(dim=0) + 1
 
     return row_rank, col_rank
 
@@ -154,6 +169,8 @@ def main() -> None:
         patch_size_px=args.patch_size_px,
         freeze=True,
     ).to(device)
+    if checkpoint.get("mae_encoder_state") is not None:
+        mae_encoder.load_state_dict(checkpoint["mae_encoder_state"], strict=False)
     mae_encoder.eval()
 
     text_encoder = T5Encoder(
@@ -179,10 +196,11 @@ def main() -> None:
     )
 
     similarity = image_emb @ text_emb.T
-    img_to_txt_rank, txt_to_img_rank = _ranks_from_similarity(similarity)
+    img_to_txt_rank, txt_to_img_rank = _ranks_from_similarity(similarity, text_rows)
 
     metrics = {
         "num_samples": int(similarity.shape[0]),
+        "num_unique_texts": int(len(set(text_rows))),
         "image_to_text_r1": _recall_at_k(img_to_txt_rank, 1),
         "image_to_text_r5": _recall_at_k(img_to_txt_rank, 5),
         "image_to_text_r10": _recall_at_k(img_to_txt_rank, 10),

@@ -15,7 +15,7 @@ fi
 ALIGN_CHECKPOINT="$1"
 shift
 
-python "src/stage2/evaluate_text_mae_alignment.py" \
+uv run python "src/stage2/evaluate_text_mae_alignment.py" \
   --alignment-checkpoint "${ALIGN_CHECKPOINT}" \
   --root "/scratch/mars_hirise" \
   --bbox -136 12 -124 24 \

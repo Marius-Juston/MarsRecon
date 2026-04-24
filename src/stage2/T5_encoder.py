@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 try:
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoConfig, AutoModel, AutoTokenizer, T5EncoderModel
 except ImportError as exc:  # pragma: no cover - optional runtime dependency
     raise ImportError(
         "transformers is required for stage2 text alignment. "
@@ -28,7 +28,12 @@ class T5Encoder(nn.Module):
         super().__init__()
         self.max_length = int(max_length)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name)
+        if getattr(config, "model_type", "") == "t5":
+            # T5 is encoder-decoder; for embedding use we only need encoder states.
+            self.model = T5EncoderModel.from_pretrained(model_name)
+        else:
+            self.model = AutoModel.from_pretrained(model_name)
         for parameter in self.model.parameters():
             parameter.requires_grad = bool(trainable)
 

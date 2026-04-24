@@ -15,7 +15,7 @@ fi
 MAE_CHECKPOINT="$1"
 shift
 
-python "src/stage2/align_text_mae_embeddings.py" \
+uv run python "src/stage2/align_text_mae_embeddings.py" \
   --mae-checkpoint "${MAE_CHECKPOINT}" \
   --root "/scratch/mars_hirise" \
   --bbox -136 12 -124 24 \
