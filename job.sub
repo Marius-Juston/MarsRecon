@@ -1,0 +1,28 @@
+##########
+
+# Simple HTCondor submit description file
+
+##########
+
+Executable       = NONE
+Log              = condor.log
+Output           = condor.stdout
+Error            = condor.stderr
+
+#
+#requirements = (CUDADeviceName != "Tesla K40m")
+getenv = True
+stream_output = true
+stream_error = true
+remote_initialdir = $ENV(PWD)
+
+requirements =  (Machine == "vision-c23.cs.illinois.edu")
+# GPU
+Request_gpus = 1
+
+# CPU
+Request_cpus = 8
+request_memory = 48 GB
+
+# QUE
+Queue
