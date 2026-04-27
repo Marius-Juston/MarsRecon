@@ -1,6 +1,6 @@
 # CODEX Handoff: MarsRecon Stage A + Stage B
 
-Last updated: 2026-04-26 (America/Chicago)
+Last updated: 2026-04-27 (America/Chicago)
 
 This file is a practical handoff for the active workflows in the repo. The
 two stages currently live on different branches:
@@ -569,6 +569,149 @@ geo_context choice. Add `--no-use-ema` to evaluate live (non-EMA) weights,
 or `--geo-context-override <choice>` to evaluate against a different
 feature mix than was trained on (rare, only for ablation).
 
+### First B1a-geo run (v1) results — `latlon_view_scale` MLP geo head
+
+Run `olympus-marsclip-b1a-geo-latlon-view-scale-v1`, completed on the full
+12,285-patch holdout splits with EMA weights:
+
+- val full (`n=12285`): `image_to_text_r10=0.3516`, `text_to_image_r10=0.9125`,
+  `image_to_geo_r10=0.00114`, `geo_to_image_r10=0.00195`.
+- test full (`n=12285`): `image_to_text_r10=0.3410`, `text_to_image_r10=0.9289`,
+  `image_to_geo_r10=0.00122`, `geo_to_image_r10=0.00187`.
+
+Random baseline for 1-to-1 diagonal-positive retrieval at `n=12285, k=10`
+is `10/12285 ≈ 0.000814`. Geo retrieval is therefore at chance, while
+text retrieval is strong (and bottlenecked by 244 unique rationales).
+
+Diagnosis (supported by literature, see references below):
+
+1. **MLP spectral bias.** A 2-layer MLP fed raw lat/lon (or a single fixed
+   sin/cos pair) cannot represent the high-frequency lat/lon → image
+   mapping at ~0.005° patch resolution. This is exactly the phenomenon
+   GeoCLIP and SatCLIP cite when motivating positional encoders for
+   coordinate inputs.
+2. **Auxiliary feature pollution.** `viewing_features` and
+   `scale_features` are largely shared across patches in the same source
+   product (HiRISE observation has 412 unique observations vs. 81,899
+   unique patches), so they don't help separate per-patch geometry but
+   do dilute the contrastive signal.
+3. **Shared logit scale.** A single `logit_scale` is wrong when the two
+   tasks have very different effective class counts (244-class with
+   FN-mask for text vs. 256-way unique-pair for geo); both branches
+   should learn their own temperature.
+4. **No geo-only warmup.** Trained jointly from epoch 1, the
+   already-saturated text branch crowds out the geo head before it can
+   develop useful structure.
+
+### Literature references for B1a-geo+
+
+These are the published recipes we now mirror (all MIT-licensed PyTorch):
+
+- **SatCLIP** — Klemmer, Rolf, Robinson, Mackey, Rußwurm. "SatCLIP:
+  Global, General-Purpose Location Embeddings with Satellite Imagery."
+  AAAI 2025. arXiv:2311.17179. Repo:
+  <https://github.com/microsoft/satclip>. Image↔location contrastive on
+  Sentinel-2 with `Siren(SphericalHarmonics)` location encoder.
+- **GeoCLIP** — Vivanco Cepeda, Nayak, Shah. "GeoCLIP: CLIP-Inspired
+  Alignment between Locations and Images for Effective Worldwide
+  Geo-localization." NeurIPS 2023. arXiv:2309.16020. Repo:
+  <https://github.com/VicenteVivan/geo-clip>. Image↔GPS contrastive with
+  hierarchical Random Fourier Features (multiple Gaussian σ) → MLP.
+- **Russwurm et al.** — "Geographic Location Encoding with Spherical
+  Harmonics and Sinusoidal Representation Networks." ICLR 2024.
+  arXiv:2310.06743. Repo: <https://github.com/MarcCoru/locationencoder>.
+  Origin of the SIREN-on-coordinates recipe used by both SatCLIP and
+  this codebase.
+- **Sitzmann et al.** — "Implicit Neural Representations with Periodic
+  Activation Functions." NeurIPS 2020. arXiv:2006.09661. The original
+  SIREN paper; provides the periodic-activation init we vendor.
+- **Tancik et al.** — "Fourier Features Let Networks Learn High Frequency
+  Functions in Low Dimensional Domains." NeurIPS 2020. arXiv:2006.10739.
+  Theoretical and empirical case for RFF on low-dim coordinate inputs;
+  cited by GeoCLIP for the same reason.
+- **CSP** — Mai, Lao, He, Song, Ermon. "CSP: Self-Supervised Contrastive
+  Spatial Pre-Training for Geospatial-Visual Representations." ICML
+  2023. arXiv:2305.01118. Repo: <https://github.com/gengchenmai/csp>.
+  Dual-encoder image↔location contrastive learning with grid cell
+  location encoder.
+
+The recipes adopted into `src/stage_b/geo_encoders.py` are: `SirenNet`
+(Sitzmann/Russwurm), `HierarchicalRFF` (GeoCLIP capsules), and
+`SphericalHarmonics` (SatCLIP/Russwurm), composed via a small
+`LocationEncoder` umbrella (`PE → head`, optional aux concat). At the
+12°×32° Olympus bbox, spherical harmonics are overkill, so the default
+recipe is `Siren(HierarchicalRFF)` à la GeoCLIP, with `Siren(SH)`
+available behind `--geo-encoder-type sh_siren` for completeness.
+
+### Canonical Stage B1a-geo+ invocation (positional-encoded geo head)
+
+The "B1a-geo+" recipe replaces the MLP-on-cyclic-features head with a
+`Siren(HierarchicalRFF)` location encoder fed raw `(lat_deg, lon_deg)`,
+and decouples the geo and text branches:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src .venv/bin/python -m stage_b.align_marsclip \
+  --mae-checkpoint "/scratch/marsrecon_runs/stage_a/satmae/20260421/20260421_012519_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v3-softweight-exp2-graypreview-v1/checkpoints/best_checkpoint.pt" \
+  --root "/scratch/mars_hirise" \
+  --bbox -136 12 -124 24 \
+  --patch-size-deg 0.005 --image-size 256 --patch-size-px 8 \
+  --patch-records-path "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_patch_records.pkl" \
+  --split-manifest "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_splits.csv" \
+  --batch-size 256 --val-batch-size 256 \
+  --epochs 60 --warmup-epochs 3 --learning-rate 5e-5 --min-lr 1e-7 \
+  --embed-dim 256 \
+  --projector-type mlp --projector-hidden-dim 768 --projector-depth 2 \
+  --image-pool cls --false-negative-mask --label-smoothing 0.05 \
+  --balanced-sampler --ema-decay 0.999 \
+  --geo-context coords_only \
+  --geo-encoder-type rff_siren \
+  --geo-rff-sigmas 1.0 4.0 16.0 64.0 --geo-rff-encoded-size 128 \
+  --geo-hidden-dim 256 --geo-depth 2 \
+  --geo-siren-w0 1.0 --geo-siren-w0-initial 30.0 \
+  --geo-temperature-init 0.07 --text-temperature-init 0.07 \
+  --geo-logit-scale-max 100.0 --logit-scale-max 100.0 \
+  --geo-warmup-epochs 3 \
+  --geo-loss-weight 1.0 --text-loss-weight 1.0 \
+  --cache-image-embeddings --image-cache-batch-size 64 \
+  --cache-text-embeddings \
+  --val-max-patches 4096 --val-every 1 \
+  --num-workers 8 --pin-memory --prefetch-factor 4 --persistent-workers \
+  --use-amp --amp-dtype bf16 --grad-clip-norm 1.0 \
+  --checkpoint-every 5 --progress-log-interval 10 \
+  --out-root "/scratch/marsrecon_runs/stage_b/marsclip_align" \
+  --wandb-mode online --wandb-project MarsRecon --wandb-entity akshayn3-auvsl \
+  --run-name "olympus-marsclip-b1a-geo-plus-rff-siren-coords-only-v1" \
+  --wandb-run-name "olympus-marsclip-b1a-geo-plus-rff-siren-coords-only-v1"
+```
+
+Notes on the new CLI surface:
+
+- `--geo-context coords_only` makes the dataset emit raw
+  `(lat_deg, lon_deg)` as the first two columns of `geo_input`. Use
+  `coords_view` to also append the 13-d viewing features as auxiliary
+  inputs (concatenated post-PE), and `coords_view_scale` to additionally
+  append the 8-d scale features.
+- `--geo-encoder-type rff_siren` is the GeoCLIP-style default;
+  `sh_siren` swaps in spherical-harmonic positional encoding (SatCLIP /
+  Russwurm); `mlp` is the back-compat path used by the v1 run.
+- `--geo-rff-sigmas` controls the Gaussian RFF frequency hierarchy.
+  `(1, 4, 16, 64)` cycles per degree spans roughly the bbox-scale
+  variation down to the 0.005° patch scale.
+- `--geo-temperature-init` and `--geo-logit-scale-max` give the geo
+  branch its own temperature parameter; the text branch keeps its own
+  via `--text-temperature-init` / `--logit-scale-max`.
+- `--geo-warmup-epochs N` opens with `text_loss_weight = 0` for the
+  first N epochs so the geo head can develop without the (already
+  saturated) text branch dominating gradients.
+- `--geo-encoder-type rff_*` / `sh_*` requires a `coords_*` geo context;
+  the trainer rejects the inconsistent combination.
+
+The evaluator (`stage_b.evaluate_marsclip`) reconstructs all of the
+above from the saved `aligner_config` automatically; no extra flags are
+needed beyond the standard `--alignment-checkpoint`,
+`--patch-records-path`, `--split-manifest`, `--holdout-split`,
+`--max-patches`.
+
 ## Roadmap
 
 The text-only aligner with B0+ knobs (Run A, `sm7ud0n9`) is the current
@@ -716,16 +859,39 @@ Stage B (lives on the `jay` branch):
   - Imports B0+ helpers (caches, EMA, balanced sampler, mask-aware label
     smoothing, scratch-run layout, W&B, graceful shutdown) so the two
     trainers stay in lockstep.
-  - Adds a `GeoEncoder` (LayerNorm + MLP) over per-patch
-    geo / scale / viewing features, and a combined loss
+  - Geo head can be either a plain `GeoEncoder` (LayerNorm + MLP over
+    cyclic `latlon_*` features) or a published `LocationEncoder`
+    (positional encoder + head) selected via `--geo-encoder-type`:
+    `mlp`, `rff_mlp`, `rff_siren` (GeoCLIP-style), `sh_mlp`, or
+    `sh_siren` (SatCLIP / Rußwurm-style). New `coords_only` /
+    `coords_view` / `coords_view_scale` geo contexts feed raw
+    `(lat_deg, lon_deg)` plus optional auxiliary features.
+  - Combined loss
     `L = w_text * InfoNCE(image, text) + w_geo * InfoNCE(image, geo)`
-    with the same false-negative mask + label smoothing as B0+.
+    with separate learnable temperatures (`logit_scale` for text,
+    `geo_logit_scale` for geo), each independently clamped. The geo
+    InfoNCE term intentionally has no false-negative mask because
+    image↔geo is a 1-to-1 task (each patch has a unique centroid).
+  - `--geo-warmup-epochs` opens the run with `text_loss_weight = 0` so
+    the geo branch can develop before the saturated text branch
+    dominates gradients.
   - Validation adds image↔geo retrieval (1-to-1 diagonal-positive)
     alongside the existing image↔text metrics.
+- `src/stage_b/geo_encoders.py`
+  - Vendored, dependency-light implementations of `Sine`, `Siren`,
+    `SirenNet` (Sitzmann et al. 2020 / Rußwurm et al. 2024),
+    `GaussianRFF` and `HierarchicalRFF` (Tancik et al. 2020 /
+    GeoCLIP), `SphericalHarmonics` (analytic real SH, SatCLIP /
+    Rußwurm et al.), and an `MLPHead`. A `LocationEncoder` umbrella
+    composes a positional encoder with a head and optionally
+    concatenates auxiliary features post-PE; `build_location_encoder`
+    is the factory used by the trainer's CLI.
 - `src/stage_b/evaluate_marsclip.py`
-  - Held-out retrieval evaluator for B1a-geo checkpoints; reconstructs
-    the full image/text/geo aligner from `aligner_config` and reports
-    image↔text and image↔geo metrics, with `--use-ema` and
-    `--geo-context-override` flags.
+  - Held-out retrieval evaluator for B1a-geo / B1a-geo+ checkpoints;
+    reconstructs the full image/text/geo aligner (including
+    `geo_encoder_type`, RFF/SH/SIREN hyperparameters, and per-branch
+    temperatures) from `aligner_config` and reports image↔text and
+    image↔geo metrics, with `--use-ema` and `--geo-context-override`
+    flags.
 - `src/stage_b/T5_encoder.py`
   - HF/T5 local cache fallback
