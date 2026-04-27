@@ -496,25 +496,112 @@ analysis, add `--export-embeddings --embeddings-out path/to/embeddings.pt`.
 
 ## Roadmap
 
-The current text-only aligner is **Stage B0**. The next milestone is
-**Stage B1a** with:
+The text-only aligner with B0+ knobs (Run A, `sm7ud0n9`) is the current
+baseline of record. The next milestone is **Stage B1a**, defined as
+paired local/global crops centered on the same patch, shared frozen Stage
+A visual backbone for both views, text + location-context targets,
+geometry / viewing features included from the start, CACo-style
+local/global consistency loss, and validation metrics for image↔text,
+text↔image, and local↔global.
 
-- paired local/global crops centered on the same patch
-- shared frozen Stage A visual backbone for both views
-- text + location-context targets
-- geometry / viewing features included from the start
-- CACo-style local/global consistency loss
-- validation metrics for image↔text, text↔image, and local↔global
+### B1a phasing (committed plan)
 
-Existing pieces that B1a should reuse:
+We deliberately reorder the B1a roadmap by expected information gain per
+unit of work, not by code coupling:
 
-- `src/clip/marsclip_patches.py` already emits location and `viewing_features`.
-- The older `src/clip/marsclip_model.py` has a geo-context tower scaffold.
-- The Stage B0 trainer now provides reusable infrastructure: W&B,
-  split-aware train/val, checkpoint selection by validation metric,
-  scratch run layout, image/text caches, and graceful shutdown.
+#### Phase 1 — `B1a-geo`: image+geo loss
 
-Do not over-optimize the text-only B0 path as if it were the final Stage B.
+Smallest delta with the largest expected new signal. `marsclip_patches.py`
+already emits per-patch location and `viewing_features`, so this is a
+plumbing change, not a dataset change.
+
+- New module `GeoEncoder`: MLP over
+  `[sin(lat), cos(lat), sin(lon), cos(lon), viewing_features]` →
+  `embed_dim`, then through a (separate or shared) projector.
+- Frozen image/geo feature cache: extend the existing image cache so each
+  sample also stores the geo feature tensor. The geo encoder runs at train
+  time (it is tiny); only its inputs are cached.
+- Loss:
+  `total = w_text · L_text + w_geo · L_geo`,
+  where `L_geo` is symmetric InfoNCE between projected image and projected
+  geo embeddings, with the same false-negative mask + mask-aware label
+  smoothing as B0+ InfoNCE.
+- New CLI flags (in the new trainer): `--geo-context {none,latlon_view}`,
+  `--geo-loss-weight 1.0`, `--geo-projector-share {separate,shared}`.
+- New eval: image↔geo retrieval metrics; image↔text metrics stay
+  apples-to-apples with Run A.
+- Success criterion: full-val image↔text MRR ≥ Run A's 0.357 / 0.659 (no
+  regression on the existing target) **and** non-trivial image↔geo MRR
+  (well above chance for a 12,285-patch held-out split).
+- Failure criterion: image↔text degrades materially. If so, the geo loss is
+  fighting text rather than complementing it; tune `w_geo` or share less of
+  the projector before declaring the architecture wrong.
+
+#### Phase 2 — `B1a-pairs`: paired local/global views + consistency loss
+
+Adds the second view and the CACo-style consistency loss on top of
+B1a-geo. We sequence it after geo because:
+
+- The cache machinery is fragile to schema changes; we'd rather change it
+  once with both new things in mind.
+- A local view that is just an inner sub-crop of the same 256-px patch sees
+  almost the same content as the global view, so its consistency signal is
+  weak compared to geo's genuinely new modality.
+
+Plan:
+
+- Each cached sample stores two image feature vectors:
+  `global = MAE(patch_256)` and
+  `local = MAE(resize_256(crop_inner_128(patch_256)))`. Image-space,
+  deterministic, fully cache-friendly.
+- One shared image projector applied to both views.
+- Loss term `L_lg` = symmetric InfoNCE between projected local and global
+  embeddings, with the same FN-mask logic.
+- Validation adds local↔global retrieval metrics.
+- New CLI: `--paired-views {none,local_global}`, `--local-crop-fraction
+  0.5`, `--lg-loss-weight 0.5`.
+
+#### Phase 3 — `B1a-full`: balance all three loss terms
+
+- Small sweep over `(w_text, w_geo, w_lg)` (3–9 runs).
+- The "B1a run of record" is the best of those by `val/alignment_score`,
+  reported with full val + full test eval JSONs in the same form as
+  Run A's records.
+
+### Explicitly deferred
+
+- **Trainable T5 or trainable MAE** — both break the cache and cost ~100×
+  more compute. Only revisit when B1a is the bottleneck.
+- **Augmentations** (random crop / flip / jitter) — same reason: caching
+  wins by a huge margin on this dataset size.
+- **Re-running prototype loss** as a primary path. If revisited, only as a
+  single-variable ablation (e.g. prototype + CLS pooling, or InfoNCE +
+  `cls_plus_mean` pooling) so failures attribute cleanly.
+- **Expanding the dataset** beyond Olympus. Worth flagging for after
+  Phase 3: 244 unique rationales over 81,899 patches in a single bbox is
+  closer to a data ceiling than a model ceiling, but doing it before B1a
+  would orphan Run A as a comparison point.
+
+### File layout decision
+
+The new trainer for Phases 1–3 lives at `src/stage_b/align_marsclip.py`
+(no stage label in the filename). It imports helpers from
+`src/stage_b/align_text_mae_embeddings.py` rather than duplicating them.
+The B0+ trainer (`align_text_mae_embeddings.py`) is frozen as the
+text-only baseline harness and used to regenerate Run A on demand.
+
+Existing pieces that B1a reuses:
+
+- `src/clip/marsclip_patches.py` already emits location and
+  `viewing_features`.
+- The older `src/clip/marsclip_model.py` has a geo-context tower scaffold
+  that will inform `GeoEncoder` even if it is not directly imported.
+- The B0 trainer's reusable infrastructure: W&B logging, split-aware
+  train/val, checkpoint selection by validation metric, scratch run
+  layout, image/text caches, and graceful shutdown.
+
+Do not over-optimize the text-only B0 path as if it were the final
+Stage B.
 
 ## Repo changes worth preserving
 
