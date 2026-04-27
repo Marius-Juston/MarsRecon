@@ -494,6 +494,81 @@ Run with `--max-patches 0` (or omit) and the larger holdout to get the full
 val readout once the run completes. To get embeddings out for downstream
 analysis, add `--export-embeddings --embeddings-out path/to/embeddings.pt`.
 
+### Canonical Stage B1a-geo invocations
+
+The B1a-geo trainer lives in `src/stage_b/align_marsclip.py`. It reuses
+every B0+ stability rail (cached features, EMA, balanced sampler,
+mask-aware label smoothing, scratch-run layout, W&B logging, graceful
+shutdown) by importing helpers from `align_text_mae_embeddings.py`, and
+adds a `GeoEncoder` head plus a combined loss
+`L = w_text * InfoNCE(image, text) + w_geo * InfoNCE(image, geo)`.
+
+Train a fresh B1a-geo run starting from Run A's recipe:
+
+```bash
+.venv/bin/python src/stage_b/align_marsclip.py \
+  --mae-checkpoint "/scratch/marsrecon_runs/stage_a/satmae/20260421/20260421_012519_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v3-softweight-exp2-graypreview-v1/checkpoints/best_checkpoint.pt" \
+  --root "/scratch/mars_hirise" \
+  --bbox -136 12 -124 24 \
+  --patch-size-deg 0.005 --image-size 256 --patch-size-px 8 \
+  --patch-records-path "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_patch_records.pkl" \
+  --split-manifest "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_splits.csv" \
+  --batch-size 256 --val-batch-size 256 \
+  --epochs 60 --warmup-epochs 3 --learning-rate 5e-5 --min-lr 1e-7 \
+  --embed-dim 256 \
+  --projector-type mlp --projector-hidden-dim 768 --projector-depth 2 \
+  --image-pool cls --false-negative-mask --label-smoothing 0.05 \
+  --balanced-sampler --ema-decay 0.999 \
+  --geo-context latlon_view_scale --geo-hidden-dim 256 --geo-depth 2 \
+  --geo-loss-weight 1.0 --text-loss-weight 1.0 \
+  --cache-image-embeddings --image-cache-batch-size 64 \
+  --cache-text-embeddings \
+  --val-max-patches 4096 --val-every 1 \
+  --num-workers 8 --pin-memory --prefetch-factor 4 --persistent-workers \
+  --use-amp --amp-dtype bf16 --grad-clip-norm 1.0 --logit-scale-max 100.0 \
+  --checkpoint-every 5 --progress-log-interval 10 \
+  --out-root "/scratch/marsrecon_runs/stage_b/marsclip_align" \
+  --wandb-mode online --wandb-project MarsRecon --wandb-entity akshayn3-auvsl \
+  --run-name "olympus-marsclip-b1a-geo-latlon-view-scale-v1" \
+  --wandb-run-name "olympus-marsclip-b1a-geo-latlon-view-scale-v1"
+```
+
+Notes:
+
+- `--geo-context` selects the raw feature concat fed to the GeoEncoder:
+  - `none` disables the geo head (and requires `--geo-loss-weight 0`); use
+    this for a B0+-equivalent regression test.
+  - `latlon_view` = 8-d geo features + 13-d viewing features (21-d input).
+  - `latlon_view_scale` = 8-d geo + 8-d patch-scale + 13-d viewing (29-d).
+- `--geo-loss-weight` and `--text-loss-weight` control the relative weight
+  of each contrastive term. Start at `1.0 / 1.0`, then sweep if needed.
+- The trainer requires `--cache-image-embeddings --freeze-mae` in B1a-geo
+  Phase 1; uncached/unfrozen training is intentionally rejected so the
+  cache schema and SatMAE backbone behave like the rest of the harness.
+
+Evaluate a B1a-geo checkpoint on a held-out split:
+
+```bash
+.venv/bin/python src/stage_b/evaluate_marsclip.py \
+  --alignment-checkpoint "/scratch/marsrecon_runs/stage_b/marsclip_align/<date>/<run-dir>/checkpoints/best_checkpoint.pt" \
+  --root "/scratch/mars_hirise" \
+  --bbox -136 12 -124 24 \
+  --patch-size-deg 0.005 --image-size 256 --patch-size-px 8 \
+  --patch-records-path "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_patch_records.pkl" \
+  --split-manifest "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_splits.csv" \
+  --holdout-split val \
+  --max-patches 4096 \
+  --batch-size 256 --num-workers 8 --pin-memory --prefetch-factor 4 \
+  --output-json /tmp/marsclip_eval_val.json
+```
+
+The evaluator reconstructs the aligner (image + text + geo heads) from
+`aligner_config` saved in the checkpoint, so the same script works for
+every B1a-geo run regardless of projector kind, hidden width, or
+geo_context choice. Add `--no-use-ema` to evaluate live (non-EMA) weights,
+or `--geo-context-override <choice>` to evaluate against a different
+feature mix than was trained on (rare, only for ablation).
+
 ## Roadmap
 
 The text-only aligner with B0+ knobs (Run A, `sm7ud0n9`) is the current
@@ -636,5 +711,21 @@ Stage B (lives on the `jay` branch):
   - optional embeddings export
   - reconstructs MLP / image-pool / EMA architectures from checkpoint
     metadata; `--use-ema/--no-use-ema` toggles EMA-vs-live weights.
+- `src/stage_b/align_marsclip.py`
+  - B1a-geo trainer: image / text / geo-context contrastive aligner.
+  - Imports B0+ helpers (caches, EMA, balanced sampler, mask-aware label
+    smoothing, scratch-run layout, W&B, graceful shutdown) so the two
+    trainers stay in lockstep.
+  - Adds a `GeoEncoder` (LayerNorm + MLP) over per-patch
+    geo / scale / viewing features, and a combined loss
+    `L = w_text * InfoNCE(image, text) + w_geo * InfoNCE(image, geo)`
+    with the same false-negative mask + label smoothing as B0+.
+  - Validation adds image↔geo retrieval (1-to-1 diagonal-positive)
+    alongside the existing image↔text metrics.
+- `src/stage_b/evaluate_marsclip.py`
+  - Held-out retrieval evaluator for B1a-geo checkpoints; reconstructs
+    the full image/text/geo aligner from `aligner_config` and reports
+    image↔text and image↔geo metrics, with `--use-ema` and
+    `--geo-context-override` flags.
 - `src/stage_b/T5_encoder.py`
   - HF/T5 local cache fallback
