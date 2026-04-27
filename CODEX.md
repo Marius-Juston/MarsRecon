@@ -693,7 +693,8 @@ Notes on the new CLI surface:
   append the 8-d scale features.
 - `--geo-encoder-type rff_siren` is the GeoCLIP-style default;
   `sh_siren` swaps in spherical-harmonic positional encoding (SatCLIP /
-  Russwurm); `mlp` is the back-compat path used by the v1 run.
+  Russwurm); `rff_mlp` and `sh_linear` are MLP-headed counterparts;
+  `mlp` is the back-compat path used by the v1 run.
 - `--geo-rff-sigmas` controls the Gaussian RFF frequency hierarchy.
   `(1, 4, 16, 64)` cycles per degree spans roughly the bbox-scale
   variation down to the 0.005° patch scale.
@@ -862,7 +863,7 @@ Stage B (lives on the `jay` branch):
   - Geo head can be either a plain `GeoEncoder` (LayerNorm + MLP over
     cyclic `latlon_*` features) or a published `LocationEncoder`
     (positional encoder + head) selected via `--geo-encoder-type`:
-    `mlp`, `rff_mlp`, `rff_siren` (GeoCLIP-style), `sh_mlp`, or
+    `mlp`, `rff_mlp`, `rff_siren` (GeoCLIP-style), `sh_linear`, or
     `sh_siren` (SatCLIP / Rußwurm-style). New `coords_only` /
     `coords_view` / `coords_view_scale` geo contexts feed raw
     `(lat_deg, lon_deg)` plus optional auxiliary features.
