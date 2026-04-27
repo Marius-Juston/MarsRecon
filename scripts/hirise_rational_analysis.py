@@ -33,6 +33,7 @@ import matplotlib as mpl
 from matplotlib.colors import LinearSegmentedColormap
 from wordcloud import WordCloud
 import logging
+import seaborn as sns
 
 
 logger = logging.getLogger(__name__)
@@ -528,14 +529,28 @@ def _theme_palette(df: pd.DataFrame):
     themes = counts.index.tolist()
     
     n_themes = len(themes)
-    # Get the smooth turbo colors you like
-    smooth_palette = plt.get_cmap("turbo")(np.linspace(0.05, 0.95, n_themes))
     
-    # Shuffle them using a coprime stride to maximize contrast between adjacent ranks
-    stride = next((p for p in [5, 7, 11, 13, 17] if n_themes % p != 0), 3)
-    shuffled_palette = [smooth_palette[(i * stride) % n_themes] for i in range(n_themes)]
+    # Strategy: Vibrant & Pastel
+    # Prevents alpha-blending confusion by using distinct, low-saturation 
+    # hues for the long tail, rather than grays.
     
-    return themes, dict(zip(themes, shuffled_palette)), counts, primary
+    # 1. Grab up to 5 bold, highly saturated colors for the leaders
+    # 'Set1' gives strong, distinct primary/secondary colors
+    num_highlight = min(5, n_themes)
+    top_colors = sns.color_palette("Set1", num_highlight)
+    
+    # 2. Grab pale, pastel hues for the remaining categories
+    # 'Set3' provides 12 distinct but desaturated/pastel colors
+    num_muted = max(0, n_themes - 5)
+    if num_muted > 0:
+        bottom_colors = sns.color_palette("Set3", num_muted)
+    else:
+        bottom_colors = []
+        
+    # 3. Combine them into the custom palette
+    custom_palette = list(top_colors) + list(bottom_colors)
+    
+    return themes, dict(zip(themes, custom_palette)), counts, primary
 
 def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
     """One Mars hex-density map per theme (panels share the same map background).
@@ -553,9 +568,10 @@ def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
     lat = df["latitude"]
 
     # Resolution scales with dataset size — finer hexes when there's more data.
-    if   len(df) < 1000:    grid = (40, 22)
-    elif len(df) < 20000:   grid = (60, 30)
-    else:                   grid = (90, 45)
+    # if   len(df) < 1000:    grid = (40, 22)
+    # elif len(df) < 20000:   grid = (60, 30)
+    # else:                   grid = (90, 45)
+    grid = (45, 22)
 
     n = len(themes)
     ncols = 5 if n >= 5 else n
@@ -570,8 +586,9 @@ def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
         m = (df["primary_theme"] == theme).values
         c = color_for[theme]
 
+        # 2. Raise the colormap floor: start at a light gray instead of pure white
         cmap = LinearSegmentedColormap.from_list(
-                    f"th_{i}", ["white", c, "#222222"], N=256)
+                    f"th_{i}", ["#e5e5e5", c, "#111111"], N=256)
 
         ax.add_patch(plt.Rectangle((-180, -90), 360, 180,
                                    facecolor="white",
@@ -581,6 +598,7 @@ def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
                       gridsize=grid,
                       extent=(-180, 180, -90, 90),
                       cmap=cmap, mincnt=1,
+                      bins='log', # 3. THE MAGIC BULLET: Logarithmic color scaling
                       linewidths=0, edgecolors="none",
                       zorder=2)
         ax.axhline(0, color="#7a2d18", lw=0.4, alpha=0.45, zorder=3)
@@ -775,10 +793,10 @@ def make_all(df: pd.DataFrame, outdir: str | Path) -> None:
     # fig_geographic_features(df, out)
     # fig_themes_bar(df, out)
     # fig_map_themed(df, out)
-    # fig_map_themed_smallmultiples(df, out)
+    fig_map_themed_smallmultiples(df, out)
     # fig_map_themed_dominant(df, out)
     # fig_treemap(df, out)
-    fig_themes_by_latitude_band(df, out)
+    # fig_themes_by_latitude_band(df, out)
 
 
 def main() -> None:
