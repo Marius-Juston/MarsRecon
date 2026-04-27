@@ -299,13 +299,12 @@ applied automatically, falling back to the live weights otherwise.
   (class-balanced sampler), and an architectural ablation on pooling /
   loss type — see "B0+ follow-up runs" below.
 
-#### 2026-04-26 B0+ follow-up runs (queued as parallel ablations)
+#### 2026-04-26 B0+ follow-up runs (completed parallel ablations)
 
-Two follow-up runs are launched in parallel, each pinned to its own GPU on
-the 4× RTX 6000 Ada host. Both keep the Stage A backbone, the split
-manifest, the false-negative-aware contrastive setup (where applicable), and
-the bf16 + grad-clip + logit-scale-clamp stability rails. They differ only
-in the variables they sweep:
+Two follow-up runs completed cleanly in parallel. Both kept the Stage A
+backbone, split manifest, bf16 + grad-clip + logit-scale-clamp stability
+rails, and the same 4,096-patch split-manifest val protocol. They differ in
+the variables they swept:
 
 - **Run A — `olympus-stage-b0plus-mlp-bal-ema-ls-v1`** (regularize + capacity):
   - same data and pooling as the previous best (CLS, InfoNCE).
@@ -319,6 +318,24 @@ in the variables they sweep:
   - run dir:
     `/scratch/marsrecon_runs/stage_b/text_mae_align/20260426/20260426_230004_olympus-stage-b0plus-mlp-bal-ema-ls-v1`.
   - W&B: `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/sm7ud0n9`.
+  - status: completed, 60/60 epochs.
+  - best checkpoint: epoch 50 by `val/alignment_score = 0.53046`.
+  - standalone val eval (`eval_val_4096.json`, best checkpoint):
+    image→text R@1 0.379, R@10 0.387, MRR 0.394, median rank 19;
+    text→image R@1 0.509, R@10 0.939, MRR 0.667, median rank 1.
+  - full holdout evals, best checkpoint:
+    - full val (`eval_val_full.json`, 12,285 patches): image→text R@1
+      0.349, R@10 0.357, MRR 0.357, median rank 73; text→image R@1
+      0.514, R@10 0.936, MRR 0.659, median rank 1.
+    - full test (`eval_test_full.json`, 12,285 patches): image→text R@1
+      0.335, R@10 0.345, MRR 0.343, median rank 73; text→image R@1
+      0.539, R@10 0.929, MRR 0.673, median rank 1.
+  - critical read: this is the new B0 run of record by a very large margin.
+    It strongly suggests the cheap B0+ levers (capacity + balanced sampler +
+    EMA + smoothing + longer lower-LR schedule) solved most of the B0
+    underfitting problem. It does **not** prove open-vocabulary semantic
+    alignment; the task is still a 244-rationale classification-like
+    retrieval problem.
 - **Run B — `olympus-stage-b0-proto-clsmean-mlp-v1`** (architecture ablation):
   - `--image-pool cls_plus_mean` (concat CLS + mean-patch pooled SatMAE
     output, image-feature dim 1536). The image cache is rebuilt at this
@@ -332,10 +349,31 @@ in the variables they sweep:
   - run dir:
     `/scratch/marsrecon_runs/stage_b/text_mae_align/20260426/20260426_230008_olympus-stage-b0-proto-clsmean-mlp-v1`.
   - W&B: `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/84q7ssq1`.
+  - status: completed, 60/60 epochs.
+  - best checkpoint: epoch 60 by `val/alignment_score = 0.30946`.
+  - standalone val eval (`eval_val_4096.json`, best checkpoint):
+    image→text R@1 0.192, R@10 0.192, MRR 0.204, median rank 81;
+    text→image R@1 0.238, R@10 0.778, MRR 0.415, median rank 3.
+  - critical read: prototype loss + CLS+mean pooling is better than the
+    linear B0 baseline but far worse than Run A. Treat this path as a useful
+    negative/partial ablation. Do not make it the next default.
 
-Both runs share the same val protocol (split-manifest val, 4,096 patches,
-`val/alignment_score`-based best checkpoint) so they are directly
-comparable to the 2026-04-26 optimized B0.
+Comparison against the previous optimized linear B0 (`erwozhp9`,
+`eval_val_4096_recheck.json`): image→text MRR improved from 0.156 to 0.394
+with Run A; text→image MRR improved from 0.123 to 0.667; median ranks
+improved from 139/25 to 19/1. That is too large to ignore, but the win is
+still on the 244-rationale B0 harness, not the final B1a target.
+
+Recommended next action:
+
+- Freeze Run A as the B0+ run of record and evaluate it on the full val split
+  and test split before any architectural claims.
+- Do **not** spend another broad run on prototype loss yet; if revisited,
+  isolate variables (`cls_plus_mean` with InfoNCE, `prototype` with CLS) so
+  the failure can be attributed cleanly.
+- Move implementation effort to Stage B1a next: paired local/global crops,
+  location/context inputs, geometry/viewing features, and local/global
+  consistency. B0+ has now done its job as a strong baseline harness.
 
 ### Canonical Stage B0 invocations
 
