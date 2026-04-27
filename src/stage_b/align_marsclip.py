@@ -95,6 +95,29 @@ GEO_CONTEXT_CHOICES = (
 )
 COORDS_CONTEXTS: frozenset[str] = frozenset({"coords_only", "coords_view", "coords_view_scale"})
 
+PAIRED_VIEWS_CHOICES = ("none", "local_global")
+
+
+def make_local_view(images: torch.Tensor, *, crop_fraction: float) -> torch.Tensor:
+    """Deterministic centered crop + bilinear resize back to the original shape.
+
+    Used for the B1a-pairs CACo-style local view: the global view stays at the
+    full 256-px patch and the local view is the inner ``crop_fraction``
+    centered crop resized back to 256 px so the same SatMAE encoder can be
+    reused without changing input resolution.
+    """
+    if images.ndim != 4:
+        raise ValueError("images must have shape (B, C, H, W)")
+    if not (0.0 < float(crop_fraction) < 1.0):
+        raise ValueError("local_crop_fraction must be in (0, 1)")
+    _, _, h, w = images.shape
+    crop_h = max(1, int(round(h * float(crop_fraction))))
+    crop_w = max(1, int(round(w * float(crop_fraction))))
+    y0 = (h - crop_h) // 2
+    x0 = (w - crop_w) // 2
+    cropped = images[:, :, y0 : y0 + crop_h, x0 : x0 + crop_w]
+    return F.interpolate(cropped, size=(h, w), mode="bilinear", align_corners=False)
+
 
 def geo_input_dim(geo_context: str) -> int:
     """Number of raw float features fed into the GeoEncoder for ``geo_context``."""
@@ -180,7 +203,7 @@ def collate_geo_warmup(samples: list[dict[str, Any]], *, geo_context: str) -> di
 
 
 def collate_marsclip_train(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate cached B1a-geo training batches."""
+    """Collate cached B1a-geo / B1a-pairs training batches."""
     texts = [str(sample.get("rationale_raw", "")) for sample in samples]
     metadata = [dict(sample.get("metadata", {})) for sample in samples]
     batch: dict[str, Any] = {"text": texts, "metadata": metadata}
@@ -189,6 +212,10 @@ def collate_marsclip_train(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if "image_features" in samples[0]:
         batch["image_features"] = torch.stack(
             [sample["image_features"] for sample in samples], dim=0
+        )
+    if "local_image_features" in samples[0]:
+        batch["local_image_features"] = torch.stack(
+            [sample["local_image_features"] for sample in samples], dim=0
         )
     if "geo_input" in samples[0]:
         batch["geo_input"] = torch.stack([sample["geo_input"] for sample in samples], dim=0)
@@ -365,7 +392,12 @@ class MarsCLIPAlignmentModel(nn.Module):
 
 
 class GeoAwareCachedDataset(Dataset):
-    """Cached frozen image features paired with assembled geo input vectors."""
+    """Cached frozen image features paired with assembled geo input vectors.
+
+    Optionally also stores ``local_image_features`` for the B1a-pairs view
+    (deterministic centered crop of the patch resized back to 256 px and run
+    through the same frozen SatMAE encoder).
+    """
 
     def __init__(
         self,
@@ -374,6 +406,7 @@ class GeoAwareCachedDataset(Dataset):
         geo_inputs: torch.Tensor,
         texts: list[str],
         metadata_rows: list[dict[str, Any]],
+        local_image_features: torch.Tensor | None = None,
     ) -> None:
         if image_features.ndim != 2:
             raise ValueError("image_features must have shape (N, D).")
@@ -383,10 +416,20 @@ class GeoAwareCachedDataset(Dataset):
             raise ValueError(
                 "image_features, geo_inputs, texts, and metadata_rows must agree in length."
             )
+        if local_image_features is not None:
+            if local_image_features.ndim != 2:
+                raise ValueError("local_image_features must have shape (N, D).")
+            if local_image_features.shape != image_features.shape:
+                raise ValueError(
+                    "local_image_features must match image_features shape."
+                )
         self.image_features = image_features.contiguous()
         self.geo_inputs = geo_inputs.contiguous()
         self.texts = list(texts)
         self.metadata_rows = [dict(row) for row in metadata_rows]
+        self.local_image_features = (
+            local_image_features.contiguous() if local_image_features is not None else None
+        )
 
     def __len__(self) -> int:
         return int(self.image_features.shape[0])
@@ -395,13 +438,20 @@ class GeoAwareCachedDataset(Dataset):
     def geo_dim(self) -> int:
         return int(self.geo_inputs.shape[-1])
 
+    @property
+    def has_local_features(self) -> bool:
+        return self.local_image_features is not None
+
     def __getitem__(self, index: int) -> dict[str, Any]:
-        return {
+        out = {
             "image_features": self.image_features[index],
             "geo_input": self.geo_inputs[index],
             "rationale_raw": self.texts[index],
             "metadata": dict(self.metadata_rows[index]),
         }
+        if self.local_image_features is not None:
+            out["local_image_features"] = self.local_image_features[index]
+        return out
 
 
 @torch.no_grad()
@@ -421,8 +471,20 @@ def build_geo_aware_cached_dataset(
     out_dir: pathlib.Path | None = None,
     progress_log_interval: int = 10,
     phase: str = "image_geo_cache_warmup",
+    paired_views: str = "none",
+    local_crop_fraction: float = 0.5,
 ) -> GeoAwareCachedDataset:
-    """Precompute frozen MAE image features and stack the geo input tensors."""
+    """Precompute frozen MAE image features and stack the geo input tensors.
+
+    When ``paired_views == "local_global"`` the cache also stores a parallel
+    ``local_image_features`` tensor obtained by deterministically center-cropping
+    each patch by ``local_crop_fraction`` and resizing back to the patch
+    resolution before a second SatMAE forward pass.
+    """
+    if paired_views not in PAIRED_VIEWS_CHOICES:
+        raise ValueError(
+            f"paired_views={paired_views!r} must be one of {PAIRED_VIEWS_CHOICES}"
+        )
     collate = partial(collate_geo_warmup, geo_context=geo_context)
     loader_kwargs: dict[str, Any] = {
         "dataset": dataset,
@@ -442,16 +504,24 @@ def build_geo_aware_cached_dataset(
     non_blocking = bool(pin_memory and device.type == "cuda")
     total_steps = max(len(dataloader), 1)
     feature_batches: list[torch.Tensor] = []
+    local_batches: list[torch.Tensor] = []
     geo_batches: list[torch.Tensor] = []
     text_rows: list[str] = []
     metadata_rows: list[dict[str, Any]] = []
     start_time = time.time()
     report_interval = max(int(progress_log_interval), 1)
+    cache_local = paired_views == "local_global"
 
     for step, batch in enumerate(dataloader, start=1):
         images = batch["image"].to(device, non_blocking=non_blocking)
         image_features = encode_image_with_satmae_encoder(mae_encoder, images, pool=image_pool)
         feature_batches.append(image_features.detach().cpu())
+        if cache_local:
+            local_images = make_local_view(images, crop_fraction=local_crop_fraction)
+            local_features = encode_image_with_satmae_encoder(
+                mae_encoder, local_images, pool=image_pool
+            )
+            local_batches.append(local_features.detach().cpu())
         geo_batches.append(batch["geo_input"].detach().cpu())
         text_rows.extend(batch["text"])
         metadata_rows.extend(batch["metadata"])
@@ -466,23 +536,28 @@ def build_geo_aware_cached_dataset(
                 "cache_steps": int(step),
                 "cache_total_steps": int(total_steps),
                 "cache_elapsed_sec": time.time() - start_time,
+                "paired_views": str(paired_views),
+                "local_crop_fraction": float(local_crop_fraction) if cache_local else None,
                 "out_dir": str(out_dir) if out_dir is not None else None,
             }
             if progress_path is not None:
                 save_training_progress(payload, progress_path)
             print(
                 f"[align-marsclip] {phase} samples={len(text_rows)}/{len(dataset)} "
-                f"steps={step}/{total_steps}",
+                f"steps={step}/{total_steps}"
+                + (" (+local)" if cache_local else ""),
                 flush=True,
             )
 
     image_features = torch.cat(feature_batches, dim=0)
     geo_inputs = torch.cat(geo_batches, dim=0)
+    local_image_features = torch.cat(local_batches, dim=0) if cache_local else None
     return GeoAwareCachedDataset(
         image_features=image_features,
         geo_inputs=geo_inputs,
         texts=text_rows,
         metadata_rows=metadata_rows,
+        local_image_features=local_image_features,
     )
 
 
@@ -534,12 +609,22 @@ def build_marsclip_embeddings(
     non_blocking: bool = False,
     image_pool: str = "cls",
     geo_context: str = "latlon_view_scale",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, list[str]]:
-    """Build aligned image / text / (optional) geo embeddings for a loader."""
+    paired_views: str = "none",
+    local_crop_fraction: float = 0.5,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    list[str],
+]:
+    """Build aligned image / text / (optional) geo / (optional) local embeddings."""
     image_chunks: list[torch.Tensor] = []
     text_chunks: list[torch.Tensor] = []
     geo_chunks: list[torch.Tensor] = []
+    local_chunks: list[torch.Tensor] = []
     text_rows: list[str] = []
+    use_local = paired_views == "local_global"
 
     for batch in dataloader:
         texts = batch["text"]
@@ -560,6 +645,25 @@ def build_marsclip_embeddings(
         text_emb = aligner.project_text(text_features)
         image_chunks.append(image_emb.detach().cpu())
         text_chunks.append(text_emb.detach().cpu())
+
+        if use_local:
+            if "local_image_features" in batch:
+                local_features = batch["local_image_features"].to(
+                    device, non_blocking=non_blocking
+                )
+            else:
+                if "image" not in batch:
+                    raise KeyError(
+                        "paired_views='local_global' requires either cached "
+                        "local_image_features or raw 'image' tensors in the batch."
+                    )
+                images = batch["image"].to(device, non_blocking=non_blocking)
+                local_images = make_local_view(images, crop_fraction=local_crop_fraction)
+                local_features = encode_image_with_satmae_encoder(
+                    mae_encoder, local_images, pool=image_pool
+                )
+            local_emb = aligner.project_image(local_features)
+            local_chunks.append(local_emb.detach().cpu())
 
         if geo_context != "none":
             if "geo_input" in batch:
@@ -587,7 +691,8 @@ def build_marsclip_embeddings(
     image_emb_all = torch.cat(image_chunks, dim=0)
     text_emb_all = torch.cat(text_chunks, dim=0)
     geo_emb_all = torch.cat(geo_chunks, dim=0) if geo_chunks else None
-    return image_emb_all, text_emb_all, geo_emb_all, text_rows
+    local_emb_all = torch.cat(local_chunks, dim=0) if local_chunks else None
+    return image_emb_all, text_emb_all, geo_emb_all, local_emb_all, text_rows
 
 
 @torch.no_grad()
@@ -602,9 +707,11 @@ def evaluate_marsclip_retrieval(
     non_blocking: bool = False,
     image_pool: str = "cls",
     geo_context: str = "latlon_view_scale",
+    paired_views: str = "none",
+    local_crop_fraction: float = 0.5,
 ) -> dict[str, float]:
-    """Combined image↔text + (optional) image↔geo retrieval metrics."""
-    image_emb, text_emb, geo_emb, text_rows = build_marsclip_embeddings(
+    """Combined image↔text + (optional) image↔geo + (optional) local↔global metrics."""
+    image_emb, text_emb, geo_emb, local_emb, text_rows = build_marsclip_embeddings(
         dataloader=dataloader,
         mae_encoder=mae_encoder,
         text_encoder=text_encoder,
@@ -614,6 +721,8 @@ def evaluate_marsclip_retrieval(
         non_blocking=non_blocking,
         image_pool=image_pool,
         geo_context=geo_context,
+        paired_views=paired_views,
+        local_crop_fraction=local_crop_fraction,
     )
     metrics = compute_retrieval_metrics(image_emb, text_emb, text_rows)
     if geo_emb is not None:
@@ -624,6 +733,17 @@ def evaluate_marsclip_retrieval(
             b_to_a_prefix="geo_to_image",
         )
         for key, value in geo_metrics.items():
+            if key == "num_samples":
+                continue
+            metrics[key] = value
+    if local_emb is not None:
+        lg_metrics = compute_pairwise_retrieval_metrics(
+            local_emb,
+            image_emb,
+            a_to_b_prefix="local_to_global",
+            b_to_a_prefix="global_to_local",
+        )
+        for key, value in lg_metrics.items():
             if key == "num_samples":
                 continue
             metrics[key] = value
@@ -674,6 +794,9 @@ def _save_marsclip_checkpoint(
             "geo_temperature_init": float(getattr(args, "geo_temperature_init", 0.07)),
             "text_temperature_init": float(getattr(args, "text_temperature_init", 0.07)),
             "geo_logit_scale_max": float(getattr(args, "geo_logit_scale_max", 100.0)),
+            "paired_views": str(getattr(args, "paired_views", "none")),
+            "local_crop_fraction": float(getattr(args, "local_crop_fraction", 0.5)),
+            "lg_loss_weight": float(getattr(args, "lg_loss_weight", 0.0)),
             "loss_type": "infonce",
             "projector_type": str(getattr(args, "projector_type", "mlp")),
             "wandb_mode": wandb_logger.mode if wandb_logger is not None else "disabled",
@@ -761,6 +884,23 @@ def main() -> None:
     parser.add_argument("--text-temperature-init", type=float, default=0.07)
     parser.add_argument("--geo-loss-weight", type=float, default=1.0)
     parser.add_argument("--text-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--paired-views",
+        type=str,
+        default="none",
+        choices=PAIRED_VIEWS_CHOICES,
+        help="If 'local_global', cache a deterministic centered local crop "
+        "(re-encoded by SatMAE) and add a CACo-style local↔global InfoNCE term.",
+    )
+    parser.add_argument("--local-crop-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--lg-loss-weight",
+        type=float,
+        default=0.0,
+        help="CACo-style local↔global InfoNCE weight; defaults to 0 so existing "
+        "b1a-geo recipes keep working. Set to 0.5 alongside --paired-views local_global "
+        "for the canonical b1a-pairs recipe.",
+    )
     parser.add_argument("--balanced-sampler", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--checkpoint-every", type=int, default=1)
@@ -781,6 +921,16 @@ def main() -> None:
 
     if args.geo_context == "none" and float(args.geo_loss_weight) > 0.0:
         raise ValueError("--geo-context none requires --geo-loss-weight 0.")
+    if args.paired_views == "none" and float(args.lg_loss_weight) > 0.0:
+        raise ValueError("--paired-views none requires --lg-loss-weight 0.")
+    if args.paired_views == "local_global" and not (0.0 < float(args.local_crop_fraction) < 1.0):
+        raise ValueError("--local-crop-fraction must be in (0, 1) when --paired-views local_global.")
+    if args.paired_views == "local_global" and float(args.lg_loss_weight) <= 0.0:
+        print(
+            "[align-marsclip] warning: --paired-views local_global with --lg-loss-weight=0; "
+            "the local view will be cached and reported in val metrics but not used for training.",
+            flush=True,
+        )
 
     device = _resolve_device(args.device)
     run_name = args.run_name or _default_run_name(mae_checkpoint=args.mae_checkpoint).replace(
@@ -990,6 +1140,8 @@ def main() -> None:
             out_dir=out_dir,
             progress_log_interval=max(progress_interval // 2, 1),
             phase="train_image_geo_cache_warmup",
+            paired_views=str(args.paired_views),
+            local_crop_fraction=float(args.local_crop_fraction),
         )
         val_source_dataset: GeoAwareCachedDataset | None = None
         if val_dataset is not None:
@@ -1008,6 +1160,8 @@ def main() -> None:
                 out_dir=out_dir,
                 progress_log_interval=max(progress_interval // 2, 1),
                 phase="val_image_geo_cache_warmup",
+                paired_views=str(args.paired_views),
+                local_crop_fraction=float(args.local_crop_fraction),
             )
         save_training_progress(
             {
@@ -1224,6 +1378,9 @@ def main() -> None:
 
         base_text_loss_weight = float(args.text_loss_weight)
         base_geo_loss_weight = float(args.geo_loss_weight) if args.geo_context != "none" else 0.0
+        base_lg_loss_weight = (
+            float(args.lg_loss_weight) if args.paired_views == "local_global" else 0.0
+        )
         geo_warmup_epochs = max(int(args.geo_warmup_epochs), 0)
 
         for epoch in range(args.epochs):
@@ -1235,6 +1392,7 @@ def main() -> None:
             in_geo_warmup = epoch < geo_warmup_epochs and base_geo_loss_weight > 0.0
             text_loss_weight = 0.0 if in_geo_warmup else base_text_loss_weight
             geo_loss_weight = base_geo_loss_weight
+            lg_loss_weight = base_lg_loss_weight
             if in_geo_warmup:
                 print(
                     f"[align-marsclip] epoch={epoch + 1}/{args.epochs} "
@@ -1246,6 +1404,7 @@ def main() -> None:
             epoch_loss = 0.0
             epoch_text_loss = 0.0
             epoch_geo_loss = 0.0
+            epoch_lg_loss = 0.0
             epoch_steps = 0
             current_lr = float(optimizer.param_groups[0]["lr"])
             save_training_progress(
@@ -1279,6 +1438,11 @@ def main() -> None:
                 geo_input = (
                     batch["geo_input"].to(device, non_blocking=non_blocking)
                     if "geo_input" in batch and geo_loss_weight > 0.0
+                    else None
+                )
+                local_image_features = (
+                    batch["local_image_features"].to(device, non_blocking=non_blocking)
+                    if "local_image_features" in batch and lg_loss_weight > 0.0
                     else None
                 )
                 if text_cache is not None:
@@ -1316,7 +1480,23 @@ def main() -> None:
                         )
                     else:
                         geo_loss = torch.zeros((), device=device, dtype=text_loss.dtype)
-                    loss = text_loss_weight * text_loss + geo_loss_weight * geo_loss
+                    if local_image_features is not None:
+                        local_emb = aligner.project_image(local_image_features)
+                        lg_loss = symmetric_contrastive_loss(
+                            local_emb,
+                            image_emb,
+                            aligner.logit_scale,
+                            text_labels=batch_class_ids if args.false_negative_mask else None,
+                            logit_scale_max=float(args.logit_scale_max),
+                            label_smoothing=float(args.label_smoothing),
+                        )
+                    else:
+                        lg_loss = torch.zeros((), device=device, dtype=text_loss.dtype)
+                    loss = (
+                        text_loss_weight * text_loss
+                        + geo_loss_weight * geo_loss
+                        + lg_loss_weight * lg_loss
+                    )
 
                 if amp_needs_scaler:
                     amp_scaler.scale(loss).backward()
@@ -1343,9 +1523,13 @@ def main() -> None:
                 loss_value = float(loss.detach().cpu())
                 text_loss_value = float(text_loss.detach().cpu())
                 geo_loss_value = float(geo_loss.detach().cpu()) if geo_input is not None else 0.0
+                lg_loss_value = (
+                    float(lg_loss.detach().cpu()) if local_image_features is not None else 0.0
+                )
                 epoch_loss += loss_value
                 epoch_text_loss += text_loss_value
                 epoch_geo_loss += geo_loss_value
+                epoch_lg_loss += lg_loss_value
                 should_report = (
                     step_in_epoch % progress_interval == 0 or step_in_epoch == steps_per_epoch
                 )
@@ -1353,6 +1537,7 @@ def main() -> None:
                     running_mean_loss = epoch_loss / max(epoch_steps, 1)
                     running_mean_text = epoch_text_loss / max(epoch_steps, 1)
                     running_mean_geo = epoch_geo_loss / max(epoch_steps, 1)
+                    running_mean_lg = epoch_lg_loss / max(epoch_steps, 1)
                     elapsed = time.time() - epoch_start
                     progress_payload = {
                         "status": "running",
@@ -1365,9 +1550,11 @@ def main() -> None:
                         "latest_loss": loss_value,
                         "latest_text_loss": text_loss_value,
                         "latest_geo_loss": geo_loss_value,
+                        "latest_lg_loss": lg_loss_value,
                         "running_mean_loss": running_mean_loss,
                         "running_mean_text_loss": running_mean_text,
                         "running_mean_geo_loss": running_mean_geo,
+                        "running_mean_lg_loss": running_mean_lg,
                         "latest_lr": current_lr,
                         "epoch_elapsed_sec": elapsed,
                         "out_dir": str(out_dir),
@@ -1376,8 +1563,8 @@ def main() -> None:
                     print(
                         f"[align-marsclip] epoch={epoch + 1}/{args.epochs} "
                         f"step={step_in_epoch}/{steps_per_epoch} "
-                        f"loss={loss_value:.6f} (text={text_loss_value:.4f} geo={geo_loss_value:.4f}) "
-                        f"mean={running_mean_loss:.6f} elapsed={elapsed:.1f}s",
+                        f"loss={loss_value:.6f} (text={text_loss_value:.4f} geo={geo_loss_value:.4f} "
+                        f"lg={lg_loss_value:.4f}) mean={running_mean_loss:.6f} elapsed={elapsed:.1f}s",
                         flush=True,
                     )
                     if wandb_logger is not None:
@@ -1386,9 +1573,11 @@ def main() -> None:
                                 "train/loss": loss_value,
                                 "train/text_loss": text_loss_value,
                                 "train/geo_loss": geo_loss_value,
+                                "train/lg_loss": lg_loss_value,
                                 "train/running_mean_loss": running_mean_loss,
                                 "train/running_mean_text_loss": running_mean_text,
                                 "train/running_mean_geo_loss": running_mean_geo,
+                                "train/running_mean_lg_loss": running_mean_lg,
                                 "train/logit_scale": float(
                                     aligner.logit_scale.exp().detach().cpu().item()
                                 ),
@@ -1397,6 +1586,7 @@ def main() -> None:
                                 ),
                                 "train/text_loss_weight": float(text_loss_weight),
                                 "train/geo_loss_weight": float(geo_loss_weight),
+                                "train/lg_loss_weight": float(lg_loss_weight),
                                 "train/lr": current_lr,
                                 "train/step_in_epoch": float(step_in_epoch),
                                 "train/steps_in_epoch": float(steps_per_epoch),
@@ -1410,6 +1600,7 @@ def main() -> None:
             avg_loss = epoch_loss / max(epoch_steps, 1)
             avg_text_loss = epoch_text_loss / max(epoch_steps, 1)
             avg_geo_loss = epoch_geo_loss / max(epoch_steps, 1)
+            avg_lg_loss = epoch_lg_loss / max(epoch_steps, 1)
             epoch_duration = time.time() - epoch_start
             val_metrics: dict[str, float] = {}
             if val_dataloader is not None and (
@@ -1431,6 +1622,8 @@ def main() -> None:
                         non_blocking=non_blocking,
                         image_pool=image_pool,
                         geo_context=str(args.geo_context),
+                        paired_views=str(args.paired_views),
+                        local_crop_fraction=float(args.local_crop_fraction),
                     )
                 finally:
                     if ema is not None and ema_backup is not None:
@@ -1444,12 +1637,17 @@ def main() -> None:
                     if "val/image_to_geo_r10" in val_metrics
                     else ""
                 )
+                lg_score_msg = (
+                    f" l2g_r10={val_metrics.get('val/local_to_global_r10', float('nan')):.4f}"
+                    if "val/local_to_global_r10" in val_metrics
+                    else ""
+                )
                 print(
                     f"[align-marsclip] epoch={epoch + 1}/{args.epochs} "
                     f"val score={val_metrics['val/alignment_score']:.6f} "
                     f"i2t_r10={val_metrics['val/image_to_text_r10']:.4f} "
                     f"t2i_r10={val_metrics['val/text_to_image_r10']:.4f}"
-                    f"{geo_score_msg} duration={val_duration:.1f}s",
+                    f"{geo_score_msg}{lg_score_msg} duration={val_duration:.1f}s",
                     flush=True,
                 )
                 if wandb_logger is not None:
@@ -1460,6 +1658,7 @@ def main() -> None:
                 "loss": avg_loss,
                 "text_loss": avg_text_loss,
                 "geo_loss": avg_geo_loss,
+                "lg_loss": avg_lg_loss,
                 "steps": float(epoch_steps),
                 "duration_sec": epoch_duration,
             }
@@ -1468,8 +1667,8 @@ def main() -> None:
             save_training_history(history, history_path)
             print(
                 f"[align-marsclip] epoch={epoch + 1}/{args.epochs} complete "
-                f"loss={avg_loss:.6f} (text={avg_text_loss:.4f} geo={avg_geo_loss:.4f}) "
-                f"duration={epoch_duration:.1f}s",
+                f"loss={avg_loss:.6f} (text={avg_text_loss:.4f} geo={avg_geo_loss:.4f} "
+                f"lg={avg_lg_loss:.4f}) duration={epoch_duration:.1f}s",
                 flush=True,
             )
             if wandb_logger is not None:
@@ -1478,6 +1677,7 @@ def main() -> None:
                         "epoch/train_loss": avg_loss,
                         "epoch/train_text_loss": avg_text_loss,
                         "epoch/train_geo_loss": avg_geo_loss,
+                        "epoch/train_lg_loss": avg_lg_loss,
                         "epoch/train_steps": float(epoch_steps),
                         "epoch/steps_in_epoch": float(steps_per_epoch),
                         "epoch/global_step_end": float(global_step),
