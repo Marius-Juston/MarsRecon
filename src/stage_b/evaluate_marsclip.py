@@ -106,9 +106,20 @@ def main() -> None:
     projector_hidden_dim = int(aligner_config.get("projector_hidden_dim", 768))
     projector_depth = int(aligner_config.get("projector_depth", 2))
     projector_dropout = float(aligner_config.get("projector_dropout", 0.0))
+    geo_encoder_type = str(aligner_config.get("geo_encoder_type", "mlp"))
+    geo_coords_dim_value = int(aligner_config.get("geo_coords_dim", 0))
     geo_hidden_dim = int(aligner_config.get("geo_hidden_dim", 256))
     geo_depth = int(aligner_config.get("geo_depth", 2))
     geo_dropout = float(aligner_config.get("geo_dropout", 0.0))
+    geo_rff_sigmas = tuple(
+        float(s) for s in aligner_config.get("geo_rff_sigmas", (1.0, 4.0, 16.0, 64.0))
+    )
+    geo_rff_encoded_size = int(aligner_config.get("geo_rff_encoded_size", 128))
+    geo_siren_w0 = float(aligner_config.get("geo_siren_w0", 1.0))
+    geo_siren_w0_initial = float(aligner_config.get("geo_siren_w0_initial", 30.0))
+    geo_sh_legendre_polys = int(aligner_config.get("geo_sh_legendre_polys", 10))
+    text_temperature_init = float(aligner_config.get("text_temperature_init", 0.07))
+    geo_temperature_init = float(aligner_config.get("geo_temperature_init", 0.07))
     image_pool = str(checkpoint.get("image_pool", config.get("image_pool", "cls")))
     geo_context = str(
         args.geo_context_override
@@ -198,9 +209,18 @@ def main() -> None:
         projector_hidden_dim=projector_hidden_dim,
         projector_depth=projector_depth,
         projector_dropout=projector_dropout,
+        geo_encoder_type=geo_encoder_type,
+        geo_coords_dim=geo_coords_dim_value,
         geo_hidden_dim=geo_hidden_dim,
         geo_depth=geo_depth,
         geo_dropout=geo_dropout,
+        geo_rff_sigmas=geo_rff_sigmas,
+        geo_rff_encoded_size=geo_rff_encoded_size,
+        geo_siren_w0=geo_siren_w0,
+        geo_siren_w0_initial=geo_siren_w0_initial,
+        geo_sh_legendre_polys=geo_sh_legendre_polys,
+        text_temperature_init=text_temperature_init,
+        geo_temperature_init=geo_temperature_init,
     ).to(device)
     aligner.load_state_dict(checkpoint["aligner_state"], strict=True)
     if use_ema_weights:
