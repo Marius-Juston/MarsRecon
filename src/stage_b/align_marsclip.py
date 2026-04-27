@@ -46,6 +46,11 @@ from clip.fb_mae_train_utils import (
     save_training_progress,
 )
 from clip.marsclip_patches import MarsCLIPPatchDataset, load_patch_records
+from stage_b.geo_encoders import (
+    GEO_ENCODER_CHOICES,
+    LocationEncoder,
+    build_location_encoder,
+)
 from stage_b.T5_encoder import T5Encoder
 from stage_b.align_text_mae_embeddings import (
     IMAGE_POOL_CHOICES,
@@ -80,7 +85,15 @@ from stage_b.align_text_mae_embeddings import (
 DEFAULT_MARSCLIP_OUT_ROOT = pathlib.Path("/scratch/marsrecon_runs/stage_b/marsclip_align")
 WANDB_STEP_METRIC = "trainer/global_step"
 
-GEO_CONTEXT_CHOICES = ("none", "latlon_view", "latlon_view_scale")
+GEO_CONTEXT_CHOICES = (
+    "none",
+    "latlon_view",
+    "latlon_view_scale",
+    "coords_only",
+    "coords_view",
+    "coords_view_scale",
+)
+COORDS_CONTEXTS: frozenset[str] = frozenset({"coords_only", "coords_view", "coords_view_scale"})
 
 
 def geo_input_dim(geo_context: str) -> int:
@@ -91,23 +104,60 @@ def geo_input_dim(geo_context: str) -> int:
         return 8 + 13
     if geo_context == "latlon_view_scale":
         return 8 + 8 + 13
+    if geo_context == "coords_only":
+        return 2
+    if geo_context == "coords_view":
+        return 2 + 13
+    if geo_context == "coords_view_scale":
+        return 2 + 8 + 13
     raise ValueError(
         f"Unknown geo_context '{geo_context}'. Expected one of {GEO_CONTEXT_CHOICES}."
     )
 
 
+def geo_coords_dim(geo_context: str) -> int:
+    """Number of leading columns of ``geo_input`` that hold raw ``(lat, lon)``."""
+    return 2 if geo_context in COORDS_CONTEXTS else 0
+
+
 def assemble_geo_input(sample: dict[str, Any], geo_context: str) -> torch.Tensor:
-    """Concatenate the requested geo/scale/viewing features for one sample."""
+    """Concatenate the requested geo/scale/viewing features for one sample.
+
+    Legacy ``latlon_*`` contexts feed cyclic ``geo_features`` straight into the
+    geo head. The newer ``coords_*`` contexts emit ``(lat_deg, lon_deg)`` as
+    the first two columns so a downstream positional encoder (RFF / SH) can
+    handle the high-frequency lat/lon → embedding mapping without spectral
+    bias from a vanilla MLP. Auxiliary scale / viewing features are appended
+    after the coords for the ``coords_view*`` variants and concatenated post-PE
+    by ``LocationEncoder``.
+    """
     if geo_context == "none":
         return torch.empty(0, dtype=torch.float32)
-    geo = torch.as_tensor(sample["geo_features"], dtype=torch.float32).flatten()
     metadata = sample.get("metadata", {})
     viewing = torch.as_tensor(metadata["viewing_features"], dtype=torch.float32).flatten()
     if geo_context == "latlon_view":
+        geo = torch.as_tensor(sample["geo_features"], dtype=torch.float32).flatten()
         return torch.cat([geo, viewing], dim=0)
     if geo_context == "latlon_view_scale":
+        geo = torch.as_tensor(sample["geo_features"], dtype=torch.float32).flatten()
         scale = torch.as_tensor(sample["scale_features"], dtype=torch.float32).flatten()
         return torch.cat([geo, scale, viewing], dim=0)
+    if geo_context in COORDS_CONTEXTS:
+        location = sample.get("location")
+        if location is None:
+            raise KeyError(
+                "coords_* geo contexts require sample['location'] = (lon, lat) from "
+                "MarsCLIPPatchDataset."
+            )
+        loc = torch.as_tensor(location, dtype=torch.float32).flatten()
+        coords = torch.stack([loc[1], loc[0]], dim=0)  # MarsCLIPPatchDataset emits (lon, lat); encoders expect (lat, lon)
+        if geo_context == "coords_only":
+            return coords
+        if geo_context == "coords_view":
+            return torch.cat([coords, viewing], dim=0)
+        if geo_context == "coords_view_scale":
+            scale = torch.as_tensor(sample["scale_features"], dtype=torch.float32).flatten()
+            return torch.cat([coords, scale, viewing], dim=0)
     raise ValueError(
         f"Unknown geo_context '{geo_context}'. Expected one of {GEO_CONTEXT_CHOICES}."
     )
@@ -146,7 +196,12 @@ def collate_marsclip_train(samples: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 class GeoEncoder(nn.Module):
-    """LayerNorm + MLP encoder over raw geo/scale/viewing features."""
+    """LayerNorm + MLP encoder over flat geo/scale/viewing features.
+
+    Used as the back-compat path for ``latlon_*`` contexts where the entire
+    ``geo_input`` tensor is fed into a single MLP. The ``coords_*`` contexts
+    use :class:`LocationEncoder` from ``stage_b.geo_encoders`` instead.
+    """
 
     def __init__(
         self,
@@ -199,9 +254,18 @@ class MarsCLIPAlignmentModel(nn.Module):
         projector_hidden_dim: int = 768,
         projector_depth: int = 2,
         projector_dropout: float = 0.0,
+        geo_encoder_type: str = "mlp",
+        geo_coords_dim: int = 0,
         geo_hidden_dim: int = 256,
         geo_depth: int = 2,
         geo_dropout: float = 0.0,
+        geo_rff_sigmas: tuple[float, ...] = (1.0, 4.0, 16.0, 64.0),
+        geo_rff_encoded_size: int = 128,
+        geo_siren_w0: float = 1.0,
+        geo_siren_w0_initial: float = 30.0,
+        geo_sh_legendre_polys: int = 10,
+        text_temperature_init: float = 0.07,
+        geo_temperature_init: float = 0.07,
     ) -> None:
         super().__init__()
         self.image_projector = build_projector(
@@ -220,26 +284,59 @@ class MarsCLIPAlignmentModel(nn.Module):
             depth=projector_depth,
             dropout=projector_dropout,
         )
-        self.geo_encoder = GeoEncoder(
-            geo_dim,
-            embed_dim,
-            hidden_dim=geo_hidden_dim,
-            depth=geo_depth,
-            dropout=geo_dropout,
+        self.geo_encoder_type = str(geo_encoder_type)
+        self.geo_coords_dim = int(geo_coords_dim)
+        self.geo_aux_dim = max(int(geo_dim) - int(geo_coords_dim), 0)
+        if self.geo_coords_dim > 0:
+            self.geo_encoder: nn.Module = build_location_encoder(
+                encoder_type=str(geo_encoder_type),
+                embed_dim=int(embed_dim),
+                aux_dim=int(self.geo_aux_dim),
+                hidden_dim=int(geo_hidden_dim),
+                depth=int(geo_depth),
+                dropout=float(geo_dropout),
+                rff_sigmas=tuple(float(s) for s in geo_rff_sigmas),
+                rff_encoded_size=int(geo_rff_encoded_size),
+                siren_w0=float(geo_siren_w0),
+                siren_w0_initial=float(geo_siren_w0_initial),
+                sh_legendre_polys=int(geo_sh_legendre_polys),
+            )
+        else:
+            self.geo_encoder = GeoEncoder(
+                int(geo_dim) if int(geo_dim) > 0 else 1,
+                int(embed_dim),
+                hidden_dim=int(geo_hidden_dim),
+                depth=int(geo_depth),
+                dropout=float(geo_dropout),
+            )
+        self.logit_scale = nn.Parameter(
+            torch.tensor(math.log(1.0 / float(text_temperature_init)), dtype=torch.float32)
         )
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / 0.07), dtype=torch.float32))
+        self.geo_logit_scale = nn.Parameter(
+            torch.tensor(math.log(1.0 / float(geo_temperature_init)), dtype=torch.float32)
+        )
         self.aligner_config: dict[str, Any] = {
             "image_dim": int(image_dim),
             "text_dim": int(text_dim),
             "geo_dim": int(geo_dim),
+            "geo_coords_dim": int(self.geo_coords_dim),
+            "geo_aux_dim": int(self.geo_aux_dim),
             "embed_dim": int(embed_dim),
             "projector_type": str(projector_type),
             "projector_hidden_dim": int(projector_hidden_dim),
             "projector_depth": int(projector_depth),
             "projector_dropout": float(projector_dropout),
+            "geo_encoder_type": str(geo_encoder_type),
             "geo_hidden_dim": int(geo_hidden_dim),
             "geo_depth": int(geo_depth),
             "geo_dropout": float(geo_dropout),
+            "geo_rff_sigmas": [float(s) for s in geo_rff_sigmas],
+            "geo_rff_encoded_size": int(geo_rff_encoded_size),
+            "geo_siren_w0": float(geo_siren_w0),
+            "geo_siren_w0_initial": float(geo_siren_w0_initial),
+            "geo_sh_legendre_polys": int(geo_sh_legendre_polys),
+            "text_temperature_init": float(text_temperature_init),
+            "geo_temperature_init": float(geo_temperature_init),
         }
 
     def project_image(self, image_features: torch.Tensor) -> torch.Tensor:
@@ -249,6 +346,10 @@ class MarsCLIPAlignmentModel(nn.Module):
         return F.normalize(self.text_projector(text_features), dim=1)
 
     def project_geo(self, geo_input: torch.Tensor) -> torch.Tensor:
+        if self.geo_coords_dim > 0 and isinstance(self.geo_encoder, LocationEncoder):
+            coords = geo_input[:, : self.geo_coords_dim]
+            aux = geo_input[:, self.geo_coords_dim :] if self.geo_aux_dim > 0 else None
+            return F.normalize(self.geo_encoder(coords, aux), dim=1)
         return F.normalize(self.geo_encoder(geo_input), dim=1)
 
     def forward(
@@ -566,8 +667,13 @@ def _save_marsclip_checkpoint(
             "embed_dim": int(args.embed_dim),
             "image_pool": str(getattr(args, "image_pool", "cls")),
             "geo_context": str(getattr(args, "geo_context", "latlon_view_scale")),
+            "geo_encoder_type": str(getattr(args, "geo_encoder_type", "mlp")),
             "geo_loss_weight": float(getattr(args, "geo_loss_weight", 0.0)),
             "text_loss_weight": float(getattr(args, "text_loss_weight", 1.0)),
+            "geo_warmup_epochs": int(getattr(args, "geo_warmup_epochs", 0)),
+            "geo_temperature_init": float(getattr(args, "geo_temperature_init", 0.07)),
+            "text_temperature_init": float(getattr(args, "text_temperature_init", 0.07)),
+            "geo_logit_scale_max": float(getattr(args, "geo_logit_scale_max", 100.0)),
             "loss_type": "infonce",
             "projector_type": str(getattr(args, "projector_type", "mlp")),
             "wandb_mode": wandb_logger.mode if wandb_logger is not None else "disabled",
@@ -629,9 +735,30 @@ def main() -> None:
     parser.add_argument("--projector-dropout", type=float, default=0.0)
     parser.add_argument("--image-pool", type=str, default="cls", choices=IMAGE_POOL_CHOICES)
     parser.add_argument("--geo-context", type=str, default="latlon_view_scale", choices=GEO_CONTEXT_CHOICES)
+    parser.add_argument("--geo-encoder-type", type=str, default="mlp", choices=GEO_ENCODER_CHOICES)
     parser.add_argument("--geo-hidden-dim", type=int, default=256)
     parser.add_argument("--geo-depth", type=int, default=2)
     parser.add_argument("--geo-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--geo-rff-sigmas",
+        type=float,
+        nargs="+",
+        default=(1.0, 4.0, 16.0, 64.0),
+        help="Hierarchical RFF sigmas (cycles per degree); GeoCLIP-style.",
+    )
+    parser.add_argument("--geo-rff-encoded-size", type=int, default=128)
+    parser.add_argument("--geo-siren-w0", type=float, default=1.0)
+    parser.add_argument("--geo-siren-w0-initial", type=float, default=30.0)
+    parser.add_argument("--geo-sh-legendre-polys", type=int, default=10)
+    parser.add_argument("--geo-temperature-init", type=float, default=0.07)
+    parser.add_argument("--geo-logit-scale-max", type=float, default=100.0)
+    parser.add_argument(
+        "--geo-warmup-epochs",
+        type=int,
+        default=0,
+        help="Number of opening epochs to train with text-loss disabled (geo-only warmup).",
+    )
+    parser.add_argument("--text-temperature-init", type=float, default=0.07)
     parser.add_argument("--geo-loss-weight", type=float, default=1.0)
     parser.add_argument("--text-loss-weight", type=float, default=1.0)
     parser.add_argument("--balanced-sampler", action=argparse.BooleanOptionalAction, default=True)
@@ -963,6 +1090,18 @@ def main() -> None:
             warmup_text_features, _ = text_encoder(warmup_batch["text"], device=device)
         text_dim = int(warmup_text_features.shape[-1])
 
+        coords_dim = geo_coords_dim(str(args.geo_context))
+        if coords_dim > 0 and str(args.geo_encoder_type) == "mlp":
+            print(
+                "[align-marsclip] note: --geo-context coords_* with --geo-encoder-type mlp "
+                "skips the positional encoder; consider rff_siren or sh_siren for geo retrieval.",
+                flush=True,
+            )
+        if coords_dim == 0 and str(args.geo_encoder_type) != "mlp":
+            raise ValueError(
+                "--geo-encoder-type rff_/sh_ requires --geo-context coords_only / coords_view / "
+                "coords_view_scale (raw lat/lon as the first two columns of geo_input)."
+            )
         aligner = MarsCLIPAlignmentModel(
             image_dim=image_dim,
             text_dim=text_dim,
@@ -972,9 +1111,18 @@ def main() -> None:
             projector_hidden_dim=int(args.projector_hidden_dim),
             projector_depth=int(args.projector_depth),
             projector_dropout=float(args.projector_dropout),
+            geo_encoder_type=str(args.geo_encoder_type),
+            geo_coords_dim=int(coords_dim),
             geo_hidden_dim=int(args.geo_hidden_dim),
             geo_depth=int(args.geo_depth),
             geo_dropout=float(args.geo_dropout),
+            geo_rff_sigmas=tuple(float(s) for s in args.geo_rff_sigmas),
+            geo_rff_encoded_size=int(args.geo_rff_encoded_size),
+            geo_siren_w0=float(args.geo_siren_w0),
+            geo_siren_w0_initial=float(args.geo_siren_w0_initial),
+            geo_sh_legendre_polys=int(args.geo_sh_legendre_polys),
+            text_temperature_init=float(args.text_temperature_init),
+            geo_temperature_init=float(args.geo_temperature_init),
         ).to(device)
 
         if float(args.ema_decay) > 0.0:
@@ -1072,15 +1220,27 @@ def main() -> None:
         amp_needs_scaler = amp_enabled and amp_dtype == torch.float16
         amp_scaler = torch.amp.GradScaler("cuda", enabled=amp_needs_scaler)
         logit_scale_max_log = math.log(float(args.logit_scale_max))
+        geo_logit_scale_max_log = math.log(float(args.geo_logit_scale_max))
 
-        text_loss_weight = float(args.text_loss_weight)
-        geo_loss_weight = float(args.geo_loss_weight) if args.geo_context != "none" else 0.0
+        base_text_loss_weight = float(args.text_loss_weight)
+        base_geo_loss_weight = float(args.geo_loss_weight) if args.geo_context != "none" else 0.0
+        geo_warmup_epochs = max(int(args.geo_warmup_epochs), 0)
 
         for epoch in range(args.epochs):
             termination_monitor.raise_if_requested()
             aligner.train()
             text_encoder.eval()
             mae_encoder.eval()
+
+            in_geo_warmup = epoch < geo_warmup_epochs and base_geo_loss_weight > 0.0
+            text_loss_weight = 0.0 if in_geo_warmup else base_text_loss_weight
+            geo_loss_weight = base_geo_loss_weight
+            if in_geo_warmup:
+                print(
+                    f"[align-marsclip] epoch={epoch + 1}/{args.epochs} "
+                    f"phase=geo_warmup (text_loss_weight=0)",
+                    flush=True,
+                )
 
             epoch_start = time.time()
             epoch_loss = 0.0
@@ -1149,9 +1309,9 @@ def main() -> None:
                         geo_loss = symmetric_contrastive_loss(
                             image_emb,
                             geo_emb,
-                            aligner.logit_scale,
-                            text_labels=batch_class_ids if args.false_negative_mask else None,
-                            logit_scale_max=float(args.logit_scale_max),
+                            aligner.geo_logit_scale,
+                            text_labels=None,
+                            logit_scale_max=float(args.geo_logit_scale_max),
                             label_smoothing=float(args.label_smoothing),
                         )
                     else:
@@ -1173,6 +1333,7 @@ def main() -> None:
 
                 with torch.no_grad():
                     aligner.logit_scale.clamp_(max=logit_scale_max_log)
+                    aligner.geo_logit_scale.clamp_(max=geo_logit_scale_max_log)
 
                 if ema is not None:
                     ema.update(aligner)
@@ -1231,6 +1392,11 @@ def main() -> None:
                                 "train/logit_scale": float(
                                     aligner.logit_scale.exp().detach().cpu().item()
                                 ),
+                                "train/geo_logit_scale": float(
+                                    aligner.geo_logit_scale.exp().detach().cpu().item()
+                                ),
+                                "train/text_loss_weight": float(text_loss_weight),
+                                "train/geo_loss_weight": float(geo_loss_weight),
                                 "train/lr": current_lr,
                                 "train/step_in_epoch": float(step_in_epoch),
                                 "train/steps_in_epoch": float(steps_per_epoch),
