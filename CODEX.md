@@ -695,6 +695,110 @@ Notes on the new CLI surface:
   `sh_siren` swaps in spherical-harmonic positional encoding (SatCLIP /
   Russwurm); `rff_mlp` and `sh_linear` are MLP-headed counterparts;
   `mlp` is the back-compat path used by the v1 run.
+
+### B1a-geo+ v1 run (`rff_siren` / `coords_only`) — results & analysis
+
+Run `olympus-marsclip-b1a-geo-plus-rff-siren-coords-only-v1`, 60 epochs,
+best epoch 58 by `val/alignment_score=0.5388`. Full holdout retrieval
+(EMA weights, `n=12285`):
+
+| metric              | v1 (mlp/latlon_view_scale) | v2 (rff_siren/coords_only) | Δ          | random `n=12285` |
+|--------------------:|---------------------------:|---------------------------:|-----------:|-----------------:|
+| val image→text R@10 | 0.3516                     | **0.3757**                 | +6.9 % rel | 0.000814         |
+| val text→image R@10 | 0.9125                     | **0.9230**                 | +1.1 % rel | 0.000814         |
+| val image→geo R@10  | 0.00114                    | **0.00244**                | +114 % rel | 0.000814         |
+| val geo→image R@10  | 0.00195                    | 0.00147                    | −25 % rel  | 0.000814         |
+| val image→geo med rk| ~6 200                     | **4 866**                  | smaller    | ~6 142           |
+| test image→text R@10| 0.3410                     | **0.3671**                 | +7.6 % rel | 0.000814         |
+| test image→geo R@10 | 0.00122                    | **0.00195**                | +60 % rel  | 0.000814         |
+
+Training-side numbers: text loss `5.63 → 2.63`, geo loss `5.06 → 3.18`,
+both monotonic. The geo branch explicitly trained alone for the first
+3 epochs before text loss kicked in at epoch 4 (verified in
+`history.json`).
+
+#### What worked
+
+- **Geo warmup loop is correct.** Epochs 1–3 had `text_loss_weight=0`;
+  geo loss dropped from 5.06 → 4.27 with no text-side interference,
+  then text loss came online at epoch 4 and dropped from 5.63 → 2.63
+  while geo loss continued downward from 4.08 → 3.18.
+- **Text retrieval did not regress.** Adding the geo branch on a
+  separate temperature actually moved image→text R@10 from 0.352 to
+  0.376 on the full val (and 0.341 → 0.367 on the full test). The B0+
+  text alignment story is intact and slightly improved.
+- **Image→geo doubled.** Median rank moved off chance (≈6 142 → 4 866),
+  R@10 went from 1.4× chance to 3.0× chance. The new positional
+  encoder is doing more than the cyclic-MLP head from v1.
+- **No instability.** EMA of `geo_logit_scale` stayed bounded
+  throughout (no temperature collapse), training was monotone.
+
+#### What did *not* work
+
+- **Geo retrieval is still at floor.** R@10 ~ 0.24 % is real but
+  useless as an end-user signal — picking 10/12285 random points
+  already gives 0.08 %. The model learned to discriminate at the batch
+  level but the val embedding space has no meaningful 1-to-1 lat/lon
+  structure.
+- **`geo→image` R@10 actually got slightly worse than v1** (0.0015 vs.
+  0.0019). Median rank improved (4 827 vs. ~5 100), so this is
+  noise-on-noise rather than a real regression, but it is fair to call
+  v1 ≈ v2 on `geo→image` despite v2 being a much larger model.
+- **Full-val image→text peaked at R@10 = 0.376** (`MRR = 0.375`). The
+  244-unique-rationale ceiling is dominating any further improvement.
+
+#### Why geo retrieval is structurally hard on this data
+
+A diagnostic over the splits manifest (run `2026-04-27`) showed:
+
+- 412 unique HiRISE observations total; 407 of them appear in **all
+  three** splits. Patches are split *within* observations, not across
+  them. So val coords are co-located with train coords:
+  - 89.0 % of val patches have a train patch within 0.005° (one patch).
+  - 100 % of val patches have a train patch within 0.010°.
+- A balanced batch of 244 has zero pairs of patches within 0.005° of
+  each other, so the contrastive negatives are well separated.
+
+The implication is that image↔geo retrieval as a 1-to-1 diagonal task
+is a *near-neighbor disambiguation* problem: the encoder has to
+distinguish a val patch's coord from the dozens of train patches at the
+same coord ±0.005°. That is fundamentally bottlenecked by the
+positional-encoder's bandwidth and by SatMAE's CLS pool, which only
+weakly varies between adjacent HiRISE tiles. With our σ ladder
+`{1, 4, 16, 64}` cycles/deg, the highest-frequency RFF block has
+period ≈ 0.016° — only 3× the patch grid. So adjacent patches are
+already half a wavelength apart and the encoder essentially treats them
+as independent rather than smoothly interpolating.
+
+The right take-away is that **1-to-1 image↔geo retrieval is the wrong
+metric** for the geo head's actual job in MarsCLIP. The geo head's job
+is to inject a coarse spatial prior into the image embedding (so image
+similarity reflects "near neighbors look alike"), not to invert
+coordinates pixel-perfectly. Future B1a-geo evals should add a
+**geocell hit-rate** (top-k retrieved geos lie in the same 0.1° / 0.5°
+geocell as the query) and a **distance correlation** (mean ground
+distance between query and top-k) instead of leaning on R@1/R@10.
+
+#### Recommended next action
+
+The B1a-geo head is now strong enough to ship as a residual signal
+(slight image→text gain, doubled image→geo R@10) without regressing
+text retrieval. Pushing the σ ladder further or adding more capacity
+will keep yielding diminishing returns — the upper bound is set by the
+data, not the encoder.
+
+The next implementation milestone is **B1a-pairs**: paired local /
+global crops + CACo-style consistency loss on the same shared image
+projector. That gives a different signal that does not depend on the
+geo head and is the next phase in the committed plan.
+
+Frozen state of B1a-geo+ v1:
+
+- run dir: `/scratch/marsrecon_runs/stage_b/marsclip_align/20260427/20260427_081138_olympus-marsclip-b1a-geo-plus-rff-siren-coords-only-v1/`
+- best ckpt: `…/checkpoints/best_checkpoint.pt` (epoch 58)
+- W&B: <https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/poekxz9b>
+- full holdout JSONs: `eval_val_full.json`, `eval_test_full.json` next
+  to the run dir.
 - `--geo-rff-sigmas` controls the Gaussian RFF frequency hierarchy.
   `(1, 4, 16, 64)` cycles per degree spans roughly the bbox-scale
   variation down to the 0.005° patch scale.
