@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -11,9 +11,23 @@ try:
     from transformers import AutoConfig, AutoModel, AutoTokenizer, T5EncoderModel
 except ImportError as exc:  # pragma: no cover - optional runtime dependency
     raise ImportError(
-        "transformers is required for stage2 text alignment. "
+        "transformers is required for stage_b text alignment. "
         "Install it with `uv add transformers`."
     ) from exc
+
+
+def _load_pretrained_with_local_fallback(
+    loader: Callable[..., Any],
+    model_name: str,
+) -> Any:
+    """Retry Hugging Face loads from the local cache when network checks fail."""
+    try:
+        return loader(model_name)
+    except Exception as exc:
+        try:
+            return loader(model_name, local_files_only=True)
+        except Exception:
+            raise exc
 
 
 class T5Encoder(nn.Module):
@@ -27,13 +41,13 @@ class T5Encoder(nn.Module):
     ) -> None:
         super().__init__()
         self.max_length = int(max_length)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        config = AutoConfig.from_pretrained(model_name)
+        self.tokenizer = _load_pretrained_with_local_fallback(AutoTokenizer.from_pretrained, model_name)
+        config = _load_pretrained_with_local_fallback(AutoConfig.from_pretrained, model_name)
         if getattr(config, "model_type", "") == "t5":
             # T5 is encoder-decoder; for embedding use we only need encoder states.
-            self.model = T5EncoderModel.from_pretrained(model_name)
+            self.model = _load_pretrained_with_local_fallback(T5EncoderModel.from_pretrained, model_name)
         else:
-            self.model = AutoModel.from_pretrained(model_name)
+            self.model = _load_pretrained_with_local_fallback(AutoModel.from_pretrained, model_name)
         for parameter in self.model.parameters():
             parameter.requires_grad = bool(trainable)
 

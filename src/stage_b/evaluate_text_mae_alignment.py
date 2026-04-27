@@ -1,4 +1,4 @@
-"""Evaluate Stage-2 text/MAE alignment checkpoints.
+"""Evaluate Stage-B text/MAE alignment checkpoints.
 
 Computes retrieval-style alignment metrics:
 - image -> text: Recall@K, MRR, median rank
@@ -13,118 +13,49 @@ import argparse
 import json
 import pathlib
 import sys
-from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
 
 if __package__ is None or __package__ == "":  # pragma: no cover - direct script execution
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from clip.marsclip_patches import MarsCLIPPatchDataset, load_patch_records
-from stage2.T5_encoder import T5Encoder
-from stage2.align_text_mae_embeddings import (
+from stage_b.T5_encoder import T5Encoder
+from stage_b.align_text_mae_embeddings import (
     AlignmentModel,
-    collate_patch_text,
-    encode_image_with_satmae_encoder,
+    attach_split_manifest,
+    build_alignment_dataloader,
+    build_alignment_embeddings,
+    compute_retrieval_metrics,
     load_satmae_encoder,
+    filter_patch_records_by_split,
+    load_split_manifest,
+    select_balanced_patch_records,
+    _resolve_device,
 )
 
 
-def _resolve_device(device: str) -> torch.device:
-    if device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device)
-
-
-def _ranks_from_similarity(similarity: torch.Tensor, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return 1-indexed positive ranks for rows and columns.
-
-    Positive matches are defined by identical text strings, so duplicate
-    rationales are treated as additional valid retrieval targets.
-    """
-    n = similarity.shape[0]
-    text_ids = {text: idx for idx, text in enumerate(sorted(set(texts)))}
-    encoded = torch.tensor([text_ids[text] for text in texts], device=similarity.device)
-    positive_mask = encoded.unsqueeze(1) == encoded.unsqueeze(0)  # (n, n)
-
-    row_order = torch.argsort(similarity, dim=1, descending=True)
-    row_positive = torch.gather(
-        positive_mask,
-        dim=1,
-        index=row_order,
-    )
-    row_rank = row_positive.to(torch.int64).argmax(dim=1) + 1
-
-    col_order = torch.argsort(similarity, dim=0, descending=True)
-    col_positive = torch.gather(
-        positive_mask,
-        dim=0,
-        index=col_order,
-    )
-    col_rank = col_positive.to(torch.int64).argmax(dim=0) + 1
-
-    return row_rank, col_rank
-
-
-def _recall_at_k(ranks: torch.Tensor, k: int) -> float:
-    return float((ranks <= int(k)).float().mean().item())
-
-
-def _mean_reciprocal_rank(ranks: torch.Tensor) -> float:
-    return float((1.0 / ranks.to(torch.float32)).mean().item())
-
-
-@torch.no_grad()
-def build_embeddings(
-    *,
-    dataloader: DataLoader,
-    mae_encoder: torch.nn.Module,
-    text_encoder: T5Encoder,
-    aligner: AlignmentModel,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]], list[str]]:
-    image_embeddings: list[torch.Tensor] = []
-    text_embeddings: list[torch.Tensor] = []
-    metadata_rows: list[dict[str, Any]] = []
-    text_rows: list[str] = []
-
-    for batch in dataloader:
-        images = batch["image"].to(device)
-        texts = batch["text"]
-
-        image_features = encode_image_with_satmae_encoder(mae_encoder, images)
-        text_features, _ = text_encoder(texts, device=device)
-        image_emb, text_emb = aligner(image_features, text_features)
-
-        image_embeddings.append(image_emb.detach().cpu())
-        text_embeddings.append(text_emb.detach().cpu())
-        metadata_rows.extend(batch["metadata"])
-        text_rows.extend(texts)
-
-    return (
-        torch.cat(image_embeddings, dim=0),
-        torch.cat(text_embeddings, dim=0),
-        metadata_rows,
-        text_rows,
-    )
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate Stage-2 text/MAE alignment.")
+    parser = argparse.ArgumentParser(description="Evaluate Stage-B text/MAE alignment.")
     parser.add_argument("--alignment-checkpoint", type=pathlib.Path, required=True)
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("/scratch/mars_hirise"))
     parser.add_argument("--bbox", type=float, nargs=4, default=(-136.0, 12.0, -124.0, 24.0))
     parser.add_argument("--patch-size-deg", type=float, default=0.005)
-    parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument("--patch-size-px", type=int, default=16)
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--patch-size-px", type=int, default=8)
     parser.add_argument("--max-patches", type=int, default=1024)
     parser.add_argument("--patch-records-path", type=pathlib.Path, default=None)
+    parser.add_argument("--split-manifest", type=pathlib.Path, default=None)
+    parser.add_argument("--holdout-split", type=str, default=None, choices=("train", "val", "test"))
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--output-json", type=pathlib.Path, default=None)
     parser.add_argument("--export-embeddings", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--embeddings-out", type=pathlib.Path, default=pathlib.Path("stage2_eval_embeddings.pt"))
+    parser.add_argument("--embeddings-out", type=pathlib.Path, default=pathlib.Path("stage_b_eval_embeddings.pt"))
     args = parser.parse_args()
 
     checkpoint = torch.load(str(args.alignment_checkpoint), map_location="cpu")
@@ -144,22 +75,39 @@ def main() -> None:
     patch_records = None
     if args.patch_records_path is not None and args.patch_records_path.exists():
         patch_records = load_patch_records(args.patch_records_path)
+    if args.split_manifest is not None:
+        if patch_records is None:
+            raise ValueError("--split-manifest requires --patch-records-path so patch ids can be aligned.")
+        patch_records = attach_split_manifest(patch_records, load_split_manifest(args.split_manifest))
+    if patch_records is not None and args.holdout_split is not None:
+        patch_records = filter_patch_records_by_split(patch_records, split_name=args.holdout_split)
+        patch_records = select_balanced_patch_records(
+            patch_records,
+            max_patches=args.max_patches,
+            seed=0,
+        )
+        max_patches = None
+    else:
+        max_patches = args.max_patches
 
     dataset = MarsCLIPPatchDataset(
         root=args.root,
         bbox=tuple(args.bbox),
         patch_size=args.patch_size_deg,
         image_size=args.image_size,
-        max_patches=args.max_patches,
+        max_patches=max_patches,
         color_only=True,
         patch_records=patch_records,
     )
-    dataloader = DataLoader(
+    dataloader = build_alignment_dataloader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
-        collate_fn=collate_patch_text,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
+        drop_last=False,
     )
 
     mae_encoder = load_satmae_encoder(
@@ -187,7 +135,7 @@ def main() -> None:
     aligner.load_state_dict(checkpoint["aligner_state"], strict=True)
     aligner.eval()
 
-    image_emb, text_emb, metadata_rows, text_rows = build_embeddings(
+    image_emb, text_emb, metadata_rows, text_rows = build_alignment_embeddings(
         dataloader=dataloader,
         mae_encoder=mae_encoder,
         text_encoder=text_encoder,
@@ -195,23 +143,9 @@ def main() -> None:
         device=device,
     )
 
-    similarity = image_emb @ text_emb.T
-    img_to_txt_rank, txt_to_img_rank = _ranks_from_similarity(similarity, text_rows)
-
-    metrics = {
-        "num_samples": int(similarity.shape[0]),
-        "num_unique_texts": int(len(set(text_rows))),
-        "image_to_text_r1": _recall_at_k(img_to_txt_rank, 1),
-        "image_to_text_r5": _recall_at_k(img_to_txt_rank, 5),
-        "image_to_text_r10": _recall_at_k(img_to_txt_rank, 10),
-        "image_to_text_mrr": _mean_reciprocal_rank(img_to_txt_rank),
-        "image_to_text_median_rank": float(torch.median(img_to_txt_rank.to(torch.float32)).item()),
-        "text_to_image_r1": _recall_at_k(txt_to_img_rank, 1),
-        "text_to_image_r5": _recall_at_k(txt_to_img_rank, 5),
-        "text_to_image_r10": _recall_at_k(txt_to_img_rank, 10),
-        "text_to_image_mrr": _mean_reciprocal_rank(txt_to_img_rank),
-        "text_to_image_median_rank": float(torch.median(txt_to_img_rank.to(torch.float32)).item()),
-    }
+    metrics = {key: float(value) for key, value in compute_retrieval_metrics(image_emb, text_emb, text_rows).items()}
+    if args.holdout_split is not None:
+        metrics["holdout_split"] = args.holdout_split
 
     print(json.dumps(metrics, indent=2))
 

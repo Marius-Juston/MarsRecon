@@ -159,6 +159,34 @@ wheels = [
 ]
 
 [[package]]
+name = "boto3"
+version = "1.42.95"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "botocore" },
+    { name = "jmespath" },
+    { name = "s3transfer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e0/33/1e44193d5419683bf9dc121108407cbd6ebe73e17f5615cb62c68fae97b1/boto3-1.42.95.tar.gz", hash = "sha256:1cb77a269596abe05e72ed44a26167e7a620df920edb7c65e7d8a7dd39b427d5", size = 113226, upload-time = "2026-04-23T21:35:36.657Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/c6/8908d18c0fbef8edb62791e1a5b8ff33b816b1a9b9dff360159befdb8fac/boto3-1.42.95-py3-none-any.whl", hash = "sha256:f0175de8f52448e9ecade9573532c25bed390a7c30435920a0da42a10f4cafb3", size = 140557, upload-time = "2026-04-23T21:35:33.906Z" },
+]
+
+[[package]]
+name = "botocore"
+version = "1.42.95"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jmespath" },
+    { name = "python-dateutil" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a0/29/a6d95515b49357891f63cb7a93fef37334118ba7d11d686d139e5d648733/botocore-1.42.95.tar.gz", hash = "sha256:f23a78b76def67222ddac738fb65475f55d17fd88c1e18573b3a561135ec4527", size = 15260896, upload-time = "2026-04-23T21:35:22.335Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/ee/b08867e183922dd356d2d8f23bafd7bb6b24c5992bdb301873edbb096e2d/botocore-1.42.95-py3-none-any.whl", hash = "sha256:3381279d26792df2fcc3d5d7fa052ecf1949a0fe1ea819bf35d61e943c15a3b6", size = 14943430, upload-time = "2026-04-23T21:35:18.976Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.2.25"
 source = { registry = "https://pypi.org/simple" }
@@ -648,6 +676,15 @@ wheels = [
 ]
 
 [[package]]
+name = "jmespath"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/59/322338183ecda247fb5d1763a6cbe46eff7222eaeebafd9fa65d4bf5cb11/jmespath-1.1.0.tar.gz", hash = "sha256:472c87d80f36026ae83c6ddd0f1d05d4e510134ed462851fd5f754c8c3cbb88d", size = 27377, upload-time = "2026-01-22T16:35:26.279Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/14/2f/967ba146e6d58cf6a652da73885f52fc68001525b4197effc174321d70b4/jmespath-1.1.0-py3-none-any.whl", hash = "sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64", size = 20419, upload-time = "2026-01-22T16:35:24.919Z" },
+]
+
+[[package]]
 name = "jsonargparse"
 version = "4.47.0"
 source = { registry = "https://pypi.org/simple" }
@@ -803,6 +840,26 @@ wheels = [
 ]
 
 [[package]]
+name = "litdata"
+version = "0.2.61"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "boto3" },
+    { name = "filelock" },
+    { name = "lightning-utilities" },
+    { name = "numpy" },
+    { name = "obstore" },
+    { name = "requests" },
+    { name = "tifffile" },
+    { name = "torch" },
+    { name = "torchvision" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6e/66/6ff8c295d2b1b91c1867f2c0cdd8d15d45782252154f22e313de5154a038/litdata-0.2.61.tar.gz", hash = "sha256:ff398facbf624067dc93a87ca836c97de877705df542f857bc7d78e5c84f8c4e", size = 219649, upload-time = "2026-02-20T14:34:54.534Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/dd/e8a26e3eb200c6495339f2e6009c1121544c4e54999c9392342bcf8d308e/litdata-0.2.61-py3-none-any.whl", hash = "sha256:2a77762b3b827b35980ea9dc5839dd65ca5c0984e291bf2d2fe09389a35d882e", size = 205413, upload-time = "2026-02-20T14:34:53.391Z" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -845,6 +902,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "torch" },
     { name = "torchgeo" },
+    { name = "transformers" },
 ]
 
 [package.optional-dependencies]
@@ -854,6 +912,7 @@ depthfm = [
     { name = "einops" },
     { name = "jsonargparse", extra = ["signatures"] },
     { name = "lightning" },
+    { name = "litdata" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "omegaconf" },
@@ -881,6 +940,9 @@ dev = [
 experiment = [
     { name = "wandb" },
 ]
+streaming = [
+    { name = "litdata" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -892,6 +954,8 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.8.0" },
     { name = "jsonargparse", extras = ["signatures"], marker = "extra == 'depthfm'", specifier = ">=4.47.0" },
     { name = "lightning", marker = "extra == 'depthfm'", specifier = ">=2.6.1" },
+    { name = "litdata", marker = "extra == 'depthfm'", specifier = ">=0.2.61" },
+    { name = "litdata", marker = "extra == 'streaming'", specifier = ">=0.2.61" },
     { name = "matplotlib", marker = "extra == 'depthfm'", specifier = ">=3.10.8" },
     { name = "numpy", marker = "extra == 'depthfm'", specifier = ">=2.4.4" },
     { name = "omegaconf", marker = "extra == 'depthfm'", specifier = ">=2.3.0" },
@@ -915,11 +979,12 @@ requires-dist = [
     { name = "torchgeo", specifier = ">=0.9.0" },
     { name = "torchmetrics", marker = "extra == 'depthfm'", specifier = ">=1.9.0" },
     { name = "tqdm", marker = "extra == 'depthfm'", specifier = ">=4.67.3" },
+    { name = "transformers", specifier = ">=5.5.0" },
     { name = "transformers", marker = "extra == 'depthfm'", specifier = ">=5.5.0" },
     { name = "wandb", marker = "extra == 'depthfm'", specifier = ">=0.25.1" },
     { name = "wandb", marker = "extra == 'experiment'", specifier = ">=0.19" },
 ]
-provides-extras = ["dev", "experiment", "depthfm"]
+provides-extras = ["dev", "experiment", "streaming", "depthfm"]
 
 [[package]]
 name = "matplotlib"
@@ -1161,6 +1226,30 @@ version = "12.8.90"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/eb/86626c1bbc2edb86323022371c39aa48df6fd8b0a1647bc274577f72e90b/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:5b17e2001cc0d751a5bc2c6ec6d26ad95913324a4adb86788c944f8ce9ba441f", size = 89954, upload-time = "2025-03-07T01:42:44.131Z" },
+]
+
+[[package]]
+name = "obstore"
+version = "0.9.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d3/7a/3a37b0bf0da898478029fcc511a0d2a7252689b1f29e46db7ae74a219c74/obstore-0.9.4.tar.gz", hash = "sha256:e2b93f1372c59da2c7e74122fc6dc4b713d84fd4528b5b500ef7f548425496b5", size = 124167, upload-time = "2026-04-22T19:51:05.261Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ac/25/4449a0066796b91e282d7604a66387bba399b14752598c748ea9557c4c32/obstore-0.9.4-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:0d17cd04e7f22960050a85f8daa6e274d693e8fb3b97b81eeaa293c6f9e62eb4", size = 4090743, upload-time = "2026-04-22T19:49:26.461Z" },
+    { url = "https://files.pythonhosted.org/packages/93/91/639fe5f5644593b9f4bea66f8f29c7bfd4de3b3381fb74b4f7df678f505f/obstore-0.9.4-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:d4beec92710fb8826fb357baf28fb79a91ee07dcdfe73777207aa762164aaa35", size = 3876313, upload-time = "2026-04-22T19:49:28.107Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/71/d6675f845ebe1e3927f2dce6a2a4d5a393359274762ee00c5e6855d5f468/obstore-0.9.4-cp311-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:d523c8c365ab60afb8d232614a00a92bea439a9f5c55b92486c23a47af038a1e", size = 4029950, upload-time = "2026-04-22T19:49:30.279Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/3a/5915a173f5c6a95f9ec186a7e29b0ce6a23bd9b04c2b0b29a351dbe2baf6/obstore-0.9.4-cp311-abi3-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:ee0483619088337ee365cb344fceee337e2670ec4de2a1da92ac7f6b2220f18e", size = 4129455, upload-time = "2026-04-22T19:49:31.934Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/a9/63c31d2d436c06c4d39ed5cb154fe54202b303854532ec09537c4ce0755b/obstore-0.9.4-cp311-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:83da348bf0a7dd84e5839c0cd54d79dcd08e0729c394e566f73a605b93b9e998", size = 4416727, upload-time = "2026-04-22T19:49:34.016Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/fa/23c5c6db02be0e13abcbe01c1ca94c5f7876e8c58e74cb9ac2b57b068866/obstore-0.9.4-cp311-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:f282a17200bcc37b8d7a1d02a146ed41812eb6e76fd0a4c9a154f02da1b8031f", size = 4311520, upload-time = "2026-04-22T19:49:35.905Z" },
+    { url = "https://files.pythonhosted.org/packages/86/f0/49f6b02dab9c05e3fd79d6129e4d9e7e9874d6e5e05369ca3b3b80a48aaa/obstore-0.9.4-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d29dcfceaa0a205ded2263d29a2a3aa206819d549e0325c1f2106f79e2658584", size = 4220536, upload-time = "2026-04-22T19:49:38.343Z" },
+    { url = "https://files.pythonhosted.org/packages/50/ab/d0bfd6d68422e7d8f2204d91736c7e62767e0576ad749da442a71e7773b2/obstore-0.9.4-cp311-abi3-manylinux_2_24_aarch64.whl", hash = "sha256:caecb912723ab8e9da8da26def249d66da4318959df2bafc0a55af64f3255902", size = 4105099, upload-time = "2026-04-22T19:49:40.384Z" },
+    { url = "https://files.pythonhosted.org/packages/66/3b/f595d0ee354f9daa69438991f8818602f34bc59498c8468456a02d45fb27/obstore-0.9.4-cp311-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:0c1c06fec8837595a2829b5f7536d0d01e940ce10b07ad2a8594fec1cfd0b7d5", size = 4294206, upload-time = "2026-04-22T19:49:42.016Z" },
+    { url = "https://files.pythonhosted.org/packages/60/54/3c5af2d59258aaa9e5bef05320658ea6e9b1f3897a3a977bf7f54a0b6ec1/obstore-0.9.4-cp311-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:c132795a789ec5ade31bf4d5b55ed321fb41d9749e9145520bf19063e1da5f7b", size = 4265047, upload-time = "2026-04-22T19:49:43.983Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/af/a8ba1feb81b9833b253147839da40405ec6bfa51feb3abfe909c800208a5/obstore-0.9.4-cp311-abi3-musllinux_1_2_i686.whl", hash = "sha256:c6e342360a5d0ae71486bc5f8311778aa144ec1a905c23593f8ef57b5bceae24", size = 4255361, upload-time = "2026-04-22T19:49:45.864Z" },
+    { url = "https://files.pythonhosted.org/packages/15/f7/3ccc0288111e057f8ba3d99bee14f95d9e9bb00acaf6e9700e0eb4cd82c3/obstore-0.9.4-cp311-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:aeb6f7e7e862550f5020a10692ef6f02d5ba4912dba08942eb59bb7d73f93fe0", size = 4439378, upload-time = "2026-04-22T19:49:47.581Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/b1/3ac8b5772743c60064f3c7e02d27f346dbb58feaa99a49ee09798d1cfb00/obstore-0.9.4-cp311-abi3-win_amd64.whl", hash = "sha256:a58ef942292841f99d69ac11d19d05544c835447c8c09dacbfb7409c6374c4a1", size = 4191594, upload-time = "2026-04-22T19:49:49.308Z" },
 ]
 
 [[package]]
@@ -1650,6 +1739,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ca/20/69ed9131f7677790c9f1b51f0b69656575ab4b93090a45201527a55b2bbd/rms_vax-1.0.5.tar.gz", hash = "sha256:7e83e7461e5a7d5d765225220bfd8e27242b5f20838d930bf3665d9ef66211b0", size = 36443, upload-time = "2024-12-16T21:03:58.689Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/78/f9/407a90f936fa3fbfea576845e18798f05398c832e3055207e68a24eda432/rms_vax-1.0.5-py3-none-any.whl", hash = "sha256:cf81320d3b0adb85d881a1f5e2a348c3e42aaec3b34f090b16d84e91d0a8f57a", size = 10422, upload-time = "2024-12-16T21:03:56.421Z" },
+]
+
+[[package]]
+name = "s3transfer"
+version = "0.16.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "botocore" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/46/29/af14f4ef3c11a50435308660e2cc68761c9a7742475e0585cd4396b91777/s3transfer-0.16.1.tar.gz", hash = "sha256:8e424355754b9ccb32467bdc568edf55be82692ef2002d934b1311dbb3b9e524", size = 154801, upload-time = "2026-04-22T20:36:06.475Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/19/90d7d4ed51932c022d53f1d02d564b62d10e272692a1f9b76425c1ad2a02/s3transfer-0.16.1-py3-none-any.whl", hash = "sha256:61bcd00ccb83b21a0fe7e91a553fff9729d46c83b4e0106e7c314a733891f7c2", size = 86825, upload-time = "2026-04-22T20:36:04.992Z" },
 ]
 
 [[package]]
