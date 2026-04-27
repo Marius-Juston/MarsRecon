@@ -56,6 +56,7 @@ def main() -> None:
     parser.add_argument("--output-json", type=pathlib.Path, default=None)
     parser.add_argument("--export-embeddings", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--embeddings-out", type=pathlib.Path, default=pathlib.Path("stage_b_eval_embeddings.pt"))
+    parser.add_argument("--use-ema", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     checkpoint = torch.load(str(args.alignment_checkpoint), map_location="cpu")
@@ -69,6 +70,13 @@ def main() -> None:
     embed_dim = int(checkpoint["embed_dim"])
     image_dim = int(checkpoint["image_dim"])
     text_dim = int(checkpoint["text_dim"])
+    aligner_config = dict(checkpoint.get("aligner_config") or {})
+    projector_type = str(aligner_config.get("projector_type", checkpoint.get("projector_type", config.get("projector_type", "linear"))))
+    projector_hidden_dim = int(aligner_config.get("projector_hidden_dim", config.get("projector_hidden_dim", 768)))
+    projector_depth = int(aligner_config.get("projector_depth", config.get("projector_depth", 2)))
+    projector_dropout = float(aligner_config.get("projector_dropout", config.get("projector_dropout", 0.0)))
+    image_pool = str(checkpoint.get("image_pool", config.get("image_pool", "cls")))
+    use_ema_weights = bool(args.use_ema) and checkpoint.get("ema_state") is not None
 
     device = _resolve_device(args.device)
 
@@ -131,8 +139,19 @@ def main() -> None:
     if checkpoint.get("text_encoder_state") is not None:
         text_encoder.load_state_dict(checkpoint["text_encoder_state"], strict=False)
 
-    aligner = AlignmentModel(image_dim=image_dim, text_dim=text_dim, embed_dim=embed_dim).to(device)
+    aligner = AlignmentModel(
+        image_dim=image_dim,
+        text_dim=text_dim,
+        embed_dim=embed_dim,
+        projector_type=projector_type,
+        projector_hidden_dim=projector_hidden_dim,
+        projector_depth=projector_depth,
+        projector_dropout=projector_dropout,
+    ).to(device)
     aligner.load_state_dict(checkpoint["aligner_state"], strict=True)
+    if use_ema_weights:
+        ema_state = {key: tensor.to(device) for key, tensor in checkpoint["ema_state"].items()}
+        aligner.load_state_dict(ema_state, strict=True)
     aligner.eval()
 
     image_emb, text_emb, metadata_rows, text_rows = build_alignment_embeddings(
@@ -141,6 +160,7 @@ def main() -> None:
         text_encoder=text_encoder,
         aligner=aligner,
         device=device,
+        image_pool=image_pool,
     )
 
     metrics = {key: float(value) for key, value in compute_retrieval_metrics(image_emb, text_emb, text_rows).items()}

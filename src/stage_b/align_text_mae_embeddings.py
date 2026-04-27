@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 if __package__ is None or __package__ == "":  # pragma: no cover - direct script execution
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -480,9 +480,26 @@ def load_satmae_encoder(
     return model
 
 
+IMAGE_POOL_CHOICES = ("cls", "mean_patch", "cls_plus_mean")
+
+
+def image_pool_output_dim(pool: str, base_dim: int) -> int:
+    """Effective image-feature dimensionality given a SatMAE pooling strategy."""
+    if pool not in IMAGE_POOL_CHOICES:
+        raise ValueError(f"Unknown image_pool '{pool}'. Expected one of {IMAGE_POOL_CHOICES}.")
+    return int(base_dim) * (2 if pool == "cls_plus_mean" else 1)
+
+
 @torch.no_grad()
-def encode_image_with_satmae_encoder(model: nn.Module, images: torch.Tensor) -> torch.Tensor:
-    """Encode images with SatMAE encoder (CLS token output)."""
+def encode_image_with_satmae_encoder(
+    model: nn.Module,
+    images: torch.Tensor,
+    *,
+    pool: str = "cls",
+) -> torch.Tensor:
+    """Encode images with the SatMAE encoder using the requested token pooling."""
+    if pool not in IMAGE_POOL_CHOICES:
+        raise ValueError(f"Unknown image_pool '{pool}'. Expected one of {IMAGE_POOL_CHOICES}.")
     tokens = model.patch_embed(images)
     tokens = tokens + model.pos_embed[:, 1:, :]
     cls = model.cls_token + model.pos_embed[:, :1, :]
@@ -491,7 +508,13 @@ def encode_image_with_satmae_encoder(model: nn.Module, images: torch.Tensor) -> 
     for block in model.blocks:
         hidden = block(hidden)
     hidden = model.norm(hidden)
-    return hidden[:, 0]  # CLS embedding
+    cls_out = hidden[:, 0]
+    if pool == "cls":
+        return cls_out
+    patch_mean = hidden[:, 1:].mean(dim=1)
+    if pool == "mean_patch":
+        return patch_mean
+    return torch.cat([cls_out, patch_mean], dim=1)
 
 
 def collate_patch_text(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -547,6 +570,38 @@ def build_text_labels(texts: list[str], device: torch.device) -> torch.Tensor:
     return torch.tensor(label_ids, device=device, dtype=torch.long)
 
 
+def _masked_smoothed_cross_entropy(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Cross-entropy that ignores masked logits in both the softmax and the
+    smoothing distribution.
+
+    ``F.cross_entropy(label_smoothing=...)`` averages the smoothed term over
+    *all* classes, so combining it with ``-inf`` masked logits produces ``inf``.
+    This helper masks invalid classes out of the softmax denominator and the
+    smoothing average, keeping label smoothing well-defined when same-text
+    duplicates are removed from the negative set.
+    """
+    smoothing = float(label_smoothing)
+    if mask is None:
+        return F.cross_entropy(logits, target, label_smoothing=smoothing)
+    masked_logits = logits.masked_fill(mask, float("-inf"))
+    log_probs = F.log_softmax(masked_logits, dim=1)
+    n = logits.shape[0]
+    nll = -log_probs[torch.arange(n, device=logits.device), target]
+    if smoothing <= 0.0:
+        return nll.mean()
+    valid = ~mask
+    num_valid = valid.sum(dim=1).clamp(min=1).to(log_probs.dtype)
+    safe_log_probs = log_probs.masked_fill(mask, 0.0)
+    smoothed = -(safe_log_probs * valid.to(log_probs.dtype)).sum(dim=1) / num_valid
+    return ((1.0 - smoothing) * nll + smoothing * smoothed).mean()
+
+
 def symmetric_contrastive_loss(
     image_embeddings: torch.Tensor,
     text_embeddings: torch.Tensor,
@@ -554,26 +609,178 @@ def symmetric_contrastive_loss(
     *,
     text_labels: torch.Tensor | None = None,
     logit_scale_max: float = 100.0,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """Symmetric InfoNCE with optional same-text false-negative masking.
+    """Symmetric InfoNCE with optional false-negative masking and label smoothing.
 
     The Olympus rationale vocabulary is small (~244 unique strings) and highly
     imbalanced, so every contrastive batch contains many same-text samples.
     When ``text_labels`` is provided we mask non-diagonal same-text entries out
     of the softmax denominator, preventing those duplicates from being treated
-    as negatives.
+    as negatives. ``label_smoothing`` softens the diagonal target distribution
+    while respecting the mask so it stays finite.
     """
     scale = logit_scale.exp().clamp(max=float(logit_scale_max))
     logits = torch.matmul(image_embeddings, text_embeddings.T) * scale
     n = image_embeddings.shape[0]
     target = torch.arange(n, device=image_embeddings.device)
+    mask: torch.Tensor | None = None
     if text_labels is not None:
         same_text = text_labels.unsqueeze(0) == text_labels.unsqueeze(1)
         eye = torch.eye(n, dtype=torch.bool, device=image_embeddings.device)
         false_negative_mask = same_text & ~eye
         if bool(false_negative_mask.any()):
-            logits = logits.masked_fill(false_negative_mask, float("-inf"))
-    return 0.5 * (F.cross_entropy(logits, target) + F.cross_entropy(logits.T, target))
+            mask = false_negative_mask
+    forward_loss = _masked_smoothed_cross_entropy(
+        logits, target, mask=mask, label_smoothing=label_smoothing
+    )
+    reverse_loss = _masked_smoothed_cross_entropy(
+        logits.T, target, mask=mask.T if mask is not None else None, label_smoothing=label_smoothing
+    )
+    return 0.5 * (forward_loss + reverse_loss)
+
+
+def prototype_classification_loss(
+    image_embeddings: torch.Tensor,
+    prototype_embeddings: torch.Tensor,
+    class_ids: torch.Tensor,
+    logit_scale: torch.Tensor,
+    *,
+    logit_scale_max: float = 100.0,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Cross-entropy of images against the full bank of class-prototype text embeddings.
+
+    With only ~244 unique rationales in Stage B, treating each unique text as
+    a class prototype removes batch-size sensitivity: every image is scored
+    against all 244 candidate texts, which is a much stronger learning signal
+    than a 256-way contrastive subset.
+    """
+    scale = logit_scale.exp().clamp(max=float(logit_scale_max))
+    logits = image_embeddings @ prototype_embeddings.T * scale
+    return F.cross_entropy(logits, class_ids, label_smoothing=float(label_smoothing))
+
+
+def build_projector(
+    in_dim: int,
+    embed_dim: int,
+    *,
+    kind: str = "linear",
+    hidden_dim: int = 768,
+    depth: int = 2,
+    dropout: float = 0.0,
+) -> nn.Module:
+    """Construct an image/text projection head.
+
+    ``kind="linear"`` reproduces the original B0 baseline. ``kind="mlp"`` adds
+    capacity via an LayerNorm/GELU MLP with ``depth`` total ``Linear`` layers.
+    """
+    if kind == "linear":
+        return nn.Linear(int(in_dim), int(embed_dim))
+    if kind != "mlp":
+        raise ValueError(f"Unknown projector kind '{kind}'. Expected 'linear' or 'mlp'.")
+    if int(depth) < 1:
+        raise ValueError("projector depth must be >= 1.")
+    layers: list[nn.Module] = []
+    prev = int(in_dim)
+    hidden = int(hidden_dim)
+    for _ in range(int(depth) - 1):
+        layers.append(nn.Linear(prev, hidden))
+        layers.append(nn.LayerNorm(hidden))
+        layers.append(nn.GELU())
+        if float(dropout) > 0.0:
+            layers.append(nn.Dropout(float(dropout)))
+        prev = hidden
+    layers.append(nn.Linear(prev, int(embed_dim)))
+    return nn.Sequential(*layers)
+
+
+class ClassBalancedSampler(Sampler[int]):
+    """Class-stratified sampler that interleaves samples across class buckets.
+
+    Each output cycle visits every class still holding remaining samples, so
+    contiguous windows of length ``num_classes`` contain at most one sample per
+    class. With ``batch_size >= num_classes`` every batch covers every class,
+    eliminating the false-negative problem at the source.
+    """
+
+    def __init__(
+        self,
+        class_ids: list[int],
+        *,
+        generator: torch.Generator | None = None,
+    ) -> None:
+        if not class_ids:
+            raise ValueError("ClassBalancedSampler requires at least one class id.")
+        groups: dict[int, list[int]] = {}
+        for index, class_id in enumerate(class_ids):
+            groups.setdefault(int(class_id), []).append(int(index))
+        self._groups: list[list[int]] = list(groups.values())
+        self._total: int = sum(len(group) for group in self._groups)
+        self.generator = generator
+
+    def __iter__(self):
+        rng = self.generator if self.generator is not None else torch.Generator()
+        shuffled: list[list[int]] = []
+        for group in self._groups:
+            permutation = torch.randperm(len(group), generator=rng).tolist()
+            shuffled.append([group[index] for index in permutation])
+        cursors = [0] * len(shuffled)
+        out: list[int] = []
+        while len(out) < self._total:
+            class_order = torch.randperm(len(shuffled), generator=rng).tolist()
+            for class_index in class_order:
+                if cursors[class_index] < len(shuffled[class_index]):
+                    out.append(shuffled[class_index][cursors[class_index]])
+                    cursors[class_index] += 1
+                if len(out) >= self._total:
+                    break
+        return iter(out)
+
+    def __len__(self) -> int:
+        return self._total
+
+
+class ParameterEMA:
+    """Exponential moving average over an ``nn.Module``'s parameters and buffers.
+
+    The aligner is small enough to keep a full shadow copy on-device. Floating
+    point tensors are EMA-tracked; integer/bool buffers (e.g. counts) are
+    copied verbatim so things like ``num_batches_tracked`` keep working.
+    """
+
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        if not (0.0 < float(decay) < 1.0):
+            raise ValueError("EMA decay must lie in the open interval (0, 1).")
+        self.decay = float(decay)
+        self.shadow: dict[str, torch.Tensor] = {
+            name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, tensor in model.state_dict().items():
+            shadow = self.shadow[name]
+            if tensor.dtype.is_floating_point:
+                shadow.mul_(self.decay).add_(tensor.detach().to(shadow.dtype), alpha=1.0 - self.decay)
+            else:
+                shadow.copy_(tensor.detach())
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {name: tensor.detach().clone() for name, tensor in self.shadow.items()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        for name, tensor in state.items():
+            if name in self.shadow:
+                self.shadow[name].copy_(tensor)
+
+    def apply_to(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        backup = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=True)
+        return backup
+
+    def restore(self, model: nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        model.load_state_dict(backup, strict=True)
 
 
 @dataclass(eq=False)
@@ -584,16 +791,53 @@ class AlignmentModel(nn.Module):
     text_projector: nn.Module
     logit_scale: nn.Parameter
 
-    def __init__(self, image_dim: int, text_dim: int, embed_dim: int) -> None:
+    def __init__(
+        self,
+        image_dim: int,
+        text_dim: int,
+        embed_dim: int,
+        *,
+        projector_type: str = "linear",
+        projector_hidden_dim: int = 768,
+        projector_depth: int = 2,
+        projector_dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.image_projector = nn.Linear(image_dim, embed_dim)
-        self.text_projector = nn.Linear(text_dim, embed_dim)
+        self.image_projector = build_projector(
+            image_dim,
+            embed_dim,
+            kind=projector_type,
+            hidden_dim=projector_hidden_dim,
+            depth=projector_depth,
+            dropout=projector_dropout,
+        )
+        self.text_projector = build_projector(
+            text_dim,
+            embed_dim,
+            kind=projector_type,
+            hidden_dim=projector_hidden_dim,
+            depth=projector_depth,
+            dropout=projector_dropout,
+        )
         self.logit_scale = nn.Parameter(torch.tensor(float(torch.log(torch.tensor(1 / 0.07)))))
+        self.aligner_config: dict[str, Any] = {
+            "image_dim": int(image_dim),
+            "text_dim": int(text_dim),
+            "embed_dim": int(embed_dim),
+            "projector_type": str(projector_type),
+            "projector_hidden_dim": int(projector_hidden_dim),
+            "projector_depth": int(projector_depth),
+            "projector_dropout": float(projector_dropout),
+        }
+
+    def project_text(self, text_features: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.text_projector(text_features), dim=1)
+
+    def project_image(self, image_features: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.image_projector(image_features), dim=1)
 
     def forward(self, image_features: torch.Tensor, text_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        image_embeddings = F.normalize(self.image_projector(image_features), dim=1)
-        text_embeddings = F.normalize(self.text_projector(text_features), dim=1)
-        return image_embeddings, text_embeddings
+        return self.project_image(image_features), self.project_text(text_features)
 
 
 class FrozenTextEmbeddingCache:
@@ -711,6 +955,7 @@ def build_frozen_image_feature_dataset(
     out_dir: pathlib.Path | None = None,
     progress_log_interval: int = 10,
     phase: str = "image_cache_warmup",
+    image_pool: str = "cls",
 ) -> FrozenImageFeatureDataset:
     """Precompute frozen MAE image features once and train on the cached vectors."""
     dataloader = build_alignment_dataloader(
@@ -733,7 +978,7 @@ def build_frozen_image_feature_dataset(
 
     for step, batch in enumerate(dataloader, start=1):
         images = batch["image"].to(device, non_blocking=non_blocking)
-        image_features = encode_image_with_satmae_encoder(mae_encoder, images)
+        image_features = encode_image_with_satmae_encoder(mae_encoder, images, pool=image_pool)
         feature_batches.append(image_features.detach().cpu())
         text_rows.extend(batch["text"])
         metadata_rows.extend(batch["metadata"])
@@ -775,6 +1020,7 @@ def build_alignment_embeddings(
     device: torch.device,
     text_cache: FrozenTextEmbeddingCache | None = None,
     non_blocking: bool = False,
+    image_pool: str = "cls",
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]], list[str]]:
     """Build aligned image/text embeddings for retrieval evaluation."""
     image_embeddings: list[torch.Tensor] = []
@@ -788,7 +1034,7 @@ def build_alignment_embeddings(
             image_features = batch["image_features"].to(device, non_blocking=non_blocking)
         else:
             images = batch["image"].to(device, non_blocking=non_blocking)
-            image_features = encode_image_with_satmae_encoder(mae_encoder, images)
+            image_features = encode_image_with_satmae_encoder(mae_encoder, images, pool=image_pool)
 
         if text_cache is not None:
             text_features = text_cache.encode(texts)
@@ -819,6 +1065,7 @@ def evaluate_alignment_retrieval(
     device: torch.device,
     text_cache: FrozenTextEmbeddingCache | None = None,
     non_blocking: bool = False,
+    image_pool: str = "cls",
 ) -> dict[str, float]:
     """Evaluate retrieval quality for the current alignment model."""
     image_emb, text_emb, _, text_rows = build_alignment_embeddings(
@@ -829,6 +1076,7 @@ def evaluate_alignment_retrieval(
         device=device,
         text_cache=text_cache,
         non_blocking=non_blocking,
+        image_pool=image_pool,
     )
     return compute_retrieval_metrics(image_emb, text_emb, text_rows)
 
@@ -853,6 +1101,7 @@ def _save_alignment_checkpoint(
     text_dim: int,
     wandb_logger: WandbLogger | None,
     epoch: int,
+    ema: ParameterEMA | None = None,
 ) -> pathlib.Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -861,6 +1110,9 @@ def _save_alignment_checkpoint(
             "config": config,
             "history": history,
             "aligner_state": aligner.state_dict(),
+            "aligner_config": dict(getattr(aligner, "aligner_config", {})),
+            "ema_state": ema.state_dict() if ema is not None else None,
+            "ema_decay": float(ema.decay) if ema is not None else None,
             "text_encoder_state": text_encoder.state_dict() if args.train_text_encoder else None,
             "mae_encoder_state": mae_encoder.state_dict() if not args.freeze_mae else None,
             "text_model_name": args.text_model,
@@ -869,6 +1121,9 @@ def _save_alignment_checkpoint(
             "image_dim": image_dim,
             "text_dim": text_dim,
             "embed_dim": int(args.embed_dim),
+            "image_pool": str(getattr(args, "image_pool", "cls")),
+            "loss_type": str(getattr(args, "loss_type", "infonce")),
+            "projector_type": str(getattr(args, "projector_type", "linear")),
             "wandb_mode": wandb_logger.mode if wandb_logger is not None else "disabled",
             "wandb_project": wandb_logger.project if wandb_logger is not None else None,
             "wandb_entity": wandb_logger.entity if wandb_logger is not None else None,
@@ -919,6 +1174,15 @@ def main() -> None:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--false-negative-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--logit-scale-max", type=float, default=100.0)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--projector-type", type=str, default="linear", choices=("linear", "mlp"))
+    parser.add_argument("--projector-hidden-dim", type=int, default=768)
+    parser.add_argument("--projector-depth", type=int, default=2)
+    parser.add_argument("--projector-dropout", type=float, default=0.0)
+    parser.add_argument("--image-pool", type=str, default="cls", choices=IMAGE_POOL_CHOICES)
+    parser.add_argument("--loss-type", type=str, default="infonce", choices=("infonce", "prototype"))
+    parser.add_argument("--balanced-sampler", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ema-decay", type=float, default=0.0)
     parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--progress-log-interval", type=int, default=25)
     parser.add_argument("--device", type=str, default="auto")
@@ -966,6 +1230,7 @@ def main() -> None:
     config: dict[str, Any] | None = None
     image_dim: int | None = None
     text_dim: int | None = None
+    ema: ParameterEMA | None = None
 
     save_training_progress(
         {
@@ -1111,6 +1376,7 @@ def main() -> None:
                     startup_progress_path,
                 )
 
+        image_pool = str(args.image_pool)
         train_source_dataset: Dataset | list[dict[str, Any]] = dataset
         val_source_dataset: Dataset | list[dict[str, Any]] | None = val_dataset
         if args.cache_image_embeddings and args.freeze_mae:
@@ -1127,6 +1393,7 @@ def main() -> None:
                 out_dir=out_dir,
                 progress_log_interval=max(progress_interval // 2, 1),
                 phase="train_image_cache_warmup",
+                image_pool=image_pool,
             )
             if val_dataset is not None:
                 val_source_dataset = build_frozen_image_feature_dataset(
@@ -1142,6 +1409,7 @@ def main() -> None:
                     out_dir=out_dir,
                     progress_log_interval=max(progress_interval // 2, 1),
                     phase="val_image_cache_warmup",
+                    image_pool=image_pool,
                 )
             save_training_progress(
                 {
@@ -1161,17 +1429,60 @@ def main() -> None:
         train_loader_prefetch_factor = None if using_cached_train_features else args.prefetch_factor
         train_loader_persistent_workers = False if using_cached_train_features else bool(args.persistent_workers)
 
-        dataloader = build_alignment_dataloader(
-            train_source_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            generator=torch.Generator().manual_seed(args.seed),
-            num_workers=train_loader_num_workers,
-            pin_memory=train_loader_pin_memory,
-            prefetch_factor=train_loader_prefetch_factor,
-            persistent_workers=train_loader_persistent_workers,
-            drop_last=False,
+        train_texts_for_labels: list[str]
+        if isinstance(train_source_dataset, FrozenImageFeatureDataset):
+            train_texts_for_labels = list(train_source_dataset.texts)
+        else:
+            train_texts_for_labels = list(
+                dataset.patch_records["rationale_raw"].fillna("").astype(str).tolist()
+            )
+        global_text_label_map: dict[str, int] = {}
+        for text in train_texts_for_labels:
+            key = str(text)
+            if key not in global_text_label_map:
+                global_text_label_map[key] = len(global_text_label_map)
+        unique_texts_in_order: list[str] = sorted(
+            global_text_label_map, key=lambda value: global_text_label_map[value]
         )
+        global_class_ids: list[int] = [
+            global_text_label_map[str(text)] for text in train_texts_for_labels
+        ]
+
+        sampler: Sampler[int] | None = None
+        loader_shuffle = True
+        if bool(args.balanced_sampler):
+            sampler = ClassBalancedSampler(
+                global_class_ids,
+                generator=torch.Generator().manual_seed(int(args.seed)),
+            )
+            loader_shuffle = False
+
+        if sampler is not None:
+            loader_kwargs: dict[str, Any] = {
+                "batch_size": args.batch_size,
+                "sampler": sampler,
+                "collate_fn": collate_patch_text,
+                "num_workers": train_loader_num_workers,
+                "pin_memory": train_loader_pin_memory,
+                "drop_last": False,
+            }
+            if train_loader_num_workers > 0:
+                loader_kwargs["persistent_workers"] = train_loader_persistent_workers
+                if train_loader_prefetch_factor is not None:
+                    loader_kwargs["prefetch_factor"] = train_loader_prefetch_factor
+            dataloader = DataLoader(train_source_dataset, **loader_kwargs)
+        else:
+            dataloader = build_alignment_dataloader(
+                train_source_dataset,
+                batch_size=args.batch_size,
+                shuffle=loader_shuffle,
+                generator=torch.Generator().manual_seed(args.seed),
+                num_workers=train_loader_num_workers,
+                pin_memory=train_loader_pin_memory,
+                prefetch_factor=train_loader_prefetch_factor,
+                persistent_workers=train_loader_persistent_workers,
+                drop_last=False,
+            )
         val_dataloader = None
         if val_source_dataset is not None and args.val_every > 0:
             val_loader_num_workers = 0 if using_cached_val_features else int(args.num_workers)
@@ -1212,14 +1523,40 @@ def main() -> None:
                 image_dim = int(warmup_batch["image_features"].shape[-1])
             else:
                 warmup_images = warmup_batch["image"].to(device, non_blocking=non_blocking)
-                image_dim = int(encode_image_with_satmae_encoder(mae_encoder, warmup_images).shape[-1])
+                image_dim = int(
+                    encode_image_with_satmae_encoder(
+                        mae_encoder, warmup_images, pool=image_pool
+                    ).shape[-1]
+                )
             if text_cache is not None:
                 warmup_text_features = text_cache.encode(warmup_batch["text"])
             else:
                 warmup_text_features, _ = text_encoder(warmup_batch["text"], device=device)
             text_dim = int(warmup_text_features.shape[-1])
 
-        aligner = AlignmentModel(image_dim=image_dim, text_dim=text_dim, embed_dim=args.embed_dim).to(device)
+        aligner = AlignmentModel(
+            image_dim=image_dim,
+            text_dim=text_dim,
+            embed_dim=args.embed_dim,
+            projector_type=str(args.projector_type),
+            projector_hidden_dim=int(args.projector_hidden_dim),
+            projector_depth=int(args.projector_depth),
+            projector_dropout=float(args.projector_dropout),
+        ).to(device)
+
+        if float(args.ema_decay) > 0.0:
+            ema = ParameterEMA(aligner, decay=float(args.ema_decay))
+
+        loss_type = str(args.loss_type)
+        prototype_text_features: torch.Tensor | None = None
+        global_class_id_tensor: torch.Tensor | None = None
+        if loss_type == "prototype":
+            if text_cache is None:
+                raise ValueError("--loss-type prototype requires --cache-text-embeddings.")
+            prototype_text_features = text_cache.encode(unique_texts_in_order).detach()
+            global_class_id_tensor = torch.tensor(
+                global_class_ids, device=device, dtype=torch.long
+            )
 
         parameters: list[nn.Parameter] = list(aligner.parameters())
         if args.train_text_encoder:
@@ -1355,7 +1692,15 @@ def main() -> None:
                     else:
                         image_features = encode_image_with_satmae_encoder(mae_encoder, images)
 
-                if args.train_text_encoder:
+                batch_class_ids = torch.tensor(
+                    [global_text_label_map[str(text)] for text in texts],
+                    device=device,
+                    dtype=torch.long,
+                )
+
+                if loss_type == "prototype":
+                    text_features = None
+                elif args.train_text_encoder:
                     text_features, _ = text_encoder(texts, device=device)
                 elif text_cache is not None:
                     text_features = text_cache.encode(texts)
@@ -1363,17 +1708,28 @@ def main() -> None:
                     with torch.no_grad():
                         text_features, _ = text_encoder(texts, device=device)
 
-                text_labels = build_text_labels(texts, device) if args.false_negative_mask else None
-
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                    image_embeddings, text_embeddings = aligner(image_features, text_features)
-                    loss = symmetric_contrastive_loss(
-                        image_embeddings,
-                        text_embeddings,
-                        aligner.logit_scale,
-                        text_labels=text_labels,
-                        logit_scale_max=float(args.logit_scale_max),
-                    )
+                    image_embeddings = aligner.project_image(image_features)
+                    if loss_type == "prototype":
+                        prototype_embeddings = aligner.project_text(prototype_text_features)
+                        loss = prototype_classification_loss(
+                            image_embeddings,
+                            prototype_embeddings,
+                            batch_class_ids,
+                            aligner.logit_scale,
+                            logit_scale_max=float(args.logit_scale_max),
+                            label_smoothing=float(args.label_smoothing),
+                        )
+                    else:
+                        text_embeddings = aligner.project_text(text_features)
+                        loss = symmetric_contrastive_loss(
+                            image_embeddings,
+                            text_embeddings,
+                            aligner.logit_scale,
+                            text_labels=batch_class_ids if args.false_negative_mask else None,
+                            logit_scale_max=float(args.logit_scale_max),
+                            label_smoothing=float(args.label_smoothing),
+                        )
 
                 if amp_needs_scaler:
                     amp_scaler.scale(loss).backward()
@@ -1390,6 +1746,9 @@ def main() -> None:
 
                 with torch.no_grad():
                     aligner.logit_scale.clamp_(max=logit_scale_max_log)
+
+                if ema is not None:
+                    ema.update(aligner)
 
                 global_step += 1
                 epoch_steps += 1
@@ -1448,15 +1807,23 @@ def main() -> None:
                 text_encoder.eval()
                 mae_encoder.eval()
                 val_start = time.time()
-                raw_val_metrics = evaluate_alignment_retrieval(
-                    dataloader=val_dataloader,
-                    mae_encoder=mae_encoder,
-                    text_encoder=text_encoder,
-                    aligner=aligner,
-                    device=device,
-                    text_cache=text_cache if not args.train_text_encoder else None,
-                    non_blocking=non_blocking,
-                )
+                ema_backup: dict[str, torch.Tensor] | None = None
+                if ema is not None:
+                    ema_backup = ema.apply_to(aligner)
+                try:
+                    raw_val_metrics = evaluate_alignment_retrieval(
+                        dataloader=val_dataloader,
+                        mae_encoder=mae_encoder,
+                        text_encoder=text_encoder,
+                        aligner=aligner,
+                        device=device,
+                        text_cache=text_cache if not args.train_text_encoder else None,
+                        non_blocking=non_blocking,
+                        image_pool=image_pool,
+                    )
+                finally:
+                    if ema is not None and ema_backup is not None:
+                        ema.restore(aligner, ema_backup)
                 val_duration = time.time() - val_start
                 val_metrics = {f"val/{key}": float(value) for key, value in raw_val_metrics.items()}
                 val_metrics["val/alignment_score"] = compute_alignment_score(raw_val_metrics)
@@ -1511,6 +1878,7 @@ def main() -> None:
                 text_dim=text_dim,
                 wandb_logger=wandb_logger,
                 epoch=epoch + 1,
+                ema=ema,
             )
             if lowest_train_loss is None or avg_loss < lowest_train_loss:
                 lowest_train_loss = avg_loss
@@ -1538,19 +1906,27 @@ def main() -> None:
             if should_update_best_checkpoint:
                 best_checkpoint_metric_value = current_checkpoint_metric_value
                 best_checkpoint_epoch = epoch + 1
-                _save_alignment_checkpoint(
-                    best_checkpoint_path,
-                    config=config,
-                    history=history,
-                    aligner=aligner,
-                    text_encoder=text_encoder,
-                    mae_encoder=mae_encoder,
-                    args=args,
-                    image_dim=image_dim,
-                    text_dim=text_dim,
-                    wandb_logger=wandb_logger,
-                    epoch=epoch + 1,
-                )
+                best_ema_backup: dict[str, torch.Tensor] | None = None
+                if ema is not None:
+                    best_ema_backup = ema.apply_to(aligner)
+                try:
+                    _save_alignment_checkpoint(
+                        best_checkpoint_path,
+                        config=config,
+                        history=history,
+                        aligner=aligner,
+                        text_encoder=text_encoder,
+                        mae_encoder=mae_encoder,
+                        args=args,
+                        image_dim=image_dim,
+                        text_dim=text_dim,
+                        wandb_logger=wandb_logger,
+                        epoch=epoch + 1,
+                        ema=ema,
+                    )
+                finally:
+                    if ema is not None and best_ema_backup is not None:
+                        ema.restore(aligner, best_ema_backup)
             if args.checkpoint_every > 0 and (((epoch + 1) % args.checkpoint_every == 0) or ((epoch + 1) == args.epochs)):
                 _save_alignment_checkpoint(
                     checkpoints_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt",
@@ -1564,6 +1940,7 @@ def main() -> None:
                     text_dim=text_dim,
                     wandb_logger=wandb_logger,
                     epoch=epoch + 1,
+                    ema=ema,
                 )
 
             save_training_progress(
@@ -1672,6 +2049,7 @@ def main() -> None:
                     text_dim=text_dim,
                     wandb_logger=wandb_logger,
                     epoch=int(history[-1]["epoch"]) if history else 0,
+                    ema=ema,
                 )
             except Exception:
                 pass

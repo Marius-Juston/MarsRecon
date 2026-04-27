@@ -2,9 +2,15 @@
 
 Last updated: 2026-04-26 (America/Chicago)
 
-This file is a practical handoff for the active workflows on the `akshay`
-branch. It is intentionally short and only keeps things that have been
-re-verified against on-disk artifacts.
+This file is a practical handoff for the active workflows in the repo. The
+two stages currently live on different branches:
+
+- Stage A (SatMAE) work landed on `akshay`.
+- Stage B (text/MAE alignment, B0 baseline, B1a roadmap) lives on `jay`,
+  which is the branch this file is maintained on.
+
+It is intentionally short and only keeps things that have been re-verified
+against on-disk artifacts.
 
 The repo currently has two active stages:
 
@@ -186,6 +192,50 @@ harness against B1a, not as the final Stage B.
   `pin_memory=False`, `persistent_workers=False`. Multi-worker settings still
   apply to the cache warmup path.
 
+### Stage B0+ knobs (added 2026-04-26)
+
+The trainer now exposes a small set of orthogonal CLI flags so the same
+script covers both B0 and the B0+ ablations without needing forks. Defaults
+preserve the original B0 behavior, so existing checkpoints and recipes still
+work.
+
+- `--projector-type {linear,mlp}` (default `linear`).
+  - For `mlp`: `--projector-hidden-dim` (default `768`),
+    `--projector-depth` (default `2`, total `Linear` layers including the
+    output projection), `--projector-dropout` (default `0.0`). LayerNorm +
+    GELU between hidden layers.
+- `--image-pool {cls,mean_patch,cls_plus_mean}` (default `cls`).
+  - `cls_plus_mean` concatenates CLS and mean-patch pooled SatMAE
+    outputs, doubling the image-feature dim (768 → 1536). The frozen image
+    cache rebuilds at the requested pool, so swapping pools forces a
+    one-time warmup.
+- `--loss-type {infonce,prototype}` (default `infonce`).
+  - `prototype` scores each image against all 244 unique text-prototype
+    embeddings (computed by passing the cached unique-text features
+    through the text projector each step). Requires
+    `--cache-text-embeddings`; ignores `--false-negative-mask` because it
+    operates on a fixed 244-way classifier.
+- `--label-smoothing FLOAT` (default `0.0`).
+  - Smoothing is masked-aware: when `--false-negative-mask` is on, the
+    smoothing distribution is computed only over valid (non-masked)
+    columns, so masking + smoothing coexist without producing `inf` loss.
+- `--balanced-sampler / --no-balanced-sampler` (default off).
+  - Class-stratified order over the global text-class id. Each contiguous
+    window of `num_classes` (244 today) emits at most one sample per class,
+    so any batch ≥ 244 covers every class. Disables `shuffle` because the
+    sampler already produces an interleaved permutation.
+- `--ema-decay FLOAT` (default `0.0`, disabled).
+  - EMA over the aligner's parameters and buffers. Validation and the
+    `best_checkpoint.pt` use the EMA weights; rolling per-epoch
+    checkpoints save the live weights and the EMA shadow side-by-side
+    (`ema_state` field in the checkpoint).
+
+Checkpoints now also persist `aligner_config`, `image_pool`, `loss_type`, and
+`projector_type`, so the evaluator can reconstruct any of these
+architectures without extra flags. The evaluator gained
+`--use-ema/--no-use-ema` (default on); when EMA weights are present they are
+applied automatically, falling back to the live weights otherwise.
+
 ### Stage B0 runs of record
 
 #### 2026-04-23 baseline (online)
@@ -215,14 +265,14 @@ harness against B1a, not as the final Stage B.
 - **Do not** treat this as a fair B0 readout — it never finished and it ran
   before the loss correctness, scaling, and stability fixes below.
 
-#### 2026-04-26 optimized B0 (in progress)
+#### 2026-04-26 optimized B0 (completed)
 
 - run dir:
   - `/scratch/marsrecon_runs/stage_b/text_mae_align/20260426/20260426_214338_olympus-stage-b0-bs256-fnmask-bf16-v1`
 - W&B:
   - `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/erwozhp9`
-- Designed to be the first apples-to-apples best B0 readout. Differences from
-  the crashed 2026-04-26 run:
+- First apples-to-apples best B0 readout. Differences from the crashed
+  2026-04-26 run:
   - false-negative-mask in the contrastive loss (correctness fix for the 244
     unique-text vocabulary)
   - `batch_size=256` and `val_batch_size=256` (cached features make this free)
@@ -231,16 +281,69 @@ harness against B1a, not as the final Stage B.
   - bf16 AMP autocast, gradient clipping `1.0`, logit-scale clamp at `100`
   - same Stage A backbone, same split manifest, same val sampling
     (`val_max_patches=4096`)
-- Linear projector kept; B0 architecture is intentionally unchanged so it
-  remains a clean ablation against the eventual B1a model.
+- Linear projector kept; B0 architecture intentionally unchanged so it remains
+  a clean ablation against the upcoming B0+/proto runs and the eventual B1a.
+- Final state (from `summary.json` + `eval_val_4096.json`):
+  - status `completed`, 30/30 epochs.
+  - Best `val/alignment_score = 0.13958` at epoch 28 (selection metric).
+  - Final train loss `4.098` — large because the loss is the symmetric
+    InfoNCE *over a 256-way batch with same-text duplicates masked out*, so
+    the floor is closer to `log(244) ≈ 5.5` than `log(256) ≈ 5.55`. Train
+    loss alone is not the right success metric here.
+  - Held-out val (4,096 patches), best checkpoint:
+    - image→text: R@1 0.146, R@10 0.146, MRR 0.156, median rank 139.
+    - text→image: R@1 0.040, R@5 0.177, R@10 0.313, MRR 0.123, median rank 25.
+- Takeaway: validation retrieval improved over the 2026-04-23 baseline
+  on text→image, but i2t plateaued. Next step is to add capacity (MLP
+  projector), regularization (label smoothing, EMA), batch composition
+  (class-balanced sampler), and an architectural ablation on pooling /
+  loss type — see "B0+ follow-up runs" below.
+
+#### 2026-04-26 B0+ follow-up runs (queued as parallel ablations)
+
+Two follow-up runs are launched in parallel, each pinned to its own GPU on
+the 4× RTX 6000 Ada host. Both keep the Stage A backbone, the split
+manifest, the false-negative-aware contrastive setup (where applicable), and
+the bf16 + grad-clip + logit-scale-clamp stability rails. They differ only
+in the variables they sweep:
+
+- **Run A — `olympus-stage-b0plus-mlp-bal-ema-ls-v1`** (regularize + capacity):
+  - same data and pooling as the previous best (CLS, InfoNCE).
+  - `--projector-type mlp --projector-hidden-dim 768 --projector-depth 2`
+  - `--balanced-sampler` (class-stratified ordering over the 244 rationales)
+  - `--ema-decay 0.999` (EMA-tracked aligner used for val + best checkpoint)
+  - `--label-smoothing 0.05` (mask-aware so it stays finite under FN-mask)
+  - longer schedule: `--epochs 60 --warmup-epochs 3 --learning-rate 5e-5
+    --min-lr 1e-7`.
+  - GPU: `cuda:0`.
+  - run dir:
+    `/scratch/marsrecon_runs/stage_b/text_mae_align/20260426/20260426_230004_olympus-stage-b0plus-mlp-bal-ema-ls-v1`.
+  - W&B: `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/sm7ud0n9`.
+- **Run B — `olympus-stage-b0-proto-clsmean-mlp-v1`** (architecture ablation):
+  - `--image-pool cls_plus_mean` (concat CLS + mean-patch pooled SatMAE
+    output, image-feature dim 1536). The image cache is rebuilt at this
+    pool config, so the run pays a one-time warmup cost.
+  - `--loss-type prototype` — image is classified against all 244
+    text-prototype embeddings instead of a 256-way contrastive subset; this
+    removes the small-vocabulary false-negative problem at the source.
+  - same MLP projector + balanced sampler + EMA + label smoothing as Run A.
+  - same 60-epoch / 5e-5 / cosine schedule as Run A.
+  - GPU: `cuda:1`.
+  - run dir:
+    `/scratch/marsrecon_runs/stage_b/text_mae_align/20260426/20260426_230008_olympus-stage-b0-proto-clsmean-mlp-v1`.
+  - W&B: `https://wandb.ai/akshayn3-auvsl/MarsRecon/runs/84q7ssq1`.
+
+Both runs share the same val protocol (split-manifest val, 4,096 patches,
+`val/alignment_score`-based best checkpoint) so they are directly
+comparable to the 2026-04-26 optimized B0.
 
 ### Canonical Stage B0 invocations
 
-There are no shell wrappers; call the Python modules directly. The two
-recipes below are the canonical "train a fresh B0 run" and "evaluate a
-checkpoint on val" flows.
+There are no shell wrappers; call the Python modules directly. The recipes
+below are the canonical "train a fresh B0 run", "B0+ regularize + capacity",
+"B0 prototype ablation", and "evaluate a checkpoint on val" flows.
 
-Train an optimized B0 run:
+Train the original optimized B0 (linear projector, InfoNCE, CLS pool):
 
 ```bash
 .venv/bin/python src/stage_b/align_text_mae_embeddings.py \
@@ -274,6 +377,64 @@ Notes:
 - For a more conservative LR rerun, swap in `--learning-rate 5e-5`.
 - For an offline-friendly variant, use `--wandb-mode offline` (or
   `--wandb-mode disabled` to skip W&B entirely).
+
+Train **Run A** (B0+ regularize + capacity, MLP / balanced / EMA / smooth /
+60 epochs):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python src/stage_b/align_text_mae_embeddings.py \
+  --mae-checkpoint "/scratch/marsrecon_runs/stage_a/satmae/20260421/20260421_012519_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v3-softweight-exp2-graypreview-v1/checkpoints/best_checkpoint.pt" \
+  --root "/scratch/mars_hirise" \
+  --bbox -136 12 -124 24 \
+  --patch-size-deg 0.005 --image-size 256 --patch-size-px 8 \
+  --patch-records-path "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_patch_records.pkl" \
+  --split-manifest "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_splits.csv" \
+  --batch-size 256 --val-batch-size 256 \
+  --epochs 60 --warmup-epochs 3 --learning-rate 5e-5 --min-lr 1e-7 \
+  --embed-dim 256 \
+  --projector-type mlp --projector-hidden-dim 768 --projector-depth 2 \
+  --balanced-sampler --ema-decay 0.999 --label-smoothing 0.05 \
+  --image-pool cls --loss-type infonce --false-negative-mask \
+  --cache-image-embeddings --image-cache-batch-size 64 \
+  --cache-text-embeddings \
+  --val-max-patches 4096 --val-every 1 \
+  --num-workers 8 --pin-memory --prefetch-factor 4 --persistent-workers \
+  --use-amp --amp-dtype bf16 --grad-clip-norm 1.0 --logit-scale-max 100.0 \
+  --checkpoint-every 5 --progress-log-interval 10 \
+  --out-root "/scratch/marsrecon_runs/stage_b/text_mae_align" \
+  --wandb-mode online --wandb-project MarsRecon --wandb-entity akshayn3-auvsl \
+  --run-name "olympus-stage-b0plus-mlp-bal-ema-ls-v1" \
+  --wandb-run-name "olympus-stage-b0plus-mlp-bal-ema-ls-v1"
+```
+
+Train **Run B** (CLS+mean pool, prototype loss, MLP, balanced, EMA, 60
+epochs):
+
+```bash
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python src/stage_b/align_text_mae_embeddings.py \
+  --mae-checkpoint "/scratch/marsrecon_runs/stage_a/satmae/20260421/20260421_012519_olympus-satmae-vit-base-256p8-mr50-e20-validmask-v3-softweight-exp2-graypreview-v1/checkpoints/best_checkpoint.pt" \
+  --root "/scratch/mars_hirise" \
+  --bbox -136 12 -124 24 \
+  --patch-size-deg 0.005 --image-size 256 --patch-size-px 8 \
+  --patch-records-path "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_patch_records.pkl" \
+  --split-manifest "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_splits.csv" \
+  --batch-size 256 --val-batch-size 256 \
+  --epochs 60 --warmup-epochs 3 --learning-rate 5e-5 --min-lr 1e-7 \
+  --embed-dim 256 \
+  --projector-type mlp --projector-hidden-dim 768 --projector-depth 2 \
+  --balanced-sampler --ema-decay 0.999 --label-smoothing 0.05 \
+  --image-pool cls_plus_mean --loss-type prototype \
+  --cache-image-embeddings --image-cache-batch-size 64 \
+  --cache-text-embeddings \
+  --val-max-patches 4096 --val-every 1 \
+  --num-workers 8 --pin-memory --prefetch-factor 4 --persistent-workers \
+  --use-amp --amp-dtype bf16 --grad-clip-norm 1.0 --logit-scale-max 100.0 \
+  --checkpoint-every 5 --progress-log-interval 10 \
+  --out-root "/scratch/marsrecon_runs/stage_b/text_mae_align" \
+  --wandb-mode online --wandb-project MarsRecon --wandb-entity akshayn3-auvsl \
+  --run-name "olympus-stage-b0-proto-clsmean-mlp-v1" \
+  --wandb-run-name "olympus-stage-b0-proto-clsmean-mlp-v1"
+```
 
 Evaluate a Stage B0 checkpoint on the held-out val split:
 
@@ -331,7 +492,7 @@ Stage A:
 - `tests/test_train_marsclip_satmae.py`
 - `tests/test_marsclip_patches.py`
 
-Stage B:
+Stage B (lives on the `jay` branch):
 
 - `src/stage_b/align_text_mae_embeddings.py`
   - split-manifest-aware train/val and balanced val sampling
@@ -341,8 +502,14 @@ Stage B:
   - bf16 AMP autocast and gradient clipping
   - SIGINT/SIGTERM monitor that writes an interrupted checkpoint
   - W&B integration with canonical `trainer/global_step`
+  - **B0+ knobs**: linear/MLP projector, CLS / mean-patch / CLS+mean
+    image pooling, InfoNCE / prototype loss, mask-aware label smoothing,
+    class-balanced sampler, EMA-tracked aligner weights (used for
+    validation and the best checkpoint).
 - `src/stage_b/evaluate_text_mae_alignment.py`
   - split-manifest-aware held-out retrieval evaluation
   - optional embeddings export
+  - reconstructs MLP / image-pool / EMA architectures from checkpoint
+    metadata; `--use-ema/--no-use-ema` toggles EMA-vs-live weights.
 - `src/stage_b/T5_encoder.py`
   - HF/T5 local cache fallback
