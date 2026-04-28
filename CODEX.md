@@ -974,6 +974,8 @@ Stage A:
 - `src/clip/marsclip_patches.py`
   - stricter pixel-valid logic
   - single-band invalidation in `color_only` mode
+  - optional per-patch text augment map; metadata includes
+    `centroid_lat` / `centroid_lon`, `rationale_base`, `patch_text_augment`
 - `tests/test_train_marsclip_satmae.py`
 - `tests/test_marsclip_patches.py`
 
@@ -1025,6 +1027,11 @@ Stage B (lives on the `jay` branch):
     `L_lg = w_lg * InfoNCE(local, global)` sharing the image projector and
     text-branch logit scale, with optional false-negative masking; val
     reports `local_to_global_*` / `global_to_local_*` retrieval.
+  - **Per-patch text augment** (`--patch-text-augment-jsonl`): optional
+    offline JSONL merges `augment` onto each patch’s `rationale_raw` for
+    cache + T5 encoding.
+  - **Geocell val metrics** (`--geocell-deg`): default `0.1 0.5` degrees when
+    geo is enabled; softer image→geo diagnostics than diagonal R@k.
 - `src/stage_b/geo_encoders.py`
   - Vendored, dependency-light implementations of `Sine`, `Siren`,
     `SirenNet` (Sitzmann et al. 2020 / Rußwurm et al. 2024),
@@ -1034,6 +1041,8 @@ Stage B (lives on the `jay` branch):
     composes a positional encoder with a head and optionally
     concatenates auxiliary features post-PE; `build_location_encoder`
     is the factory used by the trainer's CLI.
+- `src/stage_b/patch_text_augment.py`
+  - Offline JSONL ``{patch_id, augment}`` loader for Cursor- or manually-authored per-patch text tails.
 - `src/stage_b/evaluate_marsclip.py`
   - Held-out retrieval evaluator for B1a-geo / B1a-geo+ / B1a-pairs
     checkpoints; reconstructs the full image/text/geo aligner (including
@@ -1041,7 +1050,9 @@ Stage B (lives on the `jay` branch):
     temperatures) from `aligner_config` and reports image↔text and
     image↔geo metrics; when `paired_views=local_global` (or
     `--paired-views-override local_global`) also reports local↔global
-    retrieval. Flags: `--use-ema`, `--geo-context-override`,
-    `--paired-views-override`, `--local-crop-fraction-override`.
+    retrieval; image→geo ``geocell_*deg_topk_*`` softness when centroid
+    metadata is present. Flags: `--use-ema`, `--geo-context-override`,
+    `--paired-views-override`, `--local-crop-fraction-override`,
+    `--geocell-deg`.
 - `src/stage_b/T5_encoder.py`
   - HF/T5 local cache fallback
