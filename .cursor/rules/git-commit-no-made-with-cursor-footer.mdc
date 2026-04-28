@@ -1,0 +1,8 @@
+---
+description: Git commit messages must not include Cursor product footers or similar.
+alwaysApply: true
+---
+
+# Commit messages
+
+- Do **not** append `Made-with: Cursor`, `Co-authored-by: Cursor`, or any similar tooling footer to commit messages unless the human author explicitly asks for it.
