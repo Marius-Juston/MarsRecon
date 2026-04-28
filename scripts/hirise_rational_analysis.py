@@ -267,7 +267,7 @@ THEMES = {
 }
 
 
-def save_fig(fig: plt.Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"), **kwargs):
+def save_fig(fig: plt.Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf", ".svg"), **kwargs):
     for f in formats:
         new_path = path.with_suffix(f)
         fig.savefig(new_path, **kwargs)
@@ -787,16 +787,16 @@ def make_all(df: pd.DataFrame, outdir: str | Path) -> None:
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     print(f"writing figures to {out.resolve()}")
-    # fig_wordcloud(df, out)
-    # fig_wordcloud_mars_disk(df, out)
-    # fig_top_words_and_phrases(df, out)
-    # fig_geographic_features(df, out)
-    # fig_themes_bar(df, out)
-    # fig_map_themed(df, out)
+    fig_wordcloud(df, out)
+    fig_wordcloud_mars_disk(df, out)
+    fig_top_words_and_phrases(df, out)
+    fig_geographic_features(df, out)
+    fig_themes_bar(df, out)
+    fig_map_themed(df, out)
     fig_map_themed_smallmultiples(df, out)
-    # fig_map_themed_dominant(df, out)
-    # fig_treemap(df, out)
-    # fig_themes_by_latitude_band(df, out)
+    fig_map_themed_dominant(df, out)
+    fig_treemap(df, out)
+    fig_themes_by_latitude_band(df, out)
 
 
 def main() -> None:
