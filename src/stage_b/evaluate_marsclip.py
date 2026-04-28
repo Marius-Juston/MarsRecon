@@ -6,6 +6,8 @@ Loads a checkpoint produced by ``stage_b.align_marsclip`` and computes:
 - text  -> image: Recall@K, MRR, median rank
 - image -> geo:   Recall@K, MRR, median rank (diagonal-positive)
 - geo   -> image: Recall@K, MRR, median rank (diagonal-positive)
+- local -> global / global -> local: when the checkpoint was trained with
+  ``paired_views=local_global`` (or overriden here), same diagonal retrieval
 
 Optionally exports the aligned image / text / geo embeddings for downstream
 analysis. The aligner is reconstructed from ``aligner_config`` saved in the
@@ -31,6 +33,7 @@ from clip.marsclip_patches import MarsCLIPPatchDataset, load_patch_records
 from stage_b.T5_encoder import T5Encoder
 from stage_b.align_marsclip import (
     GEO_CONTEXT_CHOICES,
+    PAIRED_VIEWS_CHOICES,
     MarsCLIPAlignmentModel,
     build_marsclip_embeddings,
     collate_geo_warmup,
@@ -81,6 +84,20 @@ def main() -> None:
         choices=GEO_CONTEXT_CHOICES,
         help="Override geo_context (defaults to whatever the checkpoint stored).",
     )
+    parser.add_argument(
+        "--paired-views-override",
+        type=str,
+        default=None,
+        choices=PAIRED_VIEWS_CHOICES,
+        help="Override paired_views (defaults to aligner_config / run config; use "
+        "local_global to compute local↔global retrieval on raw images).",
+    )
+    parser.add_argument(
+        "--local-crop-fraction-override",
+        type=float,
+        default=None,
+        help="Override local crop fraction for the local view (same as training).",
+    )
     args = parser.parse_args()
 
     checkpoint = torch.load(str(args.alignment_checkpoint), map_location="cpu")
@@ -125,6 +142,17 @@ def main() -> None:
         args.geo_context_override
         or checkpoint.get("geo_context", config.get("geo_context", "latlon_view_scale"))
     )
+    paired_views = str(
+        args.paired_views_override
+        or aligner_config.get("paired_views", config.get("paired_views", "none"))
+    )
+    local_crop_fraction = float(
+        args.local_crop_fraction_override
+        if args.local_crop_fraction_override is not None
+        else aligner_config.get("local_crop_fraction", config.get("local_crop_fraction", 0.5))
+    )
+    if paired_views == "local_global" and not (0.0 < local_crop_fraction < 1.0):
+        raise ValueError("local_crop_fraction must be in (0, 1) when paired_views is local_global.")
     expected_geo_dim = geo_input_dim(geo_context)
     if geo_context != "none" and expected_geo_dim != geo_dim:
         raise ValueError(
@@ -228,7 +256,7 @@ def main() -> None:
         aligner.load_state_dict(ema_state, strict=True)
     aligner.eval()
 
-    image_emb, text_emb, geo_emb, text_rows = build_marsclip_embeddings(
+    image_emb, text_emb, geo_emb, local_emb, text_rows = build_marsclip_embeddings(
         dataloader=dataloader,
         mae_encoder=mae_encoder,
         text_encoder=text_encoder,
@@ -236,6 +264,8 @@ def main() -> None:
         device=device,
         image_pool=image_pool,
         geo_context=geo_context,
+        paired_views=paired_views,
+        local_crop_fraction=local_crop_fraction,
     )
 
     metrics: dict[str, float] = {
@@ -253,9 +283,22 @@ def main() -> None:
             if key == "num_samples":
                 continue
             metrics[key] = float(value)
+    if local_emb is not None:
+        lg_metrics = compute_pairwise_retrieval_metrics(
+            local_emb,
+            image_emb,
+            a_to_b_prefix="local_to_global",
+            b_to_a_prefix="global_to_local",
+        )
+        for key, value in lg_metrics.items():
+            if key == "num_samples":
+                continue
+            metrics[key] = float(value)
     if args.holdout_split is not None:
         metrics["holdout_split"] = args.holdout_split
     metrics["geo_context"] = geo_context
+    metrics["paired_views"] = paired_views
+    metrics["local_crop_fraction"] = float(local_crop_fraction)
     metrics["used_ema_weights"] = bool(use_ema_weights)
 
     print(json.dumps(metrics, indent=2))
@@ -276,6 +319,8 @@ def main() -> None:
         }
         if geo_emb is not None:
             payload["geo_embeddings"] = geo_emb
+        if local_emb is not None:
+            payload["local_embeddings"] = local_emb
         torch.save(payload, args.embeddings_out)
         print(f"[eval-marsclip] saved embeddings: {args.embeddings_out}")
 
