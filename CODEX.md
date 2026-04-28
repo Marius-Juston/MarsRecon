@@ -1,6 +1,6 @@
 # CODEX Handoff: MarsRecon Stage A + Stage B
 
-Last updated: 2026-04-27 (America/Chicago)
+Last updated: 2026-04-28 (America/Chicago)
 
 This file is a practical handoff for the active workflows in the repo. The
 two stages currently live on different branches:
@@ -32,7 +32,8 @@ call the trainers and evaluators directly.
 - Stage A runs:
   - `/scratch/marsrecon_runs/stage_a/satmae`
 - Stage B runs:
-  - `/scratch/marsrecon_runs/stage_b/text_mae_align`
+  - **B0 text–MAE alignment:** `/scratch/marsrecon_runs/stage_b/text_mae_align`
+  - **B1a MarsCLIP (geo / pairs):** `/scratch/marsrecon_runs/stage_b/marsclip_align`
 - dataset viz / clip viz / clip reports defaults:
   - `/scratch/marsrecon_runs/dataset_viz`
   - `/scratch/marsrecon_runs/clip_viz`
@@ -147,18 +148,42 @@ See all live Stage A CLI knobs:
 
 ## Stage B: image-text alignment (B0 baseline, B1a roadmap)
 
-Stage B was reorganized from `src/stage2` into `src/stage_b`. The folder now
-contains exactly three Python modules and no shell wrappers:
+Stage B was reorganized from `src/stage2` into `src/stage_b`. There are no
+run-specific shell wrappers under `src/stage_b`; trainers and evaluators are
+invoked as `python -m stage_b.*` or `python src/stage_b/...`. Core modules:
 
 - `src/stage_b/align_text_mae_embeddings.py` — Stage B0 trainer
-- `src/stage_b/evaluate_text_mae_alignment.py` — held-out retrieval evaluator
+- `src/stage_b/evaluate_text_mae_alignment.py` — B0 held-out retrieval evaluator
+- `src/stage_b/align_marsclip.py` — **B1a** trainer (geo + optional pairs + optional offline text augment)
+- `src/stage_b/evaluate_marsclip.py` — **B1a** held-out retrieval (+ geocell / local↔global when applicable)
+- `src/stage_b/patch_text_augment.py` — offline JSONL loader + `patch_records` merge helper
+- `src/stage_b/geo_encoders.py` — positional geo encoders (RFF / SIREN / SH) for `coords_*` contexts
 - `src/stage_b/T5_encoder.py` — frozen T5 encoder with HF/T5 local cache fallback
 
-Stage B0 is the **text-only baseline**. The next architecture target is
-**Stage B1a**: paired local/global crops sharing the frozen Stage A backbone,
-text + location context targets, geometry/viewing features, and a CACo-style
-local/global consistency loss. B0 is intentionally treated as an ablation
-harness against B1a, not as the final Stage B.
+Stage B0 is the **text-only baseline**. The architecture target is **Stage
+B1a** on the frozen Stage A backbone: text + geo-context + (optional) paired
+local/global views and CACo-style local↔global loss. B0 remains the ablation
+harness; **B1a code paths live in `align_marsclip.py` / `evaluate_marsclip.py`.**
+
+### Stage B snapshot (trust this for “where we are”)
+
+| Item | Status |
+|------|--------|
+| B0 / B0+ text–image runs (split val, EMA, caches) | Completed; baseline of record documented above |
+| B1a-geo (`latlon_*` or `coords_*` + GeoEncoder / `LocationEncoder`) | **Trained & evaluated** (incl. B1a-geo+ `rff_siren` / `coords_only`) |
+| B1a-geo+ analysis | 1-to-1 image↔geo R@K is a **weak** metric on this split (near-duplicate train coords); use **geocell** + narrative in run sections below |
+| **Geocell softness metrics** (`image_to_geo_geocell_*deg_topk_*`) | **Implemented** in train val + `evaluate_marsclip` when patch metadata includes `centroid_lat/lon` (emitted by `marsclip_patches`); **`--geocell-deg` defaults effectively to `0.1`° and `0.5`°** when geo is enabled (omit the flag for defaults); see `--help` |
+| B1a-pairs (dual SatMAE cache, `L_lg`, local↔global retrieval) | **Implemented in code**; **full-length production run is the next empirical step** (see § “Planned runs” below) |
+| Offline **per-patch text augment** (JSONL, no train-time LLM) | **Implemented**; checked-in sample `assets/offline_augment/sample_olympus_384_patch_augments_v1.jsonl` is for **pipeline testing** — replace or expand with project-specific phrases (e.g. authored in Cursor, then committed) |
+| B1a-full (sweep `w_text, w_geo, w_l_lg`) | **Not started** — after a stable B1a-pairs run of record |
+
+**Planned runs (next on the GPU, in order):**
+
+1. **B1a-pairs (full Olympus, no tiny `--max-patches` cap)** — same Stage A ckpt and Olympus assets as B1a-geo+; use `CODEX` skeleton for `--paired-views local_global --lg-loss-weight 0.5` merged with your best B1a-geo+ hyperparameters (lr, epochs, `--geo-warmup-epochs`, etc.). Goal: `val/local_to_global_*`, `val/alignment_score`, and image↔text vs the best B1a-geo+ checkpoint.
+2. **Optional augment ablation** — same recipe as (1) but add `--patch-text-augment-jsonl` pointing at a **curated** JSONL (start from the sample file shape; grow coverage over time). Compare val image↔text / `alignment_score` with and without augment for the same step budget.
+3. **Eval artifacts** — for each run, full val/test via `evaluate_marsclip.py` with `--max-patches` set large enough for the full holdout (e.g. `100000`), save JSON next to the run dir.
+
+**Smoke reference (not a baseline number):** a short capped run `olympus-b1a-pairs-augment-smoke-v1` under `marsclip_align/20260427/…` used small `--max-patches` / `--val-max-patches` and 2 epochs only to verify the stack; **do not** compare its metrics to full-split evals.
 
 ### Stage B0 trainer features
 
@@ -810,23 +835,22 @@ The right take-away is that **1-to-1 image↔geo retrieval is the wrong
 metric** for the geo head's actual job in MarsCLIP. The geo head's job
 is to inject a coarse spatial prior into the image embedding (so image
 similarity reflects "near neighbors look alike"), not to invert
-coordinates pixel-perfectly. Future B1a-geo evals should add a
-**geocell hit-rate** (top-k retrieved geos lie in the same 0.1° / 0.5°
-geocell as the query) and a **distance correlation** (mean ground
-distance between query and top-k) instead of leaning on R@1/R@10.
+coordinates pixel-perfectly.
 
-#### Recommended next action
+**Update:** coarse **geocell-style** diagnostics are now logged automatically
+(metric names like `image_to_geo_geocell_0p1deg_top1_any_neighbor`): they
+measure whether retrieved geo embeddings land in the same lon/lat *cell* as the
+query patch (see `--geocell-deg`). A separate **distance correlation**
+metric remains future work if we need finer-grained GIS analysis.
 
-The B1a-geo head is now strong enough to ship as a residual signal
-(slight image→text gain, doubled image→geo R@10) without regressing
-text retrieval. Pushing the σ ladder further or adding more capacity
-will keep yielding diminishing returns — the upper bound is set by the
-data, not the encoder.
+#### Recommended next action (historical note + current plan)
 
-The next implementation milestone is **B1a-pairs**: paired local /
-global crops + CACo-style consistency loss on the same shared image
-projector. That gives a different signal that does not depend on the
-geo head and is the next phase in the committed plan.
+Geo+ pairs **code** landed after this analysis. The qualitative conclusion
+stands (diminishing returns on pushing σ alone). **Current priority** is
+documented in **§ Stage B snapshot** above: a **full-scale B1a-pairs train +
+eval**, then optional **offline augment JSONL ablations**. Implementation of
+pairs + augment + geocell is done; outstanding work is **experimentation &
+reporting**.
 
 Frozen state of B1a-geo+ v1:
 
@@ -852,24 +876,34 @@ from the saved `aligner_config` automatically. For B1a-pairs, it also reads
 `paired_views` and `local_crop_fraction`; optional overrides are
 `--paired-views-override` and `--local-crop-fraction-override`. Standard flags:
 `--alignment-checkpoint`, `--patch-records-path`, `--split-manifest`,
-`--holdout-split`, `--max-patches` (use a large value for full-split eval).
+`--holdout-split`, `--max-patches` (use a value **≥ holdout patch count**,
+ e.g. `100000`, so eval is not silently truncated — the CLI default alone
+ may be small for quick tests).
+
+### Git commits (contributors)
+
+Cursor or other tools may try to append a `Made-with: Cursor`-style footer to
+commit messages. To record a clean message when that happens, use the system Git
+binary, e.g. ` /usr/bin/git commit --amend -F msg.txt `. A project rule under
+`.cursor/rules/` discourages AI-added footers in future commits.
 
 ## Roadmap
 
-The text-only aligner with B0+ knobs (Run A, `sm7ud0n9`) is the current
-baseline of record. The next milestone is **Stage B1a**, defined as
-paired local/global crops centered on the same patch, shared frozen Stage
-A visual backbone for both views, text + location-context targets,
-geometry / viewing features included from the start, CACo-style
-local/global consistency loss, and validation metrics for image↔text,
-text↔image, and local↔global.
+The text-only aligner with B0+ knobs (Run A, `sm7ud0n9`) is the baseline of
+record for **text-only** comparisons. **Stage B1a** (in `align_marsclip`) is
+the multimodal direction: geo-context (+ optional positional encoders),
+optional paired local/global views, optional offline text augment JSONL,
+and validation metrics including image↔text, image↔geo, local↔global, and
+geocell softness when centroid metadata exists.
+
+See **§ Stage B snapshot** for what is coded vs what runs are still owed.
 
 ### B1a phasing (committed plan)
 
-We deliberately reorder the B1a roadmap by expected information gain per
-unit of work, not by code coupling:
+Order is still by expected information gain; **implementation status** in
+**bold**:
 
-#### Phase 1 — `B1a-geo`: image+geo loss
+#### Phase 1 — `B1a-geo`: image+geo loss — **implemented & run**
 
 Smallest delta with the largest expected new signal. `marsclip_patches.py`
 already emits per-patch location and `viewing_features`, so this is a
@@ -897,7 +931,7 @@ plumbing change, not a dataset change.
   fighting text rather than complementing it; tune `w_geo` or share less of
   the projector before declaring the architecture wrong.
 
-#### Phase 2 — `B1a-pairs`: paired local/global views + consistency loss
+#### Phase 2 — `B1a-pairs`: paired local/global views + consistency loss — **implemented in code; full-scale run pending**
 
 Adds the second view and the CACo-style consistency loss on top of
 B1a-geo. We sequence it after geo because:
@@ -908,32 +942,30 @@ B1a-geo. We sequence it after geo because:
   almost the same content as the global view, so its consistency signal is
   weak compared to geo's genuinely new modality.
 
-Plan:
+Plan (as implemented):
 
-- Each cached sample stores two image feature vectors:
-  `global = MAE(patch_256)` and
-  `local = MAE(resize_256(crop_inner_128(patch_256)))`. Image-space,
-  deterministic, fully cache-friendly.
-- One shared image projector applied to both views.
-- Loss term `L_lg` = symmetric InfoNCE between projected local and global
-  embeddings, with the same FN-mask logic.
-- Validation adds local↔global retrieval metrics.
-- New CLI: `--paired-views {none,local_global}`, `--local-crop-fraction
-  0.5`, `--lg-loss-weight 0.5`.
+- Cached sample stores **`global`** = SatMAE(full patch tensor) and **`local`** =
+  SatMAE(center crop by `--local-crop-fraction`, resized back to patch size).
+  Deterministic and cache-friendly.
+- One shared image projector on CLS features from both views.
+- `L_lg` = symmetric InfoNCE(local, global); CLI `--paired-views local_global`,
+  `--lg-loss-weight`, `--local-crop-fraction`; val / eval report
+  `local_to_global_*` and `global_to_local_*`.
+- **Still owed:** **full Olympus** duration run — see § Stage B snapshot.
 
-#### Phase 3 — `B1a-full`: balance all three loss terms
+#### Phase 3 — `B1a-full`: balance all three loss terms — **not started**
 
 - Small sweep over `(w_text, w_geo, w_lg)` (3–9 runs).
-- The "B1a run of record" is the best of those by `val/alignment_score`,
-  reported with full val + full test eval JSONs in the same form as
-  Run A's records.
+- The "B1a run of record" would be chosen by `val/alignment_score` with full
+  val + test eval JSONs archived like earlier Stage B milestones.
 
 ### Explicitly deferred
 
 - **Trainable T5 or trainable MAE** — both break the cache and cost ~100×
   more compute. Only revisit when B1a is the bottleneck.
-- **Augmentations** (random crop / flip / jitter) — same reason: caching
-  wins by a huge margin on this dataset size.
+- **Online image augmentations** (random crop / flip / jitter) — same reason:
+  caching wins at this dataset scale. **Offline** per-patch JSONL text augment
+  (`--patch-text-augment-jsonl`) is supported and cache-compatible.
 - **Re-running prototype loss** as a primary path. If revisited, only as a
   single-variable ablation (e.g. prototype + CLS pooling, or InfoNCE +
   `cls_plus_mean` pooling) so failures attribute cleanly.
