@@ -696,6 +696,42 @@ Notes on the new CLI surface:
   Russwurm); `rff_mlp` and `sh_linear` are MLP-headed counterparts;
   `mlp` is the back-compat path used by the v1 run.
 
+### Canonical Stage B1a-pairs invocation (local/global + CACo-style loss)
+
+B1a-pairs extends the same trainer (`align_marsclip`) with a second frozen
+SatMAE pass per patch: a **local view** is a deterministic centered crop
+(fraction `--local-crop-fraction`, default `0.5`), bilinear-resized back to the
+patch size, then encoded like the global view. The **shared image projector**
+maps both global and local CLS features; the extra term is symmetric InfoNCE
+between local and global embeddings (same optional false-negative mask as
+image↔text). Weights: `--lg-loss-weight` (default `0` so plain B1a-geo commands
+keep working; set `0.5` for the pairs recipe alongside `--paired-views
+local_global`). Text and geo branches are unchanged.
+
+Skeleton (merge with your geo context / checkpoint paths as usual):
+
+```text
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src .venv/bin/python -m stage_b.align_marsclip \
+  --mae-checkpoint "<stage_a_satmae_best_checkpoint.pt>" \
+  --paired-views local_global \
+  --local-crop-fraction 0.5 \
+  --lg-loss-weight 0.5 \
+  --patch-records-path "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_patch_records.pkl" \
+  --split-manifest "/scratch/marsrecon_runs/stage_a/assets/olympus_color_only_v1/olympus_full_splits.csv" \
+  --out-root "/scratch/marsrecon_runs/stage_b/marsclip_align" \
+  --run-name "olympus-marsclip-b1a-pairs-local-global-v1" \
+  --wandb-run-name "olympus-marsclip-b1a-pairs-local-global-v1"
+```
+
+Cache warmup encodes global then local (`train_image_geo_cache_warmup` logs
+`( +local)`). Validation logs `local_to_global_*` / `global_to_local_*`
+retrieval beside image↔text and image↔geo. Checkpoint `aligner_config` stores
+`paired_views`, `local_crop_fraction`, and `lg_loss_weight`.
+
+Evaluate a B1a-pairs checkpoint; `paired_views` is read from `aligner_config`
+automatically. To force local↔global metrics on any checkpoint, pass
+`--paired-views-override local_global` (uses raw images from the dataloader).
+
 ### B1a-geo+ v1 run (`rff_siren` / `coords_only`) — results & analysis
 
 Run `olympus-marsclip-b1a-geo-plus-rff-siren-coords-only-v1`, 60 epochs,
@@ -811,11 +847,12 @@ Frozen state of B1a-geo+ v1:
 - `--geo-encoder-type rff_*` / `sh_*` requires a `coords_*` geo context;
   the trainer rejects the inconsistent combination.
 
-The evaluator (`stage_b.evaluate_marsclip`) reconstructs all of the
-above from the saved `aligner_config` automatically; no extra flags are
-needed beyond the standard `--alignment-checkpoint`,
-`--patch-records-path`, `--split-manifest`, `--holdout-split`,
-`--max-patches`.
+The evaluator (`stage_b.evaluate_marsclip`) reconstructs geo head options
+from the saved `aligner_config` automatically. For B1a-pairs, it also reads
+`paired_views` and `local_crop_fraction`; optional overrides are
+`--paired-views-override` and `--local-crop-fraction-override`. Standard flags:
+`--alignment-checkpoint`, `--patch-records-path`, `--split-manifest`,
+`--holdout-split`, `--max-patches` (use a large value for full-split eval).
 
 ## Roadmap
 
@@ -982,6 +1019,12 @@ Stage B (lives on the `jay` branch):
     dominates gradients.
   - Validation adds image↔geo retrieval (1-to-1 diagonal-positive)
     alongside the existing image↔text metrics.
+  - **B1a-pairs** (`--paired-views local_global`, `--local-crop-fraction`,
+    `--lg-loss-weight`): caches a second SatMAE pass on a deterministic
+    centered crop (resized back to patch size); adds
+    `L_lg = w_lg * InfoNCE(local, global)` sharing the image projector and
+    text-branch logit scale, with optional false-negative masking; val
+    reports `local_to_global_*` / `global_to_local_*` retrieval.
 - `src/stage_b/geo_encoders.py`
   - Vendored, dependency-light implementations of `Sine`, `Siren`,
     `SirenNet` (Sitzmann et al. 2020 / Rußwurm et al. 2024),
@@ -992,11 +1035,13 @@ Stage B (lives on the `jay` branch):
     concatenates auxiliary features post-PE; `build_location_encoder`
     is the factory used by the trainer's CLI.
 - `src/stage_b/evaluate_marsclip.py`
-  - Held-out retrieval evaluator for B1a-geo / B1a-geo+ checkpoints;
-    reconstructs the full image/text/geo aligner (including
+  - Held-out retrieval evaluator for B1a-geo / B1a-geo+ / B1a-pairs
+    checkpoints; reconstructs the full image/text/geo aligner (including
     `geo_encoder_type`, RFF/SH/SIREN hyperparameters, and per-branch
     temperatures) from `aligner_config` and reports image↔text and
-    image↔geo metrics, with `--use-ema` and `--geo-context-override`
-    flags.
+    image↔geo metrics; when `paired_views=local_global` (or
+    `--paired-views-override local_global`) also reports local↔global
+    retrieval. Flags: `--use-ema`, `--geo-context-override`,
+    `--paired-views-override`, `--local-crop-fraction-override`.
 - `src/stage_b/T5_encoder.py`
   - HF/T5 local cache fallback
