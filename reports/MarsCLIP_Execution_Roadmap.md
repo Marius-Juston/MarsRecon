@@ -312,8 +312,9 @@ Exit criteria:
 
 **Secondary (recommended soon):**
 
-3. Implement **coarse geo metrics** (geocell hit-rate / mean geographic error) so tuning is not driven only by diagonal image↔geo R@K.
-4. **Offline augmentation file** schema + loader (patch_id → augmented short text); generate text with Cursor in the loop, commit data + version hash—no inference LLM in training.
+3. ~~Implement **coarse geo metrics** (geocell hit-rate…)~~ **Done in code**: training and `evaluate_marsclip` report ``image_to_geo_geocell_*deg_topk_any_neighbor`` when batch metadata carries ``centroid_lat/lon`` (patch dataset now emits them). Re-cache or use a fresh cache if an older warmup JSON lacks centroids.
+
+4. **Offline augmentation**: **Partially done**: JSONL loader + optional ``--patch-text-augment-jsonl`` on ``align_marsclip`` concatenate per-patch ``augment`` to ``rationale_raw``. Author JSONL offline (including with Cursor); commit hashed artifacts when you have coverage you trust.
 
 **Tertiary / polish:**
 
