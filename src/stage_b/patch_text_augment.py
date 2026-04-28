@@ -13,6 +13,8 @@ import json
 import pathlib
 from typing import Any
 
+import pandas as pd
+
 
 def load_patch_text_augment_jsonl(path: pathlib.Path | str) -> dict[str, str]:
     """Load a patch_id -> augment string map from JSONL.
@@ -39,4 +41,27 @@ def load_patch_text_augment_jsonl(path: pathlib.Path | str) -> dict[str, str]:
                 raise ValueError(f"{p}:{lineno}: missing patch_id")
             if aug:
                 out[pid] = aug
+    return out
+
+
+def merge_patch_text_augment_into_patch_records(
+    patch_records: pd.DataFrame,
+    augment_map: dict[str, str],
+    *,
+    sep: str = " | ",
+) -> pd.DataFrame:
+    """Set ``rationale_raw`` to ``base + sep + augment`` when ``patch_id`` maps to a non-empty augment."""
+    if not augment_map:
+        return patch_records
+    pr = patch_records
+    if "patch_id" not in pr.columns or "rationale_raw" not in pr.columns:
+        raise ValueError("patch_records must contain patch_id and rationale_raw columns.")
+    bases = pr["rationale_raw"].fillna("").astype(str)
+    pids = pr["patch_id"].astype(str)
+    merged: list[str] = []
+    for base, pid in zip(bases, pids, strict=True):
+        extra = augment_map.get(pid, "").strip()
+        merged.append(base + sep + extra if extra else base)
+    out = pr.copy()
+    out["rationale_raw"] = merged
     return out

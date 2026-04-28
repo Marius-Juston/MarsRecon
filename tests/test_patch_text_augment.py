@@ -6,7 +6,12 @@ import json
 import tempfile
 from pathlib import Path
 
-from stage_b.patch_text_augment import load_patch_text_augment_jsonl
+import pandas as pd
+
+from stage_b.patch_text_augment import (
+    load_patch_text_augment_jsonl,
+    merge_patch_text_augment_into_patch_records,
+)
 
 
 def test_load_patch_text_augment_jsonl_roundtrip() -> None:
@@ -23,3 +28,15 @@ def test_load_patch_text_augment_jsonl_roundtrip() -> None:
         assert m["p2"] == "crater rim"
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_merge_into_patch_records_updates_rationale_column() -> None:
+    pr = pd.DataFrame(
+        {
+            "patch_id": ["a", "b"],
+            "rationale_raw": ["x", "y"],
+        }
+    )
+    m = {"a": "foo"}
+    out = merge_patch_text_augment_into_patch_records(pr, m, sep=" | ")
+    assert out["rationale_raw"].tolist() == ["x | foo", "y"]

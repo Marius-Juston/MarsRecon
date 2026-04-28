@@ -46,7 +46,10 @@ from clip.fb_mae_train_utils import (
     save_training_progress,
 )
 from clip.marsclip_patches import MarsCLIPPatchDataset, load_patch_records
-from stage_b.patch_text_augment import load_patch_text_augment_jsonl
+from stage_b.patch_text_augment import (
+    load_patch_text_augment_jsonl,
+    merge_patch_text_augment_into_patch_records,
+)
 from stage_b.geo_encoders import (
     GEO_ENCODER_CHOICES,
     LocationEncoder,
@@ -1179,6 +1182,16 @@ def main() -> None:
                 patch_records=val_patch_records,
                 patch_text_augment_by_id=patch_text_augment_by_id,
             )
+        if patch_text_augment_by_id:
+            dataset.patch_records = merge_patch_text_augment_into_patch_records(
+                dataset.patch_records,
+                patch_text_augment_by_id,
+            )
+            if val_dataset is not None:
+                val_dataset.patch_records = merge_patch_text_augment_into_patch_records(
+                    val_dataset.patch_records,
+                    patch_text_augment_by_id,
+                )
         save_training_progress(
             {
                 "status": "running",
