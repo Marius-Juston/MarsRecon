@@ -564,6 +564,8 @@ class MarsCLIPPatchDataset(Dataset):
         dataset_normalization_path: pathlib.Path | str | None = None,
         use_dominant_obs_only: bool = False,
         transforms: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        patch_text_augment_by_id: dict[str, str] | None = None,
+        patch_text_augment_sep: str = " | ",
     ) -> None:
         if geo_dataset is None:
             if root is None:
@@ -651,6 +653,10 @@ class MarsCLIPPatchDataset(Dataset):
             obs_index["obs_id"] = obs_index["obs_id"].astype(str)
             self._obs_index_by_id = obs_index.set_index("obs_id", drop=False)
         self.transforms = transforms
+        self.patch_text_augment_by_id = (
+            dict(patch_text_augment_by_id) if patch_text_augment_by_id is not None else None
+        )
+        self.patch_text_augment_sep = str(patch_text_augment_sep)
 
     def __len__(self) -> int:
         return len(self.patch_records)
@@ -723,10 +729,19 @@ class MarsCLIPPatchDataset(Dataset):
         if pd.isna(rationale_expanded):
             rationale_expanded = None
 
+        rationale_base = str(obs_row["rationale_desc"])
+        patch_id_str = str(patch_row["patch_id"])
+        patch_augment: str | None = None
+        rationale_raw = rationale_base
+        if self.patch_text_augment_by_id is not None:
+            patch_augment = self.patch_text_augment_by_id.get(patch_id_str)
+            if patch_augment:
+                rationale_raw = rationale_base + self.patch_text_augment_sep + patch_augment
+
         out: dict[str, Any] = {
             "image": image,
             "valid_mask": valid_mask,
-            "rationale_raw": str(obs_row["rationale_desc"]),
+            "rationale_raw": rationale_raw,
             "rationale_expanded": rationale_expanded,
             "location": torch.tensor(
                 [float(patch_row["centroid_lon"]), float(patch_row["centroid_lat"])],
@@ -771,6 +786,10 @@ class MarsCLIPPatchDataset(Dataset):
                 "has_rationale_expanded": bool(obs_row.get("has_rationale_expanded", False)),
                 "expansion_model": obs_row.get("expansion_model"),
                 "prompt_version": obs_row.get("prompt_version"),
+                "rationale_base": rationale_base,
+                "patch_text_augment": patch_augment,
+                "centroid_lon": float(patch_row["centroid_lon"]),
+                "centroid_lat": float(patch_row["centroid_lat"]),
             },
         }
         if self.transforms is not None:
