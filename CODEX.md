@@ -1029,7 +1029,10 @@ Stage B (lives on the `jay` branch):
     reports `local_to_global_*` / `global_to_local_*` retrieval.
   - **Per-patch text augment** (`--patch-text-augment-jsonl`): optional
     offline JSONL merges `augment` onto each patch’s `rationale_raw` for
-    cache + T5 encoding.
+    cache + T5 encoding. A checked-in **384-patch train sample** lives at
+    `assets/offline_augment/sample_olympus_384_patch_augments_v1.jsonl`
+    (see `assets/offline_augment/README.md`); regenerate via
+    `scripts/generate_sample_patch_text_augment_jsonl.py`.
   - **Geocell val metrics** (`--geocell-deg`): default `0.1 0.5` degrees when
     geo is enabled; softer image→geo diagnostics than diagonal R@k.
 - `src/stage_b/geo_encoders.py`

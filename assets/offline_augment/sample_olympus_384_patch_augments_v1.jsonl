@@ -1,0 +1,384 @@
+{"patch_id": "patch_038956", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_007382", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_023542", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_059976", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_019770", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_003579", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_027761", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_035390", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_065319", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_033503", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_062288", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_037063", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_069910", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_068355", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_048076", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_019694", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_021852", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_025376", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_080879", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_029071", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_063655", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_005876", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_023349", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_001241", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_047494", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_035681", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_056517", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_039793", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_051032", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_033893", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_009123", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_004185", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_014602", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_033294", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_051002", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_056254", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_076539", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_029562", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_001413", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_025477", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_038332", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_075179", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_077240", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_031046", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_007453", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_079973", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_008532", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_042424", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_065798", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_058654", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_001038", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_007603", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_059824", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_063169", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_056932", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_038206", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_036435", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_001001", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_007890", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_078127", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_015227", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_021373", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_081731", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_000308", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_005486", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_038035", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_080931", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_026168", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_077017", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_078016", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_021460", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_003132", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_030083", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_055278", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_022867", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_075886", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_064764", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_049198", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_018419", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_019527", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_051740", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_070007", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_073705", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_021779", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_014538", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_068206", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_006294", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_013219", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_034174", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_012286", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_056578", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_006542", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_037116", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_018894", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_028005", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_077518", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_040263", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_060830", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_014528", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_036486", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_038953", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_024715", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_048948", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_044643", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_053085", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_075177", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_053893", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_031235", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_066331", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_071729", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_051829", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_006492", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_040279", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_027383", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_042815", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_049616", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_001746", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_080030", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_019573", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_073324", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_032062", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_017967", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_057038", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_000321", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_069652", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_077947", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_028203", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_042797", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_048488", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_045808", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_025046", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_064132", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_016058", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_043266", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_017717", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_027345", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_023564", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_065773", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_000892", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_074509", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_072596", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_032387", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_010672", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_009883", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_030356", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_073500", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_013837", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_036659", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_002250", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_031928", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_077595", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_007153", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_042075", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_019551", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_078725", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_040994", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_010730", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_065848", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_047267", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_080954", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_028357", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_052298", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_061360", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_047008", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_030663", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_040788", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_045286", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_040564", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_039553", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_035209", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_068932", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_036461", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_045169", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_016901", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_009938", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_067617", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_074728", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_051559", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_051649", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_077328", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_065930", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_012562", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_076567", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_041614", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_077351", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_067751", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_041764", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_027569", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_047901", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_012258", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_040932", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_032606", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_062430", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_014338", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_018415", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_007754", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_061655", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_020208", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_013305", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_016773", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_019350", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_023130", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_029912", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_041338", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_069483", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_078714", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_057638", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_055873", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_022976", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_031930", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_080708", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_054270", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_021086", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_039440", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_044492", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_069266", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_063368", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_006337", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_034182", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_034155", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_079690", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_081426", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_009179", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_029362", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_073114", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_078370", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_060948", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_025066", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_023853", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_067340", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_047042", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_022498", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_080647", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_016050", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_055279", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_051505", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_061211", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_026803", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_020747", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_029068", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_058168", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_047530", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_021195", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_008436", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_043326", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_026332", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_002361", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_012321", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_033852", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_075993", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_038385", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_041193", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_034083", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_027178", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_002095", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_013747", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_030830", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_047229", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_080620", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_012699", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_046210", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_076152", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_046666", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_056423", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_068073", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_039422", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_080799", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_032289", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_005807", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_005732", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_045737", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_066623", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_018472", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_015182", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_081233", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_077531", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_041018", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_017285", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_003672", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_006813", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_010443", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_051532", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_014518", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_025926", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_012902", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_014399", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_036802", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_079260", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_006975", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_052678", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_076216", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_002398", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_070961", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_010505", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_042027", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_049131", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_059450", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_048404", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_055262", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_046080", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_058025", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_073294", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_005427", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_051496", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_062766", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_053827", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_048123", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_042338", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_010508", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_035191", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_031602", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_010701", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_021003", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_076970", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_054502", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_050695", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_038906", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_072127", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_073071", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_044529", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_024990", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_024714", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_030454", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_030532", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_025013", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_060517", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_044898", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_073720", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_038089", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_047334", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_067145", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_061874", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_069697", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_026131", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_039148", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_045603", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_021905", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_007981", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_009469", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_073004", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_012192", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_028086", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_035839", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_055213", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_029891", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_046493", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_063275", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_011451", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_071105", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_038267", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_076977", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_027900", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_010094", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_014635", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_056059", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_010128", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_079398", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_074925", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_024364", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_010261", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_036936", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_052483", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_065191", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_041531", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_014233", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_007649", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_039651", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_016146", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_077097", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_019106", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_069255", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_034531", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_050644", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_007176", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_057783", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_079707", "augment": "sinuous channel wall; layered terrain"}
+{"patch_id": "patch_061783", "augment": "Olympus basalt plains; HiRISE COLOR"}
+{"patch_id": "patch_004454", "augment": "dust mantle; aeolian streaks nearby"}
+{"patch_id": "patch_023359", "augment": "lava flow margins; wrinkle ridge context"}
+{"patch_id": "patch_038297", "augment": "crater rim ejecta; bright bedrock"}
+{"patch_id": "patch_047713", "augment": "mass-wasting scarp; talus slopes"}
+{"patch_id": "patch_047943", "augment": "yardangs; wind erosion signal"}
+{"patch_id": "patch_073433", "augment": "caldera-adjacent fractured plains"}
+{"patch_id": "patch_075942", "augment": "sinuous channel wall; layered terrain"}
