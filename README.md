@@ -2,6 +2,10 @@
 
 A [TorchGeo](https://torchgeo.readthedocs.io/)-based PyTorch dataset for NASA HiRISE Mars imagery, designed for crater segmentation and other geospatial deep-learning tasks.
 
+# ISSUES
+
+## When I implemented the GlobalLogScaler for the DTM instead of the linear scaler, I forgot to descale the features for the Lunar-Lambert renderings!!! To be aware, I am unsure about the impacts of this effect.
+
 ## Overview
 
 HiRISE (High Resolution Imaging Science Experiment) aboard the Mars Reconnaissance Orbiter produces the highest-resolution images of Mars available (~25 cm/pixel RED, ~50 cm/pixel colour). This library wraps the HiRISE RDR (Reduced Data Records) hosted on the NASA PDS Imaging Node as a `GeoDataset` compatible with TorchGeo's samplers and data loaders.
