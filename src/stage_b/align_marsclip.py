@@ -46,6 +46,7 @@ from clip.fb_mae_train_utils import (
     save_training_progress,
 )
 from clip.marsclip_patches import MarsCLIPPatchDataset, load_patch_records
+from stage_b.patch_text_augment import load_patch_text_augment_jsonl
 from stage_b.geo_encoders import (
     GEO_ENCODER_CHOICES,
     LocationEncoder,
@@ -572,6 +573,45 @@ def _diagonal_ranks(similarity: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     return row_rank, col_rank
 
 
+@torch.no_grad()
+def compute_geocell_image_to_geo_metrics(
+    image_emb: torch.Tensor,
+    geo_emb: torch.Tensor,
+    lat_lon_deg: torch.Tensor,
+    *,
+    cell_degs: tuple[float, ...],
+    ks: tuple[int, ...] = (1, 5, 10),
+) -> dict[str, float]:
+    """Fraction of image queries whose top-k *geo* neighbors share a coarse lon/lat cell with the query patch.
+
+    ``lat_lon_deg`` has shape ``(N, 2)`` with columns ``[lat, lon]`` in degrees, aligned with rows of
+    ``image_emb``. This is a softer diagnostic than diagonal R@k when many patches sit on the same grid.
+    """
+    if image_emb.shape[0] != lat_lon_deg.shape[0] or lat_lon_deg.ndim != 2 or lat_lon_deg.shape[1] != 2:
+        raise ValueError("lat_lon_deg must be (N, 2) [lat, lon] matching image_emb rows.")
+    similarity = image_emb @ geo_emb.T
+    kmax = min(max(ks), similarity.shape[1])
+    if kmax < 1:
+        return {}
+    _, top_idx = similarity.topk(kmax, dim=1, largest=True)
+    lat_lon = lat_lon_deg.to(device=similarity.device, dtype=torch.float32)
+    out: dict[str, float] = {}
+    for cell_deg in cell_degs:
+        if cell_deg <= 0.0:
+            continue
+        tgt_cell = torch.stack(
+            [torch.floor(lat_lon[:, 0] / cell_deg), torch.floor(lat_lon[:, 1] / cell_deg)], dim=1
+        )
+        pred_cell = tgt_cell[top_idx]
+        match = (pred_cell == tgt_cell.unsqueeze(1)).all(dim=-1)
+        for kk in ks:
+            use = min(kk, kmax)
+            hit = match[:, :use].any(dim=-1).float().mean().item()
+            key_deg = str(float(cell_deg)).replace(".", "p")
+            out[f"image_to_geo_geocell_{key_deg}deg_top{use}_any_neighbor"] = float(hit)
+    return out
+
+
 def compute_pairwise_retrieval_metrics(
     a_embeddings: torch.Tensor,
     b_embeddings: torch.Tensor,
@@ -617,12 +657,20 @@ def build_marsclip_embeddings(
     torch.Tensor | None,
     torch.Tensor | None,
     list[str],
+    torch.Tensor | None,
 ]:
-    """Build aligned image / text / (optional) geo / (optional) local embeddings."""
+    """Build aligned image / text / (optional) geo / (optional) local embeddings.
+
+    Returns ``(..., centroid_lat_lon)`` where the last tensor is optional ``(N, 2)`` with
+    columns ``[lat_deg, lon_deg]`` when batch metadata includes ``centroid_lat`` /
+    ``centroid_lon`` (MarsCLIP patch samples).
+    """
     image_chunks: list[torch.Tensor] = []
     text_chunks: list[torch.Tensor] = []
     geo_chunks: list[torch.Tensor] = []
     local_chunks: list[torch.Tensor] = []
+    latlon_chunks: list[torch.Tensor] = []
+    collect_latlon: bool | None = None
     text_rows: list[str] = []
     use_local = paired_views == "local_global"
 
@@ -688,11 +736,35 @@ def build_marsclip_embeddings(
 
         text_rows.extend(texts)
 
+        md = batch.get("metadata")
+        if isinstance(md, list) and md:
+            sample0 = md[0]
+            if isinstance(sample0, dict) and "centroid_lat" in sample0 and "centroid_lon" in sample0:
+                if collect_latlon is False:
+                    raise ValueError(
+                        "Mixed batches: centroid_lat/lon must be present in all batches or none."
+                    )
+                collect_latlon = True
+                lat_np = torch.tensor(
+                    [float(m["centroid_lat"]) for m in md], dtype=torch.float32
+                )
+                lon_np = torch.tensor(
+                    [float(m["centroid_lon"]) for m in md], dtype=torch.float32
+                )
+                latlon_chunks.append(torch.stack([lat_np, lon_np], dim=1))
+            else:
+                if collect_latlon is True:
+                    raise ValueError(
+                        "Mixed batches: centroid_lat/lon must be present in all batches or none."
+                    )
+                collect_latlon = False
+
     image_emb_all = torch.cat(image_chunks, dim=0)
     text_emb_all = torch.cat(text_chunks, dim=0)
     geo_emb_all = torch.cat(geo_chunks, dim=0) if geo_chunks else None
     local_emb_all = torch.cat(local_chunks, dim=0) if local_chunks else None
-    return image_emb_all, text_emb_all, geo_emb_all, local_emb_all, text_rows
+    centroid_lat_lon = torch.cat(latlon_chunks, dim=0) if collect_latlon is True else None
+    return image_emb_all, text_emb_all, geo_emb_all, local_emb_all, text_rows, centroid_lat_lon
 
 
 @torch.no_grad()
@@ -709,9 +781,10 @@ def evaluate_marsclip_retrieval(
     geo_context: str = "latlon_view_scale",
     paired_views: str = "none",
     local_crop_fraction: float = 0.5,
+    geocell_degs: tuple[float, ...] | None = None,
 ) -> dict[str, float]:
     """Combined image↔text + (optional) image↔geo + (optional) local↔global metrics."""
-    image_emb, text_emb, geo_emb, local_emb, text_rows = build_marsclip_embeddings(
+    image_emb, text_emb, geo_emb, local_emb, text_rows, centroid_lat_lon = build_marsclip_embeddings(
         dataloader=dataloader,
         mae_encoder=mae_encoder,
         text_encoder=text_encoder,
@@ -736,6 +809,20 @@ def evaluate_marsclip_retrieval(
             if key == "num_samples":
                 continue
             metrics[key] = value
+        if (
+            centroid_lat_lon is not None
+            and geocell_degs is not None
+            and len(geocell_degs) > 0
+            and centroid_lat_lon.shape[0] == image_emb.shape[0]
+        ):
+            gc = compute_geocell_image_to_geo_metrics(
+                image_emb,
+                geo_emb,
+                centroid_lat_lon,
+                cell_degs=tuple(geocell_degs),
+                ks=(1, 5, 10),
+            )
+            metrics.update(gc)
     if local_emb is not None:
         lg_metrics = compute_pairwise_retrieval_metrics(
             local_emb,
@@ -915,7 +1002,28 @@ def main() -> None:
     parser.add_argument("--wandb-entity", type=str, default="akshayn3-auvsl")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-dir", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--patch-text-augment-jsonl",
+        type=pathlib.Path,
+        default=None,
+        help="Optional JSONL map {patch_id, augment} merged into per-patch rationale_raw.",
+    )
+    parser.add_argument(
+        "--geocell-deg",
+        type=float,
+        nargs="*",
+        default=argparse.SUPPRESS,
+        help="Grid size in degrees for geocell diagnostics on image→geo (default: 0.1 0.5). "
+        "Pass an empty list after the flag to disable.",
+    )
     args = parser.parse_args()
+
+    if hasattr(args, "geocell_deg"):
+        effective_geocell_degs: tuple[float, ...] = (
+            tuple(float(x) for x in args.geocell_deg) if args.geocell_deg else ()
+        )
+    else:
+        effective_geocell_degs = (0.1, 0.5)
 
     torch.manual_seed(args.seed)
 
@@ -1046,6 +1154,10 @@ def main() -> None:
                 seed=args.seed,
             )
 
+        patch_text_augment_by_id: dict[str, str] | None = None
+        if args.patch_text_augment_jsonl is not None:
+            patch_text_augment_by_id = load_patch_text_augment_jsonl(args.patch_text_augment_jsonl)
+
         dataset = MarsCLIPPatchDataset(
             root=args.root,
             bbox=tuple(args.bbox),
@@ -1054,6 +1166,7 @@ def main() -> None:
             max_patches=train_dataset_max_patches,
             color_only=True,
             patch_records=train_patch_records,
+            patch_text_augment_by_id=patch_text_augment_by_id,
         )
         val_dataset = None
         if val_patch_records is not None:
@@ -1064,6 +1177,7 @@ def main() -> None:
                 color_only=True,
                 observation_metadata=dataset.observation_metadata.reset_index(drop=True),
                 patch_records=val_patch_records,
+                patch_text_augment_by_id=patch_text_augment_by_id,
             )
         save_training_progress(
             {
@@ -1624,6 +1738,9 @@ def main() -> None:
                         geo_context=str(args.geo_context),
                         paired_views=str(args.paired_views),
                         local_crop_fraction=float(args.local_crop_fraction),
+                        geocell_degs=effective_geocell_degs
+                        if str(args.geo_context) != "none"
+                        else None,
                     )
                 finally:
                     if ema is not None and ema_backup is not None:

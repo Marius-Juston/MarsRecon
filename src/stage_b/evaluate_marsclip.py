@@ -37,6 +37,7 @@ from stage_b.align_marsclip import (
     MarsCLIPAlignmentModel,
     build_marsclip_embeddings,
     collate_geo_warmup,
+    compute_geocell_image_to_geo_metrics,
     compute_pairwise_retrieval_metrics,
     geo_input_dim,
 )
@@ -98,7 +99,21 @@ def main() -> None:
         default=None,
         help="Override local crop fraction for the local view (same as training).",
     )
+    parser.add_argument(
+        "--geocell-deg",
+        type=float,
+        nargs="*",
+        default=argparse.SUPPRESS,
+        help="Geocell softness for image→geo (default 0.1 0.5). Omit flag for defaults.",
+    )
     args = parser.parse_args()
+
+    if hasattr(args, "geocell_deg"):
+        effective_geocell_degs: tuple[float, ...] = (
+            tuple(float(x) for x in args.geocell_deg) if args.geocell_deg else ()
+        )
+    else:
+        effective_geocell_degs = (0.1, 0.5)
 
     checkpoint = torch.load(str(args.alignment_checkpoint), map_location="cpu")
     config = dict(checkpoint.get("config", {}))
@@ -256,7 +271,7 @@ def main() -> None:
         aligner.load_state_dict(ema_state, strict=True)
     aligner.eval()
 
-    image_emb, text_emb, geo_emb, local_emb, text_rows = build_marsclip_embeddings(
+    image_emb, text_emb, geo_emb, local_emb, text_rows, centroid_lat_lon = build_marsclip_embeddings(
         dataloader=dataloader,
         mae_encoder=mae_encoder,
         text_encoder=text_encoder,
@@ -283,6 +298,21 @@ def main() -> None:
             if key == "num_samples":
                 continue
             metrics[key] = float(value)
+        if (
+            centroid_lat_lon is not None
+            and geo_context != "none"
+            and effective_geocell_degs
+            and centroid_lat_lon.shape[0] == image_emb.shape[0]
+        ):
+            gc = compute_geocell_image_to_geo_metrics(
+                image_emb,
+                geo_emb,
+                centroid_lat_lon,
+                cell_degs=effective_geocell_degs,
+                ks=(1, 5, 10),
+            )
+            for key, value in gc.items():
+                metrics[key] = float(value)
     if local_emb is not None:
         lg_metrics = compute_pairwise_retrieval_metrics(
             local_emb,
