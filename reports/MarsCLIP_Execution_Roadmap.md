@@ -314,7 +314,7 @@ Exit criteria:
 
 3. ~~Implement **coarse geo metrics** (geocell hit-rate…)~~ **Done in code**: training and `evaluate_marsclip` report ``image_to_geo_geocell_*deg_topk_any_neighbor`` when batch metadata carries ``centroid_lat/lon`` (patch dataset now emits them). Re-cache or use a fresh cache if an older warmup JSON lacks centroids.
 
-4. **Offline augmentation**: **Partially done**: JSONL loader + optional ``--patch-text-augment-jsonl`` on ``align_marsclip`` concatenate per-patch ``augment`` to ``rationale_raw``. Author JSONL offline (including with Cursor); commit hashed artifacts when you have coverage you trust.
+4. **Offline augmentation**: **Partially done**: JSONL loader + optional ``--patch-text-augment-jsonl`` on ``align_marsclip`` concatenate per-patch ``augment`` to ``rationale_raw``. A checked-in 384-patch train sample lives under ``assets/offline_augment/``. **Smoke OK (2026-04-27)** — B1a-pairs + augment on 320 train / 128 val patches, 2 epochs, run dir ``…/marsclip_align/20260427/20260427_211717_olympus-b1a-pairs-augment-smoke-v1/``; scale to full Olympus + longer schedule for production.
 
 **Tertiary / polish:**
 
