@@ -4,9 +4,9 @@ This document turns the embedding workflow into a finite execution plan. The wor
 
 ## Status Snapshot
 
-Current position: Phase 0 and all of Stage A are complete in the current environment. We now have a reusable GPU-backed Stage A MAE checkpoint, a longer non-smoke CUDA run, and embedding sanity artifacts. The next gap is Stage B1: building workflow-aligned paired local/global crops and reusing the Stage A encoder in the multimodal path.
+Current position: Phase 0 and Stage A are complete. Stage B has advanced beyond a text-only baseline: **B1a-geo** (image + text + geo-context contrastive training) and **B1a-geo+** (positional location encoders, separate geo temperature, geo warmup) have been run and analyzed on Olympus splits. **B1a-pairs**—deterministic local/global views, cached dual SatMAE features, CACo-style local↔global InfoNCE, and local↔global retrieval in train/eval—is **implemented in code** (`stage_b.align_marsclip`, `evaluate_marsclip`) and documented in `CODEX.md`, but the **first full training run sized like production** is still the main open loop. Optional follow-ups: softer geo metrics (geocell hit-rate, distance correlation), and **offline** patch text augmentation (human- or Cursor-assisted JSON, not runtime LLM).
 
-Overall workflow progress: `[#######---] ~68%`
+Overall workflow progress: `[########--] ~75%`
 
 This percentage is intentionally conservative. It reflects alignment to the full workflow, not just the amount of code already written.
 
@@ -185,28 +185,26 @@ Exit criteria:
 
 ### 5. Stage B1: Paired Multi-Scale Crops And Workflow-Aligned Encoders
 
-Status: `pending`
+Status: `in_progress`
 
-Progress: `[#---------] 10%`
+Progress: `[######----] 65%`
 
-Why this is not zero:
-- We already have a baseline text path, geo-context path, and contrastive model scaffold
-- But it is still much simpler than the workflow
+Why this is not complete:
+- Trainer implements **global patch** + **deterministic centered local crop** (resize to same resolution), both through the **frozen Stage A** encoder, shared image projector, and local↔global contrastive term; geo + text paths match the B1a-geo roadmap.
+- Still missing vs a fancier workflow doc: stochastic multi-scale sampling, FiLM conditioning, and optional separate “expanded rationale” ingestion beyond the Olympus short strings.
 
 Deliverables:
-- Paired local/global crop sampler
-- Stage A encoder reused as the visual backbone
-- Geometry encoder aligned more closely with the workflow
-- Location encoder aligned more closely with the workflow
-- Frozen text embedding path over raw and expanded rationale text
-- Optional FiLM conditioning or another explicit geometry-conditioning mechanism
-- Context fusion target for text and location
+- Paired local/global crop sampler ~~(minimal: centered crop fraction)~~ **done in trainer cache path**
+- Stage A encoder reused as the visual backbone **done**
+- Geometry / location encoding **partially aligned** (coords + optional RFF/SIREN/SH stacks in `geo_encoders.py`; eval shows 1↔1 geo retrieval is a weak metric on this split—see CODEX).
+- Frozen text embedding path over raw rationales **done** (T5 + cache).
+- ~~Optional FiLM~~ still open.
+- Context fusion beyond concat+projector **open**.
 
 Validation:
-- Unit tests for paired-crop validity
-- Tests for crop overlap / validity intersection rules
-- Tests for encoder output shapes and normalization
-- Smoke test for one Stage B batch
+- Unit tests for **`make_local_view`** and crop bounds (**`tests/test_align_marsclip_helpers.py`**)
+- Tests for paired-crop validity / overlap intersection rules **still open** if we add stochastic crops
+- End-to-end **GPU smoke** (small `--max-patches`, `--epochs 2`) and one **production-scale B1a-pairs run** **open**
 
 Final report artifacts:
 - Paired local/global crop figure
@@ -214,19 +212,21 @@ Final report artifacts:
 - Context fusion diagram
 
 Exit criteria:
-- We can produce aligned local/global image embeddings and context targets for one batch
+- We can produce aligned local/global image embeddings **and validate local↔global retrieval improves or stabilizes vs geo-only** on held-out Olympus splits (run + eval archived next to checkpoint).
 
 ### 6. Stage B2: Contrastive Training Aligned To The Workflow
 
-Status: `pending`
+Status: `in_progress`
 
-Progress: `[----------] 0%`
+Progress: `[####------] 40%`
+
+Note: Core contrastive training for B1a (image–text–geo–local/global) exists; this stage is “complete” only when workflows call for additional loss variants and full ablations.
 
 Deliverables:
-- Training loop for Stage B
-- Soft-target or workflow-appropriate contrastive loss
-- Cross-scale consistency loss
-- Logging of image-text, image-context, and scale-consistency metrics
+- Training loop for Stage B **(B1a trainer exists; extend with ablations / soft targets as needed)**
+- Soft-target or workflow-appropriate contrastive loss **open**
+- Cross-scale consistency loss **partial (local↔global InfoNCE in B1a-pairs)**
+- Logging of image-text, image-context, and scale-consistency metrics **partial (W&B + val retrieval)**
 
 Validation:
 - One-epoch smoke run
@@ -305,24 +305,21 @@ Exit criteria:
 
 ## Immediate Next Step
 
-The next best step is now:
+**Primary (blocking “Stage B1 done” feeling):**
 
-`Start Stage B1: paired local/global crops and workflow-aligned context encoders.`
+1. **Run B1a-pairs training** using the canonical flags in `CODEX.md`: `--paired-views local_global --local-crop-fraction 0.5 --lg-loss-weight 0.5`, same Olympus assets and Stage A checkpoint family as prior B1a runs. Log `train/lg_*`, `val/local_to_global_*`, and compare against the best **B1a-geo+** checkpoint on image↔text.
+2. **Evaluate** `best_checkpoint.pt` with `evaluate_marsclip.py`, full val (`--max-patches` large enough), optionally `--paired-views-override local_global` for older ckpts.
 
-That means:
-- build paired local/global crop sampling on top of the Stage A patch bridge
-- load and reuse the selected Stage A encoder checkpoint
-- define the first workflow-aligned location / geometry / text context batch contract
-- keep Stage B tests as strict as Stage A tests
-- keep tests and reconstruction previews first-class from the start
+**Secondary (recommended soon):**
 
-Concretely, the immediate next actions are:
-- add a paired-crop record builder for local and global views from the same dominant observation
-- add a Stage B dataset / collator that returns local image, global image, text, and geo-context
-- wire the Stage A checkpoint in as the visual backbone initialization
-- add unit tests for paired-crop validity, overlap, and metadata alignment
+3. Implement **coarse geo metrics** (geocell hit-rate / mean geographic error) so tuning is not driven only by diagonal image↔geo R@K.
+4. **Offline augmentation file** schema + loader (patch_id → augmented short text); generate text with Cursor in the loop, commit data + version hash—no inference LLM in training.
 
-This is the highest-leverage next move because Stage A now has a selected reusable checkpoint, and the next remaining structural gap is building the workflow-aligned Stage B input pipeline around it.
+**Tertiary / polish:**
+
+5. Extend unit tests if we add non-deterministic crops or richer batch contracts.
+
+This ordering keeps momentum on the **largest unexplored empirical gap** (first real B1a-pairs run) while deferring nicer metrics and text enrichment until pairs are measured.
 
 ## Done Criteria For The Whole Project
 
