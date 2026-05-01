@@ -1114,7 +1114,7 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'depthfm'", specifier = ">=12.1.1" },
     { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "pykrige", marker = "extra == 'depthfm'", specifier = ">=1.7.3" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.14" },
