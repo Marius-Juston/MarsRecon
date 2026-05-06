@@ -98,7 +98,7 @@ class PhotoclinometricLoss(nn.Module):
     def lunar_lambert_weight(self) -> torch.Tensor:
         return torch.sigmoid(self.lunar_lambert_logit)
 
-    def _zero_loss(self) -> torch.Tensor:
+    def _zero_loss(self, B: int = 1, reduction: str = 'mean') -> torch.Tensor:
         """Return a zero loss that is CONNECTED to all parameters.
 
         Critical for DDP: if any rank skips the real loss (e.g. no valid
@@ -110,7 +110,8 @@ class PhotoclinometricLoss(nn.Module):
         for the logit, which is compatible with the real gradient on other
         ranks.
         """
-        return 0.0 * self.lunar_lambert_weight
+        z = 0.0 * self.lunar_lambert_weight
+        return z.expand(B) if reduction == 'none' else z
 
     def _get_surface_normals(self, depth: torch.Tensor) -> torch.Tensor:
         """Calculates (Nx, Ny, Nz) unit normals from the depth map.
@@ -231,7 +232,7 @@ class PhotoclinometricLoss(nn.Module):
 
     def _masked_pearson(
             self, render: torch.Tensor, ortho: torch.Tensor,
-            valid_mask: torch.Tensor, B: int,
+            valid_mask: torch.Tensor, B: int, reduction: str = 'mean'
     ) -> torch.Tensor:
         """Pearson correlation loss, NaN-safe for DDP.
 
@@ -248,7 +249,7 @@ class PhotoclinometricLoss(nn.Module):
         valid_batch = (vc_squeezed > min_pixels)
 
         if not valid_batch.any():
-            return self._zero_loss()
+            return self._zero_loss(B, reduction)
 
         r_masked = render * valid_mask
         o_masked = ortho * valid_mask
@@ -269,7 +270,7 @@ class PhotoclinometricLoss(nn.Module):
         final_valid = valid_batch & has_variance
 
         if not final_valid.any():
-            return self._zero_loss()
+            return self._zero_loss(B, reduction)
 
         # eps INSIDE sqrt to prevent ∞ gradient at var→0
         denom = torch.sqrt(var_r * var_o + 1e-8)
@@ -278,15 +279,18 @@ class PhotoclinometricLoss(nn.Module):
         # Clamp correlation to [-1, 1] — floating point can exceed this
         correlation = correlation.clamp(-1.0, 1.0)
 
-        pearson_loss = 1.0 - correlation[final_valid].mean()
+        loss = 1.0 - correlation
 
-        # Clamp the final loss to prevent extreme values from
-        # propagating through gradient accumulation
-        return pearson_loss.clamp(0.0, 2.0)
+        if reduction == 'none':
+            out = torch.zeros_like(loss)
+            out[final_valid] = loss[final_valid]
+            return out.clamp(0.0, 2.0)
+        else:
+            return loss[final_valid].mean().clamp(0.0, 2.0)
 
     def _masked_ssim(
             self, render: torch.Tensor, ortho: torch.Tensor,
-            valid_mask: torch.Tensor, window_size: int = 7,
+            valid_mask: torch.Tensor, window_size: int = 7, reduction: str = 'mean'
     ) -> torch.Tensor:
         """Differentiable SSIM loss on z-score normalised inputs, NaN-safe.
 
@@ -302,6 +306,8 @@ class PhotoclinometricLoss(nn.Module):
 
         Constants scaled for z-scored data (effective data_range ≈ 6).
         """
+        B = render.shape[0]
+
         # Wang 2004: C1 = (K1 * L)², C2 = (K2 * L)², with L = data range.
         # Pre-z-score L ≈ 2 (inputs in [-1, 1]); post-z-score L ≈ 6 (≈ ±3σ).
         data_range = 6.0
@@ -353,12 +359,22 @@ class PhotoclinometricLoss(nn.Module):
         mask_eroded = F.avg_pool2d(valid_mask.float(), window_size, stride=1, padding=pad)
         mask_eroded = (mask_eroded > 0.99).float()
 
-        if mask_eroded.sum() < 10:
-            return self._zero_loss()
+        # Calculate batched SSIM values
+        valid_items = mask_eroded.view(B, -1).sum(dim=1) >= 10
+        if not valid_items.any():
+            return self._zero_loss(B, reduction)
 
-        ssim_val = (ssim_map * mask_eroded).sum() / (mask_eroded.sum() + 1e-8)
-        loss = (1.0 - ssim_val).clamp(0.0, 2.0)
-        return loss
+        ssim_num = (ssim_map * mask_eroded).view(B, -1).sum(dim=1)
+        ssim_den = mask_eroded.view(B, -1).sum(dim=1) + 1e-8
+        ssim_val = ssim_num / ssim_den
+        loss = 1.0 - ssim_val
+
+        if reduction == 'none':
+            out = torch.zeros_like(loss)
+            out[valid_items] = loss[valid_items]
+            return out.clamp(0.0, 2.0)
+        else:
+            return loss[valid_items].mean().clamp(0.0, 2.0)
 
     @staticmethod
     @lru_cache
@@ -370,7 +386,8 @@ class PhotoclinometricLoss(nn.Module):
         return kernel.view(1, 1, size, size)
 
     def forward(self, pred_depth: torch.Tensor, real_ortho: torch.Tensor, mask: torch.Tensor,
-                sun_vectors: torch.Tensor, ambient: torch.Tensor, intensity: torch.Tensor) -> torch.Tensor:
+                sun_vectors: torch.Tensor, ambient: torch.Tensor, intensity: torch.Tensor,
+                reduction: str = 'mean') -> torch.Tensor:
 
         if pred_depth.shape[1] == 3:
             pred_depth = pred_depth[:, :1]
@@ -401,9 +418,9 @@ class PhotoclinometricLoss(nn.Module):
         # Check for degenerate inputs: NaN/Inf depth from VAE decoder
         if not torch.isfinite(pred_depth).all():
             logger.warning("PhotoclinometricLoss: non-finite pred_depth detected, returning zero loss")
-            return self._zero_loss()
+            return self._zero_loss(B, reduction)
 
-        total_loss = self._zero_loss()  # start from param-connected zero
+        total_loss = self._zero_loss(B, reduction)
 
         for s in self.scales:
             if s > 1:
@@ -429,22 +446,22 @@ class PhotoclinometricLoss(nn.Module):
             render = self._lunar_lambert_render(normals, l_dir, intensity, ambient)
 
             # Pearson component (scale- and shift-invariant by construction)
-            pearson_loss = self._masked_pearson(render, o_s, m_s, B)
+            pearson_loss = self._masked_pearson(render, o_s, m_s, B, reduction)
 
             # SSIM component (on z-score normalised inputs)
-            ssim_loss = self._masked_ssim(render, o_s, m_s)
+            ssim_loss = self._masked_ssim(render, o_s, m_s, window_size=7, reduction=reduction)
 
-            # Combined: (1-α)*Pearson + α*SSIM
             alpha = self.ssim_weight
+            # Combined: (1-α)*Pearson + α*SSIM
             scale_loss = (1.0 - alpha) * pearson_loss + alpha * ssim_loss
             total_loss = total_loss + scale_loss
 
         result = total_loss / len(self.scales)
 
         # Final NaN guard: if anything slipped through, return zero
-        if not torch.isfinite(result):
+        if not torch.isfinite(result).all():
             logger.warning("PhotoclinometricLoss: non-finite loss detected, returning zero")
-            return self._zero_loss()
+            return self._zero_loss(B, reduction)
 
         return result
 
