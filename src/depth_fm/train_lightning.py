@@ -35,9 +35,9 @@ from typing import Callable
 
 import cuml
 import matplotlib.patches as mpatches
-import pandas as pd
-from matplotlib.figure import Figure
 import xgboost as xgb
+from matplotlib.figure import Figure
+from matplotlib.patches import ConnectionPatch
 
 from depth_fm.litdata_datamodule import _build_litdata_loaders
 from depth_fm.losses import PhotoclinometricLoss, AbsoluteDepthLoss, LaplacianLoss, \
@@ -54,7 +54,6 @@ os.environ["GDAL_MAX_DATASET_POOL_SIZE"] = "1024"
 
 import lightning as L
 import torch.fft
-import torch.nn.functional as F
 from lightning.pytorch.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
@@ -74,11 +73,21 @@ from depth_fm.visualization import (
     set_neurips_style, plot_pareto_frontier,
 )
 
+import matplotlib.gridspec as gridspec
+from scipy.spatial.transform import Rotation as R
+import torch.nn.functional as F
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from tqdm import tqdm
+from depth_fm.depthfm_adapter import compute_topographic_residual
+import torch.distributed as dist
+import re
+from depth_fm.visualization import plot_timestep_ablation
 import seaborn as sns
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -873,10 +882,6 @@ def render_sample_diagnostics(
 @torch.no_grad()
 def visualize_seam_artifacts(dataloader, output_dir: Path, num_samples: int = 16):
     """Enhanced drop-in replacement. Saves a top-N/bottom-N diagnostic grid."""
-    import torch.nn.functional as F
-    import matplotlib.pyplot as plt
-    from tqdm import tqdm
-    import numpy as np
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1553,11 +1558,6 @@ def visualize_loss_physics(
             loss_fn.lunar_lambert_logit.data = saved_logit
 
 
-import torch
-from matplotlib.patches import ConnectionPatch
-from pathlib import Path
-
-
 @torch.no_grad()
 def plot_radial_sun_sweep(dataloader, loss_fn, output_dir: Path):
     """
@@ -1688,10 +1688,6 @@ def plot_radial_sun_sweep(dataloader, loss_fn, output_dir: Path):
     print(f"Radial visualization saved to: {save_path}")
 
 
-import torch
-from pathlib import Path
-
-
 @torch.no_grad()
 def plot_spherical_loss_landscape(
         dataloader,
@@ -1800,17 +1796,6 @@ def plot_spherical_loss_landscape(
     output_dir.mkdir(parents=True, exist_ok=True)
     save_fig(fig, output_dir / 'spherical_loss_landscape.pdf', bbox_inches='tight', dpi=300)
     plt.close(fig)
-
-
-import torch
-import umap
-import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
-from pathlib import Path
-from tqdm import tqdm
-from cuml.ensemble import RandomForestRegressor
-from sklearn.model_selection import cross_val_score
 
 
 def compute_distance_correlation_gpu(X: torch.Tensor, Y: torch.Tensor) -> float:
@@ -2251,9 +2236,6 @@ def plot_umap_invariance(dataloader, loss_fn, output_dir: Path, num_samples: int
     print(f"Combined Nuisance dCor: {dcor_nuisance:.3f}")
 
 
-from scipy.spatial.transform import Rotation as R
-
-
 @torch.no_grad()
 def plot_component_ablation(dataloader, loss_fn, output_dir: Path, steps: int = 50, num_batches: int = 100):
     """
@@ -2318,14 +2300,40 @@ def plot_component_ablation(dataloader, loss_fn, output_dir: Path, steps: int = 
 
 
 @torch.no_grad()
-def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
+def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path, search_batches: int = 15):
     """
     Augments qualitative outputs with statistical residual distributions
-    to rigorously prove error displacement dynamics.
+    to rigorously prove error displacement dynamics. Actively searches for
+    high-variance terrain (e.g., mountains/craters) for maximum visual clarity.
     """
     device = next(loss_fn.parameters()).device
-    batch = next(iter(dataloader))
 
+    # --- 1. Find a sample with high feature distinction ---
+    best_batch = None
+    max_variance = -1
+
+    print(f"Scanning up to {search_batches} batches for rugged terrain...")
+    for b_idx, batch in enumerate(dataloader):
+        if b_idx >= search_batches:
+            break
+
+        dtm_np = batch["dtm"][0, 0].cpu().numpy()
+        mask_np = batch["confidence"][0, 0].cpu().numpy().astype(bool)
+
+        valid_dtm = dtm_np[mask_np]
+        if len(valid_dtm) > 0:
+            variance = np.var(valid_dtm)
+            if variance > max_variance:
+                max_variance = variance
+                best_batch = batch
+
+    if best_batch is None:
+        raise ValueError("Could not find any valid terrain in the dataloader.")
+
+    print(f"Selected terrain with depth variance: {max_variance:.2f}")
+    batch = best_batch
+
+    # --- 2. Extract Data ---
     dtm = batch["dtm"][0:1].to(device)
     ortho = batch["image"][0:1].to(device)
     mask = batch["confidence"][0:1].to(device)
@@ -2333,17 +2341,19 @@ def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
     A = batch["ambient"][0:1].to(device).view(1, 1, 1, 1)
     gt_sun = batch["sun_vector"][0].cpu().numpy()
 
+    # --- 3. Compute Illumination Geometries ---
     sun_gt = torch.tensor(gt_sun, device=device, dtype=torch.float32).unsqueeze(0)
 
     az_rot = R.from_euler('z', 45, degrees=True)
     sun_az = torch.tensor(az_rot.apply(gt_sun), device=device, dtype=torch.float32).unsqueeze(0)
 
+    # Zenith Singularity Fix
     el_axis = np.cross(np.array([0, 0, 1]), gt_sun)
-    norm = np.linalg.norm(el_axis)
-    if norm < 1e-6:
-        el_axis = np.array([1.0, 0.0, 0.0])  # Arbitrary fallback axis if sun is at zenith
+    axis_norm = np.linalg.norm(el_axis)
+    if axis_norm < 1e-6:
+        el_axis = np.array([1.0, 0.0, 0.0])  # Fallback if sun is perfectly at zenith
     else:
-        el_axis /= norm
+        el_axis /= axis_norm
 
     el_rot = R.from_rotvec(np.radians(45) * el_axis)
     sun_el = torch.tensor(el_rot.apply(gt_sun), device=device, dtype=torch.float32).unsqueeze(0)
@@ -2358,22 +2368,48 @@ def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
         (r"Elevation Shift (+45$^\circ$)", sun_el)
     ]
 
-    # Expand plotting grid to 5 columns to include statistical distributions
-    fig, axes = plt.subplots(3, 5, figsize=(22, 12), gridspec_kw={'width_ratios': [1, 1, 1, 1, 1.5]})
-    plt.subplots_adjust(wspace=0.15, hspace=0.35)
+    # --- Custom GridSpec Layout ---
+    fig = plt.figure(figsize=(18, 12))
+
+    # GridSpec 1: Images (Columns 0, 1, 2)
+    # wspace=0.05 creates minimal horizontal gaps between the source, render, and residual maps.
+    gs_img = gridspec.GridSpec(3, 3, figure=fig, wspace=0.05, hspace=0.35, left=0.02, right=0.42)
+
+    # GridSpec 2: Statistical Plots (Columns 3, 4)
+    # The gap between right=0.48 (img) and left=0.55 (plt) leaves room for the density y-labels.
+    gs_plt = gridspec.GridSpec(3, 2, figure=fig, wspace=0.25, hspace=0.35, left=0.50, right=0.98,
+                               width_ratios=[1.2, 1.0])
 
     mask_np = mask[0, 0].cpu().numpy().astype(bool)
 
-    for i, (title, sun_vec) in tqdm(enumerate(conditions), desc="Looping through conditions"):
+    # Pre-calculate Ground Truth baseline distribution for visual anchoring
+    render_gt, _ = loss_fn.render_from_depth(dtm, sun_gt, I, A)
+    render_gt_z = loss_fn._zscore(render_gt, mask)
+    gt_residual_raw = (render_gt_z - ortho_z)[0, 0].cpu().numpy()
+    gt_valid_residuals = gt_residual_raw[mask_np].flatten()
+
+    axes = np.empty((3, 5), dtype=object)
+
+    for i in range(3):
+        # Assign Image axes
+        axes[i, 0] = fig.add_subplot(gs_img[i, 0])
+        axes[i, 1] = fig.add_subplot(gs_img[i, 1])
+        axes[i, 2] = fig.add_subplot(gs_img[i, 2])
+
+        # Assign Plot axes
+        axes[i, 3] = fig.add_subplot(gs_plt[i, 0])
+        axes[i, 4] = fig.add_subplot(gs_plt[i, 1])
+
+    for i, (title, sun_vec) in tqdm(enumerate(conditions), desc="Rendering Conditions", total=3):
         render, _ = loss_fn.render_from_depth(dtm, sun_vec, I, A)
         render_z = loss_fn._zscore(render, mask)
 
-        # Calculate raw statistical residuals for KDE
         residual_raw = (render_z - ortho_z)[0, 0].cpu().numpy()
         valid_residuals = residual_raw[mask_np].flatten()
 
-        residual_img = np.abs(residual_raw)
-        residual_img = np.clip(residual_img / 2.0, 0.0, 1.0)
+        # Fix: Keep directional signs and clip symmetrically for the diverging colormap
+        residual_img = residual_raw.copy()
+        residual_img = np.clip(residual_img, -3.0, 3.0)
         residual_img[~mask_np] = np.nan
 
         ortho_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
@@ -2388,28 +2424,42 @@ def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
         axes[i, 1].imshow(render_disp, cmap="gray")
         axes[i, 1].set_title(rf"Render $\mathcal{{I}}_r$: {title}")
 
-        im = axes[i, 2].imshow(residual_img, cmap="RdBu_r")
+        # Fix: Enforce vmin/vmax so white is exactly 0.0
+        im = axes[i, 2].imshow(residual_img, cmap="RdBu_r", vmin=-3.0, vmax=3.0)
         axes[i, 2].set_title("Structural Residual Map")
 
         for j in range(3):
             axes[i, j].axis('off')
 
-        # Quantitative Error Distribution Plot
-        sns.histplot(valid_residuals, kde=True, ax=axes[i, 3], color='#8b0000' if i > 0 else '#2ca02c', bins=50)
+        # Fix: Meaningful Error Metrics (RMSE and MAE)
+        rmse = np.sqrt(np.mean(valid_residuals ** 2))
+        mae = np.mean(np.abs(valid_residuals))
+
+        # Fix: Plot Ground Truth KDE in the background of perturbed rows
+        if i > 0:
+            sns.kdeplot(gt_valid_residuals, ax=axes[i, 3], color='gray', fill=True, alpha=0.2)
+
+        sns.histplot(valid_residuals, kde=True, ax=axes[i, 3], color='#8b0000' if i > 0 else '#2ca02c', bins=50,
+                     stat='density')
         axes[i, 3].set_title(
-            rf"Residual Distribution" +"\n" +rf"$\mu={valid_residuals.mean():.2f}, \sigma={valid_residuals.std():.2f}$")
+            rf"Residual Distribution" + "\n" + rf"RMSE: {rmse:.2f} | MAE: {mae:.2f}")
         axes[i, 3].set_xlim(-4, 4)
         axes[i, 3].set_xlabel("$Z_r - Z_o$")
         axes[i, 3].set_ylabel("Pixel Density")
 
-        # Emulate Box/Violin logic
         sns.violinplot(x=valid_residuals, ax=axes[i, 4], color='#d3d3d3', inner="quartile")
         axes[i, 4].set_title("Quartile Shift")
         axes[i, 4].set_xlim(-4, 4)
 
     fig.suptitle('Qualitative and Statistical Displacement under Erroneous Illumination Profiles', fontsize=18,
                  fontweight='bold')
+
+    # Optional: Add colorbar for the residual map to make the scale explicit
+    cbar_ax = fig.add_axes([0.17, 0.06, 0.10, 0.02])  # [left, bottom, width, height]
+    fig.colorbar(im, cax=cbar_ax, orientation='horizontal', label='Z-Scored Error')
+
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Using standard savefig directly on the figure object
     save_fig(fig, output_dir / 'qualitative_illumination_physics.pdf', bbox_inches='tight', dpi=300)
     plt.close(fig)
 
@@ -2418,7 +2468,6 @@ def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
 def compute_topography_statistics(dataloader, split_name="Dataset"):
     """Evaluates how many patches are essentially flat planes."""
     logger.info(f"Computing topography statistics for {split_name}...")
-    from depth_fm.depthfm_adapter import compute_topographic_residual
 
     residuals = []
     flat_stds = []
@@ -2766,7 +2815,6 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True) -> di
 # ---------------------------------------------------------------------------
 # Single training run
 # ---------------------------------------------------------------------------
-import torch.distributed as dist
 
 
 def run_single_training(
@@ -2809,7 +2857,7 @@ def run_single_training(
             test_summary = json.load(f)
 
         # Load the saved dataframe so downstream plotting doesn't crash
-        import pandas as pd
+
         test_df_path = output_dir / "test_results.csv"
         test_df = pd.read_csv(test_df_path) if test_df_path.exists() else None
 
@@ -2971,7 +3019,6 @@ def run_single_training(
         best_ckpts = list(ckpt_dir.glob(f"depthfm-best-{best_choice}-*.ckpt"))
 
         if best_ckpts:
-            import re
 
             # The float metric is right before the .ckpt extension
             def extract_rmse(path):
@@ -3009,8 +3056,6 @@ def run_single_training(
     if trainer.is_global_zero:
         with open(output_dir / "timestep_ablation.json", "w") as f:
             json.dump({str(k): v for k, v in timestep_results.items()}, f, indent=2)
-
-        from depth_fm.visualization import plot_timestep_ablation
 
         set_neurips_style()
         fig_dir = output_dir / "figures"
@@ -3136,7 +3181,6 @@ def run_multi_seed_experiment(config, n_runs: int = 3, base_seed: int = 42):
         _generate_patch_analysis(best_run, fig_dir, config)
 
         if all("timestep_ablation" in r for r in all_results):
-            from depth_fm.visualization import plot_timestep_ablation
 
             first_ablation = all_results[0]["timestep_ablation"]
             step_counts = sorted(first_ablation.keys())
@@ -3193,7 +3237,6 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
         json.dump(analysis, f, indent=2)
 
     df = best_run["test_df"]
-    import seaborn as sns
 
     set_neurips_style()
 
@@ -3221,7 +3264,6 @@ def _generate_patch_analysis(best_run: dict, fig_dir: Path, config):
 
 def _print_final_summary(all_results: list[dict], output_dir: Path):
     """Print and save the final multi-run summary."""
-    import pandas as pd
 
     metrics_of_interest = [
         "rmse", "abs_rel", "si_log", "delta_1",
