@@ -31,7 +31,6 @@ import logging
 import math
 import os
 from copy import deepcopy
-from pathlib import Path
 from typing import Callable
 
 import matplotlib.patches as mpatches
@@ -61,7 +60,6 @@ from lightning.pytorch.callbacks import (
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from depth_fm.depthfm_adapter import (
     DepthFMHiRISEAdapterCached, fill_voids_gmrf, estimate_sun_vector_irls, SeamResult, detect_seam_artifact)
@@ -73,10 +71,10 @@ from depth_fm.visualization import (
     set_neurips_style, plot_pareto_frontier,
 )
 
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import seaborn as sns
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -1549,6 +1547,447 @@ def visualize_loss_physics(
             loss_fn.lunar_lambert_logit.data = saved_logit
 
 
+import torch
+from matplotlib.patches import ConnectionPatch
+from pathlib import Path
+
+
+@torch.no_grad()
+def plot_radial_sun_sweep(dataloader, loss_fn, output_dir: Path):
+    """
+    Generates a radial visualization with the Surface Normals in the center,
+    surrounded by 8 Lunar-Lambert renders generated with different sun vectors.
+    Each render includes a mini 3D sphere indicating the lighting direction.
+    """
+    device = next(loss_fn.parameters()).device if hasattr(loss_fn, 'parameters') else torch.device("cuda")
+    loss_fn.eval()
+
+    # Extract a single sample
+    batch = next(iter(dataloader))
+    dtm = batch["dtm"][0:1].to(device)
+    mask = batch["confidence"][0:1].to(device)
+    intensity = batch["intensity"][0:1].to(device).view(1, 1, 1, 1)
+    ambient = batch["ambient"][0:1].to(device).view(1, 1, 1, 1)
+
+    dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
+
+    # Ground Truth Sun Vector
+    gt_sun = batch["sun_vector"][0].cpu().numpy()
+
+    # Calculate Central Normals
+    normals = loss_fn.surface_normals(dtm)
+    normals_disp = np.clip((normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0, 0.0, 1.0)
+    mask_np = mask[0, 0].cpu().numpy().astype(bool)
+    normals_disp[~mask_np] = np.nan
+
+    fig = plt.figure(figsize=(18, 18))
+
+    # 1. Center Axes for Normals
+    ax_center = fig.add_axes([0.375, 0.375, 0.25, 0.25])
+    ax_center.imshow(normals_disp)
+    ax_center.set_title("Surface Normals", fontsize=14, weight='bold', pad=15)
+    ax_center.axis('off')
+
+    # 2. Define the 8 circular positions
+    # Top-left in standard polar coordinates is 3*pi/4 (135 degrees)
+    angles = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+    angles = (angles + 3 * np.pi / 4) % (2 * np.pi)
+
+    radius = 0.38
+    size = 0.18
+
+    for i, angle in enumerate(angles):
+        # Top-left gets the GT vector, the rest get sweeping azimuthal shifts
+        if i == 0:
+            current_sun = gt_sun
+            title = "Correct Vector (GT)"
+            border_color = '#22cc55'  # Green
+            line_width = 4
+        else:
+            # Rotate GT sun by the swept angle relative to GT
+            rot_angle = i * (2 * np.pi / 8)
+            c, s = np.cos(rot_angle), np.sin(rot_angle)
+            rot_z = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+            current_sun = rot_z @ gt_sun
+            title = f"Azimuth Shift +{int(np.degrees(rot_angle))}°"
+            border_color = '#ff2a2a'  # Red
+            line_width = 2
+
+        sun_t = torch.tensor(current_sun, device=device, dtype=torch.float32).unsqueeze(0)
+
+        # Render the terrain under the current lighting configuration
+        render, _ = loss_fn.render_from_depth(dtm, sun_t, intensity, ambient)
+
+        # Normalize for display
+        render_disp = render[0, 0].cpu().numpy()
+        valid_pixels = render_disp[mask_np]
+        if valid_pixels.size > 0:
+            p2, p98 = np.percentile(valid_pixels, [2, 98])
+            render_disp = np.clip((render_disp - p2) / (p98 - p2 + 1e-6), 0, 1)
+        render_disp[~mask_np] = np.nan
+
+        # Calculate figure-relative coordinates
+        cx = 0.5 + radius * np.cos(angle)
+        cy = 0.5 + radius * np.sin(angle)
+
+        # Plot the Render
+        ax_img = fig.add_axes([cx - size / 2, cy - size / 2, size, size])
+        ax_img.imshow(render_disp, cmap="gray")
+        ax_img.set_title(title, fontsize=12, weight='bold' if i == 0 else 'normal')
+        ax_img.axis('off')
+
+        # Add indicative border
+        rect = plt.Rectangle((0, 0), 1, 1, transform=ax_img.transAxes,
+                             color=border_color, fill=False, linewidth=line_width)
+        ax_img.add_patch(rect)
+
+        # Draw radial connection line from the center normals to the render
+        con = ConnectionPatch(xyA=(0.5, 0.5), xyB=(cx, cy),
+                              coordsA="figure fraction", coordsB="figure fraction",
+                              axesA=ax_center, axesB=ax_img, color="black", alpha=0.15, linestyle="--")
+        fig.add_artist(con)
+
+        # 3. Mini 3D Sphere Indicator (inset at the bottom right of each render)
+        mini_size = size * 0.4
+        ax_mini = fig.add_axes([cx + size / 2 - mini_size * 0.8, cy - size / 2 - mini_size * 0.2, mini_size, mini_size],
+                               projection='3d')
+
+        # Wireframe sphere
+        u, v = np.mgrid[0:2 * np.pi:15j, 0:np.pi:10j]
+        x = np.cos(u) * np.sin(v)
+        y = np.sin(u) * np.sin(v)
+        z = np.cos(v)
+        ax_mini.plot_wireframe(x, y, z, color='gray', alpha=0.2, linewidth=0.5)
+
+        # Sun Vector Arrow
+        ax_mini.quiver(0, 0, 0, current_sun[0], current_sun[1], current_sun[2],
+                       color='orange', length=1.5, normalize=True, arrow_length_ratio=0.3, linewidth=2.5)
+
+        # Clean up 3D axis
+        ax_mini.set_xlim([-1, 1])
+        ax_mini.set_ylim([-1, 1])
+        ax_mini.set_zlim([-1, 1])
+        ax_mini.set_axis_off()
+        ax_mini.view_init(elev=30, azim=-45)
+
+    # Global Title
+    fig.suptitle('Spatial Sensitivity of Lunar-Lambert Renders to Illumination Vectors',
+                 fontsize=22, weight='bold', y=0.94)
+
+    # Save Output
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_path = output_dir / 'radial_sun_vector_sweep.pdf'
+    save_fig(fig, save_path, bbox_inches='tight', dpi=300, facecolor='white')
+    plt.close(fig)
+    print(f"Radial visualization saved to: {save_path}")
+
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm import tqdm
+
+
+@torch.no_grad()
+def plot_spherical_loss_landscape(
+        dataloader,
+        loss_fn,
+        output_dir: Path,
+        resolution: int = 50,
+):
+    """
+    Computes and plots the loss landscape over the entire solar hemisphere 
+    using a Lambert Azimuthal Equal-Area projection.
+    """
+    device = next(loss_fn.parameters()).device if hasattr(loss_fn, 'parameters') else torch.device("cuda")
+    loss_fn.eval()
+
+    # Grab a single high-quality validation patch
+    batch = next(iter(dataloader))
+    img = batch["image"][0:1].to(device).float()
+    dtm = batch["dtm"][0:1, :1].to(device).float()
+    mask = batch["confidence"][0:1].to(device).float()
+    ambient = batch["ambient"][0:1].to(device).float()
+    intensity = batch["intensity"][0:1].to(device).float()
+    gt_sun = batch["sun_vector"][0].cpu().numpy()
+
+    # Generate hemispherical grid (Elevation 0 to 90, Azimuth 0 to 360)
+    theta = np.linspace(0, np.pi / 2, resolution)  # Zenith angle (90 - elevation)
+    phi = np.linspace(0, 2 * np.pi, resolution * 2)  # Azimuth
+    T, P = np.meshgrid(theta, phi)
+
+    # Convert to Cartesian sun vectors
+    S_x = np.sin(T) * np.cos(P)
+    S_y = np.sin(T) * np.sin(P)
+    S_z = np.cos(T)
+    sun_grid = np.stack([S_x, S_y, S_z], axis=-1).reshape(-1, 3)
+
+    losses = []
+    batch_size = 256
+
+    # Evaluate loss surface in batches
+    for i in tqdm(range(0, len(sun_grid), batch_size), desc="Scanning Hemisphere"):
+        s_batch = torch.tensor(sun_grid[i:i + batch_size], device=device, dtype=torch.float32)
+        current_bs = s_batch.shape[0]
+
+        # Expand inputs to match batch size
+        img_b = img.expand(current_bs, -1, -1, -1)
+        dtm_b = dtm.expand(current_bs, -1, -1, -1)
+        mask_b = mask.expand(current_bs, -1, -1, -1)
+        amb_b = ambient.expand(current_bs)
+        int_b = intensity.expand(current_bs)
+
+        loss_vals = [loss_fn(dtm_b[j:j + 1], img_b[j:j + 1], mask_b[j:j + 1], s_batch[j:j + 1], amb_b[j:j + 1],
+                             int_b[j:j + 1]).item() for j in range(current_bs)]
+        losses.extend(loss_vals)
+
+    L = np.array(losses).reshape(T.shape)
+
+    # Lambert Azimuthal Equal-Area Projection Mathematics
+    # R = 2 * sin(theta / 2) preserves area
+    R = 2 * np.sin(T / 2)
+    X = R * np.sin(P)
+    Y = R * np.cos(P)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    contour = ax.contourf(X, Y, L, levels=50, cmap='viridis')
+    ax.contour(X, Y, L, levels=20, colors='black', linewidths=0.3, alpha=0.5)
+
+    # Plot GT Sun Vector
+    gt_zenith = np.arccos(np.clip(gt_sun[2], -1.0, 1.0))
+    gt_azimuth = np.arctan2(gt_sun[1], gt_sun[0])
+    gt_R = 2 * np.sin(gt_zenith / 2)
+    ax.scatter(gt_R * np.sin(gt_azimuth), gt_R * np.cos(gt_azimuth),
+               color='red', marker='*', s=200, edgecolors='white', label='GT Sun Vector')
+
+    ax.set_aspect('equal')
+    ax.axis('off')
+    fig.colorbar(contour, ax=ax, label=r'Photoclinometric Loss ($\mathcal{L}$)', shrink=0.7)
+    ax.legend(loc='lower right')
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_fig(fig, output_dir / 'spherical_loss_landscape.pdf', bbox_inches='tight', dpi=300)
+    plt.close(fig)
+
+
+import umap
+import seaborn as sns
+
+
+@torch.no_grad()
+def plot_umap_invariance(dataloader, loss_fn, output_dir: Path, num_samples: int = 1500):
+    """
+    Projects the high-dimensional parameter space down to 2D via UMAP to demonstrate 
+    that the loss topology is driven strictly by angular error, completely ignoring 
+    luminance and ambient scaling mismatches.
+    """
+    device = next(loss_fn.parameters()).device
+    loss_fn.eval()
+
+    batch = next(iter(dataloader))
+    dtm = batch["dtm"][0:1].to(device)
+    ortho = batch["image"][0:1].to(device)
+    mask = batch["confidence"][0:1].to(device)
+
+    gt_sun = batch["sun_vector"][0].cpu().numpy()
+    gt_I = batch["intensity"][0].item()
+    gt_A = batch["ambient"][0].item()
+
+    # Generate synthetic permutations of parameters
+    np.random.seed(42)
+    sun_perturb = np.random.randn(num_samples, 3)
+    sun_perturb /= np.linalg.norm(sun_perturb, axis=1, keepdims=True)
+
+    I_perturb = np.random.uniform(gt_I * 0.1, gt_I * 10.0, num_samples)
+    A_perturb = np.random.uniform(gt_A - 0.5, gt_A + 0.5, num_samples)
+
+    # Store errors
+    angular_errors = np.arccos(np.clip(np.sum(sun_perturb * gt_sun, axis=1), -1.0, 1.0))
+    nuisance_errors = np.sqrt((I_perturb - gt_I) ** 2 + (A_perturb - gt_A) ** 2)
+
+    # Render and compute z-scored images to build the feature manifold
+    features = []
+
+    dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
+    ortho_gray = ortho.mean(dim=1, keepdim=True) if ortho.shape[1] == 3 else ortho
+    ortho_z = loss_fn._zscore(ortho_gray, mask).cpu().numpy().flatten()
+
+    for i in tqdm(range(num_samples), desc="Generating renders for UMAP"):
+        s_t = torch.tensor(sun_perturb[i:i + 1], device=device, dtype=torch.float32)
+        I_t = torch.tensor([I_perturb[i]], device=device, dtype=torch.float32).view(1, 1, 1, 1)
+        A_t = torch.tensor([A_perturb[i]], device=device, dtype=torch.float32).view(1, 1, 1, 1)
+
+        render, _ = loss_fn.render_from_depth(dtm, s_t, I_t, A_t)
+        render_z = loss_fn._zscore(render, mask)
+
+        # The residual structurally defines the error state
+        residual = np.abs(render_z.cpu().numpy().flatten() - ortho_z)
+        features.append(residual)
+
+    features = np.stack(features)
+
+    # UMAP Projection
+    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=42)
+    embedding = reducer.fit_transform(features)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    sc1 = axes[0].scatter(embedding[:, 0], embedding[:, 1], c=np.degrees(angular_errors), cmap='inferno', s=10,
+                          alpha=0.8)
+    axes[0].set_title(r'Manifold colored by Angular Error ($\gamma$)')
+    fig.colorbar(sc1, ax=axes[0], label='Angular Error (degrees)')
+    axes[0].axis('off')
+
+    sc2 = axes[1].scatter(embedding[:, 0], embedding[:, 1], c=nuisance_errors, cmap='viridis', s=10, alpha=0.8)
+    axes[1].set_title(r'Manifold colored by Nuisance Error ($\Delta_{IA}$)')
+    fig.colorbar(sc2, ax=axes[1], label='L2 distance from GT Intensity/Ambient')
+    axes[1].axis('off')
+
+    fig.suptitle('UMAP of Z-Scored Render Residuals: Proving Shift-Invariance', fontsize=14)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_fig(fig, output_dir / 'umap_disentanglement.pdf', bbox_inches='tight', dpi=300)
+    plt.close(fig)
+
+
+from scipy.spatial.transform import Rotation as R
+
+
+@torch.no_grad()
+def plot_component_ablation(dataloader, loss_fn, output_dir: Path, steps: int = 100):
+    device = next(loss_fn.parameters()).device
+
+    batch = next(iter(dataloader))
+    dtm = batch["dtm"][0:1].to(device)
+    ortho = batch["image"][0:1].to(device)
+    mask = batch["confidence"][0:1].to(device)
+    gt_I = batch["intensity"][0:1].to(device).view(1, 1, 1, 1)
+    gt_A = batch["ambient"][0:1].to(device).view(1, 1, 1, 1)
+    gt_sun = batch["sun_vector"][0:1].to(device)
+
+    ortho_gray = ortho.mean(dim=1, keepdim=True) if ortho.shape[1] == 3 else ortho
+    dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
+
+    # Define an arbitrary orthogonal axis to rotate the sun vector around
+    v = gt_sun[0].cpu().numpy()
+    random_vec = np.array([1.0, 0.0, 0.0]) if abs(v[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    rot_axis = np.cross(v, random_vec)
+    rot_axis /= np.linalg.norm(rot_axis)
+
+    angles = np.linspace(0, 90, steps)
+
+    pearson_vals, ssim_vals, total_vals = [], [], []
+
+    for angle in angles:
+        r = R.from_rotvec(np.radians(angle) * rot_axis)
+        perturbed_sun = torch.tensor(r.apply(v), device=device, dtype=torch.float32).unsqueeze(0)
+
+        render, _ = loss_fn.render_from_depth(dtm, perturbed_sun, gt_I, gt_A)
+
+        # Call isolated loss components directly at scale 1x
+        p_loss = loss_fn._masked_pearson(render, ortho_gray, mask, B=1).item()
+        s_loss = loss_fn._masked_ssim(render, ortho_gray, mask).item()
+
+        alpha = loss_fn.ssim_weight
+        total = (1.0 - alpha) * p_loss + alpha * s_loss
+
+        pearson_vals.append(p_loss)
+        ssim_vals.append(s_loss)
+        total_vals.append(total)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(angles, pearson_vals, label=r'$(1 - \mathrm{Pearson})$', color='blue', linewidth=2, linestyle='--')
+    ax.plot(angles, ssim_vals, label=r'$(1 - \mathrm{SSIM}_z)$', color='orange', linewidth=2, linestyle='--')
+    ax.plot(angles, total_vals, label=r'Total $\mathcal{L}_{photo}$', color='black', linewidth=3)
+
+    ax.set_xlabel(r'Angular Error $\gamma$ (Degrees)')
+    ax.set_ylabel('Loss Value')
+    ax.set_title('Loss Components vs. Illumination Error')
+    ax.grid(alpha=0.3)
+    ax.legend()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_fig(fig, output_dir / 'component_ablation.pdf', bbox_inches='tight', dpi=300)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
+    device = next(loss_fn.parameters()).device
+
+    batch = next(iter(dataloader))
+    dtm = batch["dtm"][0:1].to(device)
+    ortho = batch["image"][0:1].to(device)
+    mask = batch["confidence"][0:1].to(device)
+    I = batch["intensity"][0:1].to(device).view(1, 1, 1, 1)
+    A = batch["ambient"][0:1].to(device).view(1, 1, 1, 1)
+
+    gt_sun = batch["sun_vector"][0].cpu().numpy()
+
+    # 1. Ground Truth 
+    sun_gt = torch.tensor(gt_sun, device=device, dtype=torch.float32).unsqueeze(0)
+
+    # 2. Azimuth Error (+45 deg)
+    az_rot = R.from_euler('z', 45, degrees=True)
+    sun_az = torch.tensor(az_rot.apply(gt_sun), device=device, dtype=torch.float32).unsqueeze(0)
+
+    # 3. Elevation Error (+45 deg)
+    el_axis = np.cross(np.array([0, 0, 1]), gt_sun)
+    el_axis /= np.linalg.norm(el_axis)
+    el_rot = R.from_rotvec(np.radians(45) * el_axis)
+    sun_el = torch.tensor(el_rot.apply(gt_sun), device=device, dtype=torch.float32).unsqueeze(0)
+
+    ortho_gray = ortho.mean(dim=1, keepdim=True) if ortho.shape[1] == 3 else ortho
+    dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
+    ortho_z = loss_fn._zscore(ortho_gray, mask)
+
+    conditions = [
+        ("Ground Truth", sun_gt),
+        ("Azimuth Error (+45°)", sun_az),
+        ("Elevation Error (+45°)", sun_el)
+    ]
+
+    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+    plt.subplots_adjust(wspace=0.1, hspace=0.2)
+
+    mask_np = mask[0, 0].cpu().numpy().astype(bool)
+
+    for i, (title, sun_vec) in enumerate(conditions):
+        render, _ = loss_fn.render_from_depth(dtm, sun_vec, I, A)
+        render_z = loss_fn._zscore(render, mask)
+        residual = np.abs((render_z - ortho_z)[0, 0].cpu().numpy())
+        residual = np.clip(residual / 2.0, 0.0, 1.0)
+        residual[~mask_np] = np.nan
+
+        ortho_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+        render_disp = np.clip((render[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+        dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+
+        ortho_disp[~mask_np] = np.nan
+        render_disp[~mask_np] = np.nan
+        dtm_disp[~mask_np] = np.nan
+
+        axes[i, 0].imshow(dtm_disp, cmap="terrain")
+        axes[i, 0].set_title("GT Depth")
+
+        axes[i, 1].imshow(ortho_disp, cmap="gray")
+        axes[i, 1].set_title("Real Ortho")
+
+        axes[i, 2].imshow(render_disp, cmap="gray")
+        axes[i, 2].set_title(f"Render: {title}")
+
+        im = axes[i, 3].imshow(residual, cmap="RdBu_r")
+        axes[i, 3].set_title("$|Z_r - Z_o|$ Residual")
+
+        for ax in axes[i]:
+            ax.axis('off')
+
+    fig.suptitle('Structural Residuals under Incorrect Illumination Topologies', fontsize=16)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_fig(fig, output_dir / 'qualitative_illumination_physics.pdf', bbox_inches='tight', dpi=300)
+    plt.close(fig)
+
+
 @torch.no_grad()
 def compute_topography_statistics(dataloader, split_name="Dataset"):
     """Evaluates how many patches are essentially flat planes."""
@@ -2429,6 +2868,7 @@ def main():
     parser.add_argument("--view_solar_distribution", action="store_true")
     parser.add_argument("--view_augmentations", action="store_true")
     parser.add_argument("--view_extras", action="store_true")
+    parser.add_argument("--view_lambert_ablation", action="store_true")
     parser.add_argument("--all_viz", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -2468,7 +2908,8 @@ def main():
                   args.view_solar_distribution or
                   args.view_seam_artifacts or
                   args.view_augmentations or
-                  args.view_extras)
+                  args.view_extras or
+                  args.view_lambert_ablation)
     if inspection:
         if is_global_zero:
             logger.info("Executing isolated data inspection routine...")
@@ -2509,6 +2950,12 @@ def main():
                 visualize_huber_loss(loaders["train"], output_dir=output_path, num_samples=6)
                 visualize_laplacian_loss(loaders["train"], output_dir=output_path, num_samples=6)
                 visualize_ordinal_ranking(loaders["train"], output_dir=output_path, num_samples=6)
+            if all_viz or args.view_lambert_ablation:
+                plot_spherical_loss_landscape(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
+                plot_umap_invariance(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
+                plot_component_ablation(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
+                plot_qualitative_physics_errors(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
+                plot_radial_sun_sweep(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
 
             logger.info("Data inspection complete. Exiting without training.")
         return
