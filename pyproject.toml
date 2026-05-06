@@ -29,6 +29,7 @@ experiment = [
 ]
 depthfm = [
     "accelerate>=1.13.0",
+    "cuml-cu13>=26.4.0",
     "diffusers>=0.37.1",
     "einops>=0.8.2",
     "focal-frequency-loss>=0.3.0",
@@ -39,7 +40,7 @@ depthfm = [
     "numpy>=2.4.4",
     "omegaconf>=2.3.0",
     "opencv-python>=4.13.0.92",
-    "pandas>=3.0.1",
+    "pandas>=2.0.1",
     "pillow>=12.1.1",
     "pykrige>=1.7.3",
     "rasterio>=1.5.0",
@@ -55,11 +56,15 @@ depthfm = [
     "transformers>=5.5.0",
     "umap-learn>=0.5.12",
     "wandb>=0.25.1",
+    "xgboost>=3.2.0",
 ]
 viz = [
     "cairosvg>=2.9.0",
     "graphviz>=0.21",
 ]
+
+[[tool.uv.index]]
+url = "https://pypi.nvidia.com/"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

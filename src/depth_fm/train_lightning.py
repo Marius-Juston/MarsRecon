@@ -33,8 +33,11 @@ import os
 from copy import deepcopy
 from typing import Callable
 
+import cuml
 import matplotlib.patches as mpatches
+import pandas as pd
 from matplotlib.figure import Figure
+import xgboost as xgb
 
 from depth_fm.litdata_datamodule import _build_litdata_loaders
 from depth_fm.losses import PhotoclinometricLoss, AbsoluteDepthLoss, LaplacianLoss, \
@@ -75,6 +78,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +98,8 @@ _WORKERS_PER_GPU = min(24, max(4, (_TOTAL_CORES - 16) // max(_NUM_GPUS_DEFAULT, 
 _VAL_WORKERS = min(4, _WORKERS_PER_GPU)
 
 DPI = 300
+
+sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
 
 
 # ---------------------------------------------------------------------------
@@ -1683,10 +1689,7 @@ def plot_radial_sun_sweep(dataloader, loss_fn, output_dir: Path):
 
 
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
-from tqdm import tqdm
 
 
 @torch.no_grad()
@@ -1695,92 +1698,383 @@ def plot_spherical_loss_landscape(
         loss_fn,
         output_dir: Path,
         resolution: int = 50,
+        num_batches: int = 100
 ):
     """
-    Computes and plots the loss landscape over the entire solar hemisphere 
-    using a Lambert Azimuthal Equal-Area projection.
+    Computes the expected loss landscape E[L] over the solar hemisphere
+    across multiple batches, ensuring statistical significance of the topology.
     """
     device = next(loss_fn.parameters()).device if hasattr(loss_fn, 'parameters') else torch.device("cuda")
     loss_fn.eval()
 
-    # Grab a single high-quality validation patch
-    batch = next(iter(dataloader))
-    img = batch["image"][0:1].to(device).float()
-    dtm = batch["dtm"][0:1, :1].to(device).float()
-    mask = batch["confidence"][0:1].to(device).float()
-    ambient = batch["ambient"][0:1].to(device).float()
-    intensity = batch["intensity"][0:1].to(device).float()
-    gt_sun = batch["sun_vector"][0].cpu().numpy()
-
     # Generate hemispherical grid (Elevation 0 to 90, Azimuth 0 to 360)
-    theta = np.linspace(0, np.pi / 2, resolution)  # Zenith angle (90 - elevation)
-    phi = np.linspace(0, 2 * np.pi, resolution * 2)  # Azimuth
+    theta = np.linspace(0, np.pi / 2, resolution)
+    phi = np.linspace(0, 2 * np.pi, resolution * 2)
     T, P = np.meshgrid(theta, phi)
 
-    # Convert to Cartesian sun vectors
     S_x = np.sin(T) * np.cos(P)
     S_y = np.sin(T) * np.sin(P)
     S_z = np.cos(T)
     sun_grid = np.stack([S_x, S_y, S_z], axis=-1).reshape(-1, 3)
 
-    losses = []
-    batch_size = 256
+    # Aggregate losses over multiple batches
+    aggregate_losses = np.zeros((num_batches, len(sun_grid)))
 
-    # Evaluate loss surface in batches
-    for i in tqdm(range(0, len(sun_grid), batch_size), desc="Scanning Hemisphere"):
-        s_batch = torch.tensor(sun_grid[i:i + batch_size], device=device, dtype=torch.float32)
-        current_bs = s_batch.shape[0]
+    for b_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Evaluating Batches")):
+        if b_idx >= num_batches: break
 
-        # Expand inputs to match batch size
-        img_b = img.expand(current_bs, -1, -1, -1)
-        dtm_b = dtm.expand(current_bs, -1, -1, -1)
-        mask_b = mask.expand(current_bs, -1, -1, -1)
-        amb_b = ambient.expand(current_bs)
-        int_b = intensity.expand(current_bs)
+        img = batch["image"].to(device).float()
+        dtm = batch["dtm"][:, :1].to(device).float()
+        mask = batch["confidence"].to(device).float()
+        ambient = batch["ambient"].to(device).float()
+        intensity = batch["intensity"].to(device).float()
 
-        loss_vals = [loss_fn(dtm_b[j:j + 1], img_b[j:j + 1], mask_b[j:j + 1], s_batch[j:j + 1], amb_b[j:j + 1],
-                             int_b[j:j + 1]).item() for j in range(current_bs)]
-        losses.extend(loss_vals)
+        # Taking mean over batch dimensions for a generalized landscape
+        b_size_internal = img.shape[0]
+        eval_batch_size = 512
 
-    L = np.array(losses).reshape(T.shape)
+        batch_landscape = []
+        for i in tqdm(range(0, len(sun_grid), eval_batch_size), desc=f"Scanning Hemisphere {b_idx + 1}/{num_batches}",
+                      leave=False):
+            s_batch = torch.tensor(sun_grid[i:i + eval_batch_size], device=device, dtype=torch.float32)
+            current_bs = s_batch.shape[0]
 
-    # Lambert Azimuthal Equal-Area Projection Mathematics
-    # R = 2 * sin(theta / 2) preserves area
-    R = 2 * np.sin(T / 2)
-    X = R * np.sin(P)
-    Y = R * np.cos(P)
+            img_exp = img[0:1].expand(current_bs, -1, -1, -1)
+            dtm_exp = dtm[0:1].expand(current_bs, -1, -1, -1)
+            mask_exp = mask[0:1].expand(current_bs, -1, -1, -1)
+            amb_exp = ambient[0:1].expand(current_bs)
+            int_exp = intensity[0:1].expand(current_bs)
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-    contour = ax.contourf(X, Y, L, levels=50, cmap='viridis')
-    ax.contour(X, Y, L, levels=20, colors='black', linewidths=0.3, alpha=0.5)
+            # Evaluate the entire chunk of sun positions natively on the GPU
+            losses = loss_fn(
+                dtm_exp, img_exp, mask_exp, s_batch, amb_exp, int_exp, reduction='none'
+            )
 
-    # Plot GT Sun Vector
-    gt_zenith = np.arccos(np.clip(gt_sun[2], -1.0, 1.0))
-    gt_azimuth = np.arctan2(gt_sun[1], gt_sun[0])
-    gt_R = 2 * np.sin(gt_zenith / 2)
-    ax.scatter(gt_R * np.sin(gt_azimuth), gt_R * np.cos(gt_azimuth),
-               color='red', marker='*', s=200, edgecolors='white', label='GT Sun Vector')
+            # Transfer the tensor list back to CPU in one go
+            batch_landscape.extend(losses.cpu().tolist())
 
-    ax.set_aspect('equal')
-    ax.axis('off')
-    fig.colorbar(contour, ax=ax, label=r'Photoclinometric Loss ($\mathcal{L}$)', shrink=0.7)
-    ax.legend(loc='lower right')
+        aggregate_losses[b_idx, :] = batch_landscape
+
+    # Compute statistically significant mean and Standard Error of the Mean (SEM)
+    L_mean = np.mean(aggregate_losses, axis=0).reshape(T.shape)
+
+    # Calculate SEM instead of raw standard deviation
+    L_sem = (np.std(aggregate_losses, axis=0) / np.sqrt(num_batches)).reshape(T.shape)
+
+    R_proj = 2 * np.sin(T / 2)
+    X = R_proj * np.sin(P)
+    Y = R_proj * np.cos(P)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Plot Mean Expected Loss
+    contour_mean = axes[0].contourf(X, Y, L_mean, levels=50, cmap='viridis')
+    axes[0].contour(X, Y, L_mean, levels=20, colors='black', linewidths=0.3, alpha=0.5)
+    axes[0].set_title(r'Expected Loss Surface $\mathbb{E}_{x \sim \mathcal{D}}[\mathcal{L}]$')
+    fig.colorbar(contour_mean, ax=axes[0], shrink=0.7)
+
+    # Plot Variance/Uncertainty
+    contour_sem = axes[1].contourf(X, Y, L_sem, levels=50, cmap='magma')
+    axes[1].set_title(r'Uncertainty of the Mean ($SEM_{\mathcal{L}}$)')
+    fig.colorbar(contour_sem, ax=axes[1], shrink=0.7)
+
+    for ax in axes:
+        ax.set_aspect('equal')
+
+        # Axis labels indicating the projection plane
+        ax.set_xlabel(r"Projected $X$ (West $\leftrightarrow$ East)")
+        ax.set_ylabel(r"Projected $Y$ (South $\leftrightarrow$ North)")
+
+        # Add faint crosshairs to denote the Zenith (0,0)
+        ax.axhline(0, color='white', linestyle='--', linewidth=0.8, alpha=0.6)
+        ax.axvline(0, color='white', linestyle='--', linewidth=0.8, alpha=0.6)
+
+        # Optional: Clean up the ticks to show just the center and extents
+        limit = np.sqrt(2)  # Max radius for this projection
+        ticks = [-limit, 0, limit]
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.set_xticklabels(['-Horizon', 'Zenith', '+Horizon'])
+        ax.set_yticklabels(['-Horizon', 'Zenith', '+Horizon'])
 
     output_dir.mkdir(parents=True, exist_ok=True)
     save_fig(fig, output_dir / 'spherical_loss_landscape.pdf', bbox_inches='tight', dpi=300)
     plt.close(fig)
 
 
+import torch
 import umap
+import numpy as np
 import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm import tqdm
+from cuml.ensemble import RandomForestRegressor
+from sklearn.model_selection import cross_val_score
+
+
+def compute_distance_correlation_gpu(X: torch.Tensor, Y: torch.Tensor) -> float:
+    """
+    Computes the Distance Correlation (dCor) between two tensors on the GPU.
+    A 50k x 50k matrix requires ~10GB VRAM, which fits easily on an A6000.
+    """
+    n = X.size(0)
+
+    # Process X
+    a = torch.cdist(X, X, p=2.0)
+    a -= a.mean(dim=1, keepdim=True)
+    a -= a.mean(dim=0, keepdim=True)
+    dcov2_xx = (a * a).mean()
+
+    # Process Y
+    b = torch.cdist(Y, Y, p=2.0)
+    b -= b.mean(dim=1, keepdim=True)
+    b -= b.mean(dim=0, keepdim=True)
+    dcov2_yy = (b * b).mean()
+
+    # 3. Compute squared distance covariances
+    dcov2_xy = (a * b).mean()
+
+    del a, b
+    torch.cuda.empty_cache()
+
+    # 4. Compute distance correlation
+    # Add a small epsilon to prevent division by zero in perfectly uniform edge cases
+    dcor = torch.sqrt(dcov2_xy) / torch.sqrt(torch.sqrt(dcov2_xx * dcov2_yy) + 1e-8)
+
+    return dcor.item()
+
+
+def extract_content_agnostic_features(residual_2d, num_bins=30):
+    """
+    Collapses a 2D spatial residual into a translation-invariant statistical feature vector
+    using distribution quantiles of the error and its spatial gradients.
+    """
+    q_points = np.linspace(0, 100, num_bins)
+
+    # 1. Error Magnitude Distribution (Captures the overall shape of the error)
+    res_quantiles = np.percentile(residual_2d, q_points)
+
+    # 2. Error Gradient Distribution (Captures edge-error density regardless of spatial location)
+    gy, gx = np.gradient(residual_2d)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+    grad_quantiles = np.percentile(grad_mag, q_points)
+
+    # Concatenate into a 1D content-agnostic feature vector
+    return np.concatenate([res_quantiles, grad_quantiles])
+
+
+@torch.no_grad()
+def plot_global_umap_invariance(dataloader, loss_fn, output_dir: Path, num_terrains: int = 100,
+                                samples_per_terrain: int = 500):
+    """
+    Projects high-dimensional space via UMAP across MULTIPLE terrains by extracting
+    content-agnostic spatial features, computing formal correlation statistics.
+    """
+    device = next(loss_fn.parameters()).device
+    loss_fn.eval()
+
+    all_features = []
+    all_angular_errors = []
+
+    # Track raw nuisance parameters separately for unbiased regression
+    all_I_errors = []
+    all_A_errors = []
+    all_combined_nuisance = []
+
+    data_iter = iter(dataloader)
+
+    # Process multiple base topologies to prove global invariance
+    for terrain_idx in tqdm(range(num_terrains), desc="Terrains"):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            break
+
+        dtm = batch["dtm"][0:1].to(device)
+        ortho = batch["image"][0:1].to(device)
+        mask = batch["confidence"][0:1].to(device)
+
+        gt_sun = batch["sun_vector"][0].cpu().numpy()
+        gt_I = batch["intensity"][0].item()
+        gt_A = batch["ambient"][0].item()
+
+        np.random.seed(42 + terrain_idx)
+        sun_perturb = np.random.randn(samples_per_terrain, 3)
+        sun_perturb /= np.linalg.norm(sun_perturb, axis=1, keepdims=True)
+
+        I_perturb = np.random.uniform(gt_I * 0.1, gt_I * 10.0, samples_per_terrain)
+        A_perturb = np.random.uniform(gt_A - 0.5, gt_A + 0.5, samples_per_terrain)
+
+        # Compute ground truth errors
+        angular_errors = np.arccos(np.clip(np.sum(sun_perturb * gt_sun, axis=1), -1.0, 1.0))
+
+        delta_I = np.abs(I_perturb - gt_I)
+        delta_A = np.abs(A_perturb - gt_A)
+
+        # Standardize before combining for the visual plot
+        z_I = (delta_I - np.mean(delta_I)) / (np.std(delta_I) + 1e-8)
+        z_A = (delta_A - np.mean(delta_A)) / (np.std(delta_A) + 1e-8)
+        combined_nuisance = np.sqrt(z_I ** 2 + z_A ** 2)
+
+        all_angular_errors.extend(angular_errors)
+        all_I_errors.extend(delta_I)
+        all_A_errors.extend(delta_A)
+        all_combined_nuisance.extend(combined_nuisance)
+
+        dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
+        ortho_gray = ortho.mean(dim=1, keepdim=True) if ortho.shape[1] == 3 else ortho
+        ortho_z = loss_fn._zscore(ortho_gray, mask).cpu().numpy().squeeze()
+
+        # Generate manifold points for this specific terrain
+        for i in tqdm(range(samples_per_terrain), desc=f"Terrain {terrain_idx + 1}/{num_terrains}", leave=False):
+            s_t = torch.tensor(sun_perturb[i:i + 1], device=device, dtype=torch.float32)
+            I_t = torch.tensor([I_perturb[i]], device=device, dtype=torch.float32).view(1, 1, 1, 1)
+            A_t = torch.tensor([A_perturb[i]], device=device, dtype=torch.float32).view(1, 1, 1, 1)
+
+            render, _ = loss_fn.render_from_depth(dtm, s_t, I_t, A_t)
+            render_z = loss_fn._zscore(render, mask)
+
+            residual_2d = np.abs(render_z.cpu().numpy().squeeze() - ortho_z)
+            agnostic_feats = extract_content_agnostic_features(residual_2d)
+            all_features.append(agnostic_feats)
+
+    # --- Convert to Tensors and Arrays ---
+    features = np.stack(all_features)
+    angular_errors_arr = np.array(all_angular_errors)
+    I_errors_arr = np.array(all_I_errors)
+    A_errors_arr = np.array(all_A_errors)
+    combined_nuisance_arr = np.array(all_combined_nuisance)
+
+    # --- 1. MATHEMATICAL PROOF: GPU Distance Correlation ---
+    print("\nComputing GPU-Accelerated Distance Correlations (dCor)...")
+    feats_tensor = torch.tensor(features, dtype=torch.float32, device=device)
+
+    # We test features vs Angular Error (Expected: High dCor)
+    ang_tensor = torch.tensor(angular_errors_arr, dtype=torch.float32, device=device).unsqueeze(1)
+    dcor_ang = compute_distance_correlation_gpu(feats_tensor, ang_tensor)
+
+    # We test features vs Nuisance (Expected: Near-Zero dCor)
+    # Stacking Intensity and Ambient as a 2D target vector for simultaneous testing
+    nuisance_tensor = torch.tensor(np.stack([I_errors_arr, A_errors_arr], axis=1),
+                                   dtype=torch.float32, device=device)
+    dcor_nuisance = compute_distance_correlation_gpu(feats_tensor, nuisance_tensor)
+
+    # --- 2. PRACTICAL ML PROOF: Non-Linear Probing (R^2) ---
+    print("Evaluating Disentanglement via Predictive Power (R^2)...")
+
+    def compute_r2_gpu(X_tensor, y_tensor, cv=5):
+        """
+        Memory-optimized cross-validation loop natively computing R2 on the GPU.
+        Uses QuantileDMatrix and inplace_predict to prevent VRAM spikes.
+        """
+        # Ensure memory is contiguous for C-backend compatibility
+        X = X_tensor.contiguous()
+        y = y_tensor.contiguous().squeeze()  # Ensure y is 1D
+
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+        r2_scores = []
+        indices = np.arange(X.size(0))
+
+        params = {
+            'objective': 'reg:squarederror',
+            'tree_method': 'hist',
+            'device': 'cuda',
+            'max_depth': 8,
+            'random_state': 42,
+            'verbosity': 0
+        }
+
+        for train_idx, test_idx in kf.split(indices):
+            # 1. Slice directly on the GPU (No CPU transfers)
+            X_train = X[torch.tensor(train_idx, device=X.device)]
+            X_test = X[torch.tensor(test_idx, device=X.device)]
+            y_train = y[torch.tensor(train_idx, device=y.device)]
+            y_test = y[torch.tensor(test_idx, device=y.device)]
+
+            # 2. Memory Efficient DMatrix: Compress directly from GPU memory
+            dtrain = xgb.QuantileDMatrix(X_train, label=y_train)
+
+            # 3. Train
+            bst = xgb.train(params, dtrain, num_boost_round=100)
+
+            # 4. Inplace predict keeps data on the GPU natively
+            preds = bst.inplace_predict(X_test)
+
+            if not isinstance(preds, torch.Tensor):
+                preds = torch.as_tensor(preds, device=X.device)
+
+            # 5. Compute R^2 natively on GPU (avoids sklearn CPU transfers)
+            ss_res = torch.sum((y_test - preds) ** 2)
+            ss_tot = torch.sum((y_test - torch.mean(y_test)) ** 2)
+            r2 = 1.0 - (ss_res / ss_tot)
+            r2_scores.append(r2.item())
+
+            # 6. Aggressive explicit memory cleanup
+            del dtrain, bst, X_train, X_test, y_train, y_test, preds
+            torch.cuda.empty_cache()
+
+        return np.mean(r2_scores)
+
+    # Initialize Nuisance Target Tensors (Angular is already a tensor from earlier)
+    I_tensor = torch.tensor(I_errors_arr, dtype=torch.float32, device=device)
+    A_tensor = torch.tensor(A_errors_arr, dtype=torch.float32, device=device)
+
+    # Compute memory-safe CV
+    r2_ang = compute_r2_gpu(feats_tensor, ang_tensor)
+    r2_I = compute_r2_gpu(feats_tensor, I_tensor)
+    r2_A = compute_r2_gpu(feats_tensor, A_tensor)
+
+    # --- UMAP Visual Projection ---
+    print("Fitting Global UMAP...")
+    reducer = cuml.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=42, verbose=True)
+    embedding = reducer.fit_transform(features)
+
+    # --- PLOTTING ---
+    fig = plt.figure(figsize=(20, 9))
+
+    # Plot 1: Angular Error (The Intended Signal)
+    ax1 = fig.add_subplot(121)
+    sns.kdeplot(x=embedding[:, 0], y=embedding[:, 1], fill=True, cmap="Reds", alpha=0.3, ax=ax1)
+    sc1 = ax1.scatter(embedding[:, 0], embedding[:, 1], c=np.degrees(angular_errors_arr),
+                      cmap='inferno', s=10, alpha=0.9, edgecolor='none')
+
+    ang_title = (r"Global Angular Error ($\gamma$) Topology" + "\n" +
+                 f"Predictive Power ($R^2$): {r2_ang:.3f} | Distance Corr: {dcor_ang:.3f}")
+    ax1.set_title(ang_title, fontsize=14, pad=15)
+    fig.colorbar(sc1, ax=ax1, label='Degrees')
+
+    # Plot 2: Nuisance Parameter (The Entanglement Check)
+    ax2 = fig.add_subplot(122)
+    sns.kdeplot(x=embedding[:, 0], y=embedding[:, 1], fill=True, cmap="Blues", alpha=0.3, ax=ax2)
+    sc2 = ax2.scatter(embedding[:, 0], embedding[:, 1], c=combined_nuisance_arr,
+                      cmap='viridis', s=10, alpha=0.9, edgecolor='none')
+
+    nuis_title = (r"Global Nuisance Parameter Invariance" + "\n" +
+                  f"Predictive Power ($R^2$): I={r2_I:.3f}, A={r2_A:.3f} | Distance Corr: {dcor_nuisance:.3f}")
+    ax2.set_title(nuis_title, fontsize=14, pad=15)
+    fig.colorbar(sc2, ax=ax2, label='Standardized Combined Error (Z-Score)')
+
+    plt.suptitle(f'Global Manifold Projection ({num_terrains} Terrains, {num_terrains * samples_per_terrain} Samples)',
+                 fontsize=18, y=1.05)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_fig(fig, output_dir / 'umap_global_disentanglement.pdf', bbox_inches='tight', dpi=300)
+    plt.close(fig)
+
+    print(f"\n--- Disentanglement Report ---")
+    print(f"Angular Error - R^2: {r2_ang:.3f}, dCor: {dcor_ang:.3f} (Ideal: High)")
+    print(f"Nuisance (I)  - R^2: {r2_I:.3f} (Ideal: ~0.0)")
+    print(f"Nuisance (A)  - R^2: {r2_A:.3f} (Ideal: ~0.0)")
+    print(f"Combined Nuisance dCor: {dcor_nuisance:.3f} (Ideal: ~0.0)")
 
 
 @torch.no_grad()
 def plot_umap_invariance(dataloader, loss_fn, output_dir: Path, num_samples: int = 1500):
     """
-    Projects the high-dimensional parameter space down to 2D via UMAP to demonstrate 
-    that the loss topology is driven strictly by angular error, completely ignoring 
-    luminance and ambient scaling mismatches.
+    Projects high-dimensional space via UMAP and computes formal correlation
+    statistics (dCor and R^2) to prove shift-invariance on a single terrain.
     """
     device = next(loss_fn.parameters()).device
     loss_fn.eval()
@@ -1794,7 +2088,6 @@ def plot_umap_invariance(dataloader, loss_fn, output_dir: Path, num_samples: int
     gt_I = batch["intensity"][0].item()
     gt_A = batch["ambient"][0].item()
 
-    # Generate synthetic permutations of parameters
     np.random.seed(42)
     sun_perturb = np.random.randn(num_samples, 3)
     sun_perturb /= np.linalg.norm(sun_perturb, axis=1, keepdims=True)
@@ -1802,18 +2095,24 @@ def plot_umap_invariance(dataloader, loss_fn, output_dir: Path, num_samples: int
     I_perturb = np.random.uniform(gt_I * 0.1, gt_I * 10.0, num_samples)
     A_perturb = np.random.uniform(gt_A - 0.5, gt_A + 0.5, num_samples)
 
-    # Store errors
+    # Compute ground truth errors
     angular_errors = np.arccos(np.clip(np.sum(sun_perturb * gt_sun, axis=1), -1.0, 1.0))
-    nuisance_errors = np.sqrt((I_perturb - gt_I) ** 2 + (A_perturb - gt_A) ** 2)
 
-    # Render and compute z-scored images to build the feature manifold
+    # Separate nuisance analysis
+    delta_I = np.abs(I_perturb - gt_I)
+    delta_A = np.abs(A_perturb - gt_A)
+
+    # Standardize for combined visualization
+    z_I = (delta_I - np.mean(delta_I)) / (np.std(delta_I) + 1e-8)
+    z_A = (delta_A - np.mean(delta_A)) / (np.std(delta_A) + 1e-8)
+    combined_nuisance = np.sqrt(z_I ** 2 + z_A ** 2)
+
     features = []
-
     dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
     ortho_gray = ortho.mean(dim=1, keepdim=True) if ortho.shape[1] == 3 else ortho
-    ortho_z = loss_fn._zscore(ortho_gray, mask).cpu().numpy().flatten()
+    ortho_z = loss_fn._zscore(ortho_gray, mask).cpu().numpy().squeeze()
 
-    for i in tqdm(range(num_samples), desc="Generating renders for UMAP"):
+    for i in tqdm(range(num_samples), desc="Generating UMAP Manifold"):
         s_t = torch.tensor(sun_perturb[i:i + 1], device=device, dtype=torch.float32)
         I_t = torch.tensor([I_perturb[i]], device=device, dtype=torch.float32).view(1, 1, 1, 1)
         A_t = torch.tensor([A_perturb[i]], device=device, dtype=torch.float32).view(1, 1, 1, 1)
@@ -1821,90 +2120,197 @@ def plot_umap_invariance(dataloader, loss_fn, output_dir: Path, num_samples: int
         render, _ = loss_fn.render_from_depth(dtm, s_t, I_t, A_t)
         render_z = loss_fn._zscore(render, mask)
 
-        # The residual structurally defines the error state
-        residual = np.abs(render_z.cpu().numpy().flatten() - ortho_z)
-        features.append(residual)
+        # Note: Depending on image size, this flattened array can be very large.
+        # The 1TB RAM easily handles the Random Forest, and the A6000 handles the dCor pairwise distances.
+        residual = np.abs(render_z.cpu().numpy().squeeze() - ortho_z)
+        agnostic_feats = extract_content_agnostic_features(residual)
+        features.append(agnostic_feats)
 
     features = np.stack(features)
 
-    # UMAP Projection
-    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=42)
+    # --- 1. MATHEMATICAL PROOF: GPU Distance Correlation ---
+    print("\nComputing GPU-Accelerated Distance Correlations (dCor)...")
+    feats_tensor = torch.tensor(features, dtype=torch.float32, device=device)
+
+    ang_tensor = torch.tensor(angular_errors, dtype=torch.float32, device=device).unsqueeze(1)
+    dcor_ang = compute_distance_correlation_gpu(feats_tensor, ang_tensor)
+
+    nuisance_tensor = torch.tensor(np.stack([delta_I, delta_A], axis=1),
+                                   dtype=torch.float32, device=device)
+    dcor_nuisance = compute_distance_correlation_gpu(feats_tensor, nuisance_tensor)
+
+    # --- 2. PRACTICAL ML PROOF: Non-Linear Probing (R^2) ---
+    print("Evaluating Disentanglement via Predictive Power (R^2)...")
+
+    def compute_r2_gpu(X_tensor, y_tensor, cv=5):
+        """
+        Memory-optimized cross-validation loop natively computing R2 on the GPU.
+        Uses QuantileDMatrix and inplace_predict to prevent VRAM spikes.
+        """
+        # Ensure memory is contiguous for C-backend compatibility
+        X = X_tensor.contiguous()
+        y = y_tensor.contiguous().squeeze()  # Ensure y is 1D
+
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+        r2_scores = []
+        indices = np.arange(X.size(0))
+
+        params = {
+            'objective': 'reg:squarederror',
+            # 'tree_method': 'hist',
+            'device': 'cuda',
+            'max_depth': 8,
+            'random_state': 42,
+            'verbosity': 0
+        }
+
+        for train_idx, test_idx in kf.split(indices):
+            # 1. Slice directly on the GPU (No CPU transfers)
+            X_train = X[torch.tensor(train_idx, device=X.device)]
+            X_test = X[torch.tensor(test_idx, device=X.device)]
+            y_train = y[torch.tensor(train_idx, device=y.device)]
+            y_test = y[torch.tensor(test_idx, device=y.device)]
+
+            # 2. Memory Efficient DMatrix: Compress directly from GPU memory
+            dtrain = xgb.QuantileDMatrix(X_train, label=y_train)
+
+            # 3. Train
+            bst = xgb.train(params, dtrain, num_boost_round=100)
+
+            # 4. Inplace predict keeps data on the GPU natively
+            preds = bst.inplace_predict(X_test)
+
+            if not isinstance(preds, torch.Tensor):
+                preds = torch.as_tensor(preds, device=X.device)
+
+            # 5. Compute R^2 natively on GPU (avoids sklearn CPU transfers)
+            ss_res = torch.sum((y_test - preds) ** 2)
+            ss_tot = torch.sum((y_test - torch.mean(y_test)) ** 2)
+            r2 = 1.0 - (ss_res / ss_tot)
+            r2_scores.append(r2.item())
+
+            # 6. Aggressive explicit memory cleanup
+            del dtrain, bst, X_train, X_test, y_train, y_test, preds
+            torch.cuda.empty_cache()
+
+        return np.mean(r2_scores)
+
+    # Initialize Nuisance Target Tensors (Angular is already a tensor from earlier)
+    I_tensor = torch.tensor(delta_I, dtype=torch.float32, device=device)
+    A_tensor = torch.tensor(delta_A, dtype=torch.float32, device=device)
+
+    # Compute memory-safe CV
+    r2_ang = compute_r2_gpu(feats_tensor, ang_tensor)
+    r2_I = compute_r2_gpu(feats_tensor, I_tensor)
+    r2_A = compute_r2_gpu(feats_tensor, A_tensor)
+
+    # --- UMAP Visual Projection ---
+    print("Fitting Local UMAP...")
+    reducer = cuml.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=42, verbose=True)
     embedding = reducer.fit_transform(features)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    # --- PLOTTING ---
+    fig = plt.figure(figsize=(20, 9))
 
-    sc1 = axes[0].scatter(embedding[:, 0], embedding[:, 1], c=np.degrees(angular_errors), cmap='inferno', s=10,
-                          alpha=0.8)
-    axes[0].set_title(r'Manifold colored by Angular Error ($\gamma$)')
-    fig.colorbar(sc1, ax=axes[0], label='Angular Error (degrees)')
-    axes[0].axis('off')
+    # Angular Error Plot
+    ax1 = fig.add_subplot(121)
+    sns.kdeplot(x=embedding[:, 0], y=embedding[:, 1], fill=True, cmap="Reds", alpha=0.3, ax=ax1)
+    sc1 = ax1.scatter(embedding[:, 0], embedding[:, 1], c=np.degrees(angular_errors),
+                      cmap='inferno', s=15, alpha=0.9, edgecolor='none')
 
-    sc2 = axes[1].scatter(embedding[:, 0], embedding[:, 1], c=nuisance_errors, cmap='viridis', s=10, alpha=0.8)
-    axes[1].set_title(r'Manifold colored by Nuisance Error ($\Delta_{IA}$)')
-    fig.colorbar(sc2, ax=axes[1], label='L2 distance from GT Intensity/Ambient')
-    axes[1].axis('off')
+    ang_title = (r"Angular Error ($\gamma$) Topology" + "\n" +
+                 f"Predictive Power ($R^2$): {r2_ang:.3f} | Distance Corr: {dcor_ang:.3f}")
+    ax1.set_title(ang_title, fontsize=14, pad=15)
+    fig.colorbar(sc1, ax=ax1, label='Degrees')
 
-    fig.suptitle('UMAP of Z-Scored Render Residuals: Proving Shift-Invariance', fontsize=14)
+    # Nuisance Error Plot
+    ax2 = fig.add_subplot(122)
+    sns.kdeplot(x=embedding[:, 0], y=embedding[:, 1], fill=True, cmap="Blues", alpha=0.3, ax=ax2)
+    sc2 = ax2.scatter(embedding[:, 0], embedding[:, 1], c=combined_nuisance,
+                      cmap='viridis', s=15, alpha=0.9, edgecolor='none')
+
+    nuis_title = (r"Nuisance Parameter Invariance" + "\n" +
+                  f"Predictive Power ($R^2$): I={r2_I:.3f}, A={r2_A:.3f} | Distance Corr: {dcor_nuisance:.3f}")
+    ax2.set_title(nuis_title, fontsize=14, pad=15)
+    fig.colorbar(sc2, ax=ax2, label='Standardized Combined Error (Z-Score)')
+
+    plt.suptitle(f'Single Terrain Manifold Projection and Statistical Disentanglement ({num_samples} Samples)',
+                 fontsize=18, y=1.05)
+
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Replaced save_fig with standard plt/fig syntax
     save_fig(fig, output_dir / 'umap_disentanglement.pdf', bbox_inches='tight', dpi=300)
     plt.close(fig)
+
+    print(f"\n--- Single Terrain Disentanglement Report ---")
+    print(f"Angular Error - R^2: {r2_ang:.3f}, dCor: {dcor_ang:.3f}")
+    print(f"Nuisance (I)  - R^2: {r2_I:.3f}")
+    print(f"Nuisance (A)  - R^2: {r2_A:.3f}")
+    print(f"Combined Nuisance dCor: {dcor_nuisance:.3f}")
 
 
 from scipy.spatial.transform import Rotation as R
 
 
 @torch.no_grad()
-def plot_component_ablation(dataloader, loss_fn, output_dir: Path, steps: int = 100):
+def plot_component_ablation(dataloader, loss_fn, output_dir: Path, steps: int = 50, num_batches: int = 100):
+    """
+    Computes loss ablation dynamically over a statistically significant sample size,
+    generating 95% Confidence Intervals via empirical bootstrapping.
+    """
     device = next(loss_fn.parameters()).device
 
-    batch = next(iter(dataloader))
-    dtm = batch["dtm"][0:1].to(device)
-    ortho = batch["image"][0:1].to(device)
-    mask = batch["confidence"][0:1].to(device)
-    gt_I = batch["intensity"][0:1].to(device).view(1, 1, 1, 1)
-    gt_A = batch["ambient"][0:1].to(device).view(1, 1, 1, 1)
-    gt_sun = batch["sun_vector"][0:1].to(device)
-
-    ortho_gray = ortho.mean(dim=1, keepdim=True) if ortho.shape[1] == 3 else ortho
-    dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
-
-    # Define an arbitrary orthogonal axis to rotate the sun vector around
-    v = gt_sun[0].cpu().numpy()
-    random_vec = np.array([1.0, 0.0, 0.0]) if abs(v[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    rot_axis = np.cross(v, random_vec)
-    rot_axis /= np.linalg.norm(rot_axis)
-
+    results = []
     angles = np.linspace(0, 90, steps)
 
-    pearson_vals, ssim_vals, total_vals = [], [], []
+    for b_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Ablating Components")):
+        if b_idx >= num_batches: break
 
-    for angle in angles:
-        r = R.from_rotvec(np.radians(angle) * rot_axis)
-        perturbed_sun = torch.tensor(r.apply(v), device=device, dtype=torch.float32).unsqueeze(0)
+        dtm = batch["dtm"].to(device)
+        ortho = batch["image"].to(device)
+        mask = batch["confidence"].to(device)
+        gt_I = batch["intensity"].to(device).view(-1, 1, 1, 1)
+        gt_A = batch["ambient"].to(device).view(-1, 1, 1, 1)
+        gt_sun = batch["sun_vector"].to(device)
 
-        render, _ = loss_fn.render_from_depth(dtm, perturbed_sun, gt_I, gt_A)
+        ortho_gray = ortho.mean(dim=1, keepdim=True) if ortho.shape[1] == 3 else ortho
+        dtm = dtm.mean(dim=1, keepdim=True) if dtm.shape[1] == 3 else dtm
 
-        # Call isolated loss components directly at scale 1x
-        p_loss = loss_fn._masked_pearson(render, ortho_gray, mask, B=1).item()
-        s_loss = loss_fn._masked_ssim(render, ortho_gray, mask).item()
+        for idx in range(dtm.shape[0]):
+            v = gt_sun[idx].cpu().numpy()
+            random_vec = np.array([1.0, 0.0, 0.0]) if abs(v[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            rot_axis = np.cross(v, random_vec)
+            rot_axis /= (np.linalg.norm(rot_axis) + 1e-8)
 
-        alpha = loss_fn.ssim_weight
-        total = (1.0 - alpha) * p_loss + alpha * s_loss
+            for angle in angles:
+                r = R.from_rotvec(np.radians(angle) * rot_axis)
+                perturbed_sun = torch.tensor(r.apply(v), device=device, dtype=torch.float32).unsqueeze(0)
 
-        pearson_vals.append(p_loss)
-        ssim_vals.append(s_loss)
-        total_vals.append(total)
+                render, _ = loss_fn.render_from_depth(dtm[idx:idx + 1], perturbed_sun, gt_I[idx:idx + 1],
+                                                      gt_A[idx:idx + 1])
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(angles, pearson_vals, label=r'$(1 - \mathrm{Pearson})$', color='blue', linewidth=2, linestyle='--')
-    ax.plot(angles, ssim_vals, label=r'$(1 - \mathrm{SSIM}_z)$', color='orange', linewidth=2, linestyle='--')
-    ax.plot(angles, total_vals, label=r'Total $\mathcal{L}_{photo}$', color='black', linewidth=3)
+                p_loss = loss_fn._masked_pearson(render, ortho_gray[idx:idx + 1], mask[idx:idx + 1], B=1).item()
+                s_loss = loss_fn._masked_ssim(render, ortho_gray[idx:idx + 1], mask[idx:idx + 1]).item()
+                total = (1.0 - loss_fn.ssim_weight) * p_loss + loss_fn.ssim_weight * s_loss
 
-    ax.set_xlabel(r'Angular Error $\gamma$ (Degrees)')
-    ax.set_ylabel('Loss Value')
-    ax.set_title('Loss Components vs. Illumination Error')
-    ax.grid(alpha=0.3)
-    ax.legend()
+                results.append({'Angle': angle, 'Loss Value': p_loss, 'Metric': 'Pearson (1 - r)'})
+                results.append({'Angle': angle, 'Loss Value': s_loss, 'Metric': 'SSIM (1 - s)'})
+                results.append({'Angle': angle, 'Loss Value': total, 'Metric': 'Total Loss'})
+
+    df = pd.DataFrame(results)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # seaborn natively bootstraps 95% CIs and plots standard error bands
+    sns.lineplot(data=df, x='Angle', y='Loss Value', hue='Metric',
+                 errorbar=('ci', 95), linewidth=2.5, ax=ax,
+                 palette=['#1f77b4', '#ff7f0e', '#2ca02c'])
+
+    ax.set_xlabel(r'Angular Error $\gamma$ (Degrees)', fontweight='bold')
+    ax.set_ylabel('Empirical Risk', fontweight='bold')
+    ax.set_title('Loss Component Dynamics with 95% Confidence Intervals', pad=15)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     save_fig(fig, output_dir / 'component_ablation.pdf', bbox_inches='tight', dpi=300)
@@ -1913,27 +2319,32 @@ def plot_component_ablation(dataloader, loss_fn, output_dir: Path, steps: int = 
 
 @torch.no_grad()
 def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
+    """
+    Augments qualitative outputs with statistical residual distributions
+    to rigorously prove error displacement dynamics.
+    """
     device = next(loss_fn.parameters()).device
-
     batch = next(iter(dataloader))
+
     dtm = batch["dtm"][0:1].to(device)
     ortho = batch["image"][0:1].to(device)
     mask = batch["confidence"][0:1].to(device)
     I = batch["intensity"][0:1].to(device).view(1, 1, 1, 1)
     A = batch["ambient"][0:1].to(device).view(1, 1, 1, 1)
-
     gt_sun = batch["sun_vector"][0].cpu().numpy()
 
-    # 1. Ground Truth 
     sun_gt = torch.tensor(gt_sun, device=device, dtype=torch.float32).unsqueeze(0)
 
-    # 2. Azimuth Error (+45 deg)
     az_rot = R.from_euler('z', 45, degrees=True)
     sun_az = torch.tensor(az_rot.apply(gt_sun), device=device, dtype=torch.float32).unsqueeze(0)
 
-    # 3. Elevation Error (+45 deg)
     el_axis = np.cross(np.array([0, 0, 1]), gt_sun)
-    el_axis /= np.linalg.norm(el_axis)
+    norm = np.linalg.norm(el_axis)
+    if norm < 1e-6:
+        el_axis = np.array([1.0, 0.0, 0.0])  # Arbitrary fallback axis if sun is at zenith
+    else:
+        el_axis /= norm
+
     el_rot = R.from_rotvec(np.radians(45) * el_axis)
     sun_el = torch.tensor(el_rot.apply(gt_sun), device=device, dtype=torch.float32).unsqueeze(0)
 
@@ -1942,47 +2353,62 @@ def plot_qualitative_physics_errors(dataloader, loss_fn, output_dir: Path):
     ortho_z = loss_fn._zscore(ortho_gray, mask)
 
     conditions = [
-        ("Ground Truth", sun_gt),
-        ("Azimuth Error (+45°)", sun_az),
-        ("Elevation Error (+45°)", sun_el)
+        ("Ground Truth Base", sun_gt),
+        (r"Azimuth Shift (+45$^\circ$)", sun_az),
+        (r"Elevation Shift (+45$^\circ$)", sun_el)
     ]
 
-    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
-    plt.subplots_adjust(wspace=0.1, hspace=0.2)
+    # Expand plotting grid to 5 columns to include statistical distributions
+    fig, axes = plt.subplots(3, 5, figsize=(22, 12), gridspec_kw={'width_ratios': [1, 1, 1, 1, 1.5]})
+    plt.subplots_adjust(wspace=0.15, hspace=0.35)
 
     mask_np = mask[0, 0].cpu().numpy().astype(bool)
 
-    for i, (title, sun_vec) in enumerate(conditions):
+    for i, (title, sun_vec) in tqdm(enumerate(conditions), desc="Looping through conditions"):
         render, _ = loss_fn.render_from_depth(dtm, sun_vec, I, A)
         render_z = loss_fn._zscore(render, mask)
-        residual = np.abs((render_z - ortho_z)[0, 0].cpu().numpy())
-        residual = np.clip(residual / 2.0, 0.0, 1.0)
-        residual[~mask_np] = np.nan
+
+        # Calculate raw statistical residuals for KDE
+        residual_raw = (render_z - ortho_z)[0, 0].cpu().numpy()
+        valid_residuals = residual_raw[mask_np].flatten()
+
+        residual_img = np.abs(residual_raw)
+        residual_img = np.clip(residual_img / 2.0, 0.0, 1.0)
+        residual_img[~mask_np] = np.nan
 
         ortho_disp = np.clip((ortho_gray[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
         render_disp = np.clip((render[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
-        dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
 
         ortho_disp[~mask_np] = np.nan
         render_disp[~mask_np] = np.nan
-        dtm_disp[~mask_np] = np.nan
 
-        axes[i, 0].imshow(dtm_disp, cmap="terrain")
-        axes[i, 0].set_title("GT Depth")
+        axes[i, 0].imshow(ortho_disp, cmap="gray")
+        axes[i, 0].set_title(r"Source Image $\mathcal{I}_o$")
 
-        axes[i, 1].imshow(ortho_disp, cmap="gray")
-        axes[i, 1].set_title("Real Ortho")
+        axes[i, 1].imshow(render_disp, cmap="gray")
+        axes[i, 1].set_title(rf"Render $\mathcal{{I}}_r$: {title}")
 
-        axes[i, 2].imshow(render_disp, cmap="gray")
-        axes[i, 2].set_title(f"Render: {title}")
+        im = axes[i, 2].imshow(residual_img, cmap="RdBu_r")
+        axes[i, 2].set_title("Structural Residual Map")
 
-        im = axes[i, 3].imshow(residual, cmap="RdBu_r")
-        axes[i, 3].set_title("$|Z_r - Z_o|$ Residual")
+        for j in range(3):
+            axes[i, j].axis('off')
 
-        for ax in axes[i]:
-            ax.axis('off')
+        # Quantitative Error Distribution Plot
+        sns.histplot(valid_residuals, kde=True, ax=axes[i, 3], color='#8b0000' if i > 0 else '#2ca02c', bins=50)
+        axes[i, 3].set_title(
+            rf"Residual Distribution" +"\n" +rf"$\mu={valid_residuals.mean():.2f}, \sigma={valid_residuals.std():.2f}$")
+        axes[i, 3].set_xlim(-4, 4)
+        axes[i, 3].set_xlabel("$Z_r - Z_o$")
+        axes[i, 3].set_ylabel("Pixel Density")
 
-    fig.suptitle('Structural Residuals under Incorrect Illumination Topologies', fontsize=16)
+        # Emulate Box/Violin logic
+        sns.violinplot(x=valid_residuals, ax=axes[i, 4], color='#d3d3d3', inner="quartile")
+        axes[i, 4].set_title("Quartile Shift")
+        axes[i, 4].set_xlim(-4, 4)
+
+    fig.suptitle('Qualitative and Statistical Displacement under Erroneous Illumination Profiles', fontsize=18,
+                 fontweight='bold')
     output_dir.mkdir(parents=True, exist_ok=True)
     save_fig(fig, output_dir / 'qualitative_illumination_physics.pdf', bbox_inches='tight', dpi=300)
     plt.close(fig)
@@ -2951,11 +3377,14 @@ def main():
                 visualize_laplacian_loss(loaders["train"], output_dir=output_path, num_samples=6)
                 visualize_ordinal_ranking(loaders["train"], output_dir=output_path, num_samples=6)
             if all_viz or args.view_lambert_ablation:
-                plot_spherical_loss_landscape(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
-                plot_umap_invariance(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
-                plot_component_ablation(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
-                plot_qualitative_physics_errors(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
-                plot_radial_sun_sweep(loaders["train"], loss_fn=PhotoclinometricLoss(), output_dir=output_path)
+                loss_fn = PhotoclinometricLoss().to("cuda")
+
+                # plot_global_umap_invariance(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                # plot_spherical_loss_landscape(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                # plot_umap_invariance(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                # plot_component_ablation(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                plot_qualitative_physics_errors(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                # plot_radial_sun_sweep(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
 
             logger.info("Data inspection complete. Exiting without training.")
         return
