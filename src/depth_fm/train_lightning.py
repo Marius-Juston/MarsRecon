@@ -75,13 +75,11 @@ from depth_fm.visualization import (
 
 import matplotlib.gridspec as gridspec
 from scipy.spatial.transform import Rotation as R
-import torch.nn.functional as F
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from tqdm import tqdm
 from depth_fm.depthfm_adapter import compute_topographic_residual
 import torch.distributed as dist
 import re
@@ -1688,22 +1686,18 @@ def plot_radial_sun_sweep(dataloader, loss_fn, output_dir: Path):
     print(f"Radial visualization saved to: {save_path}")
 
 
+import torch
+from pathlib import Path
+
+
 @torch.no_grad()
-def plot_spherical_loss_landscape(
-        dataloader,
-        loss_fn,
-        output_dir: Path,
-        resolution: int = 50,
-        num_batches: int = 100
+def plot_statistically_significant_landscape(
+        dataloader, loss_fn, output_dir: Path, resolution: int = 50, num_batches: int = 100
 ):
-    """
-    Computes the expected loss landscape E[L] over the solar hemisphere
-    across multiple batches, ensuring statistical significance of the topology.
-    """
     device = next(loss_fn.parameters()).device if hasattr(loss_fn, 'parameters') else torch.device("cuda")
     loss_fn.eval()
 
-    # Generate hemispherical grid (Elevation 0 to 90, Azimuth 0 to 360)
+    # 1. Generate Canonical Hemispherical Grid (Centered at Zenith)
     theta = np.linspace(0, np.pi / 2, resolution)
     phi = np.linspace(0, 2 * np.pi, resolution * 2)
     T, P = np.meshgrid(theta, phi)
@@ -1711,12 +1705,13 @@ def plot_spherical_loss_landscape(
     S_x = np.sin(T) * np.cos(P)
     S_y = np.sin(T) * np.sin(P)
     S_z = np.cos(T)
-    sun_grid = np.stack([S_x, S_y, S_z], axis=-1).reshape(-1, 3)
+    # canonical_grid shape: (N_points, 3)
+    canonical_grid = torch.tensor(np.stack([S_x, S_y, S_z], axis=-1).reshape(-1, 3), device=device, dtype=torch.float32)
 
-    # Aggregate losses over multiple batches
-    aggregate_losses = np.zeros((num_batches, len(sun_grid)))
+    total_samples = 0
+    aggregate_losses = []
 
-    for b_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Evaluating Batches")):
+    for b_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Evaluating Dataset Topology")):
         if b_idx >= num_batches: break
 
         img = batch["image"].to(device).float()
@@ -1725,77 +1720,609 @@ def plot_spherical_loss_landscape(
         ambient = batch["ambient"].to(device).float()
         intensity = batch["intensity"].to(device).float()
 
-        # Taking mean over batch dimensions for a generalized landscape
-        b_size_internal = img.shape[0]
-        eval_batch_size = 512
+        # Ground truth sun vector for each item in the batch: Shape (B, 3)
+        s_gt = batch["sun_vector"].to(device).float()
+        B = s_gt.shape[0]
+        total_samples += B
 
-        batch_landscape = []
-        for i in tqdm(range(0, len(sun_grid), eval_batch_size), desc=f"Scanning Hemisphere {b_idx + 1}/{num_batches}",
-                      leave=False):
-            s_batch = torch.tensor(sun_grid[i:i + eval_batch_size], device=device, dtype=torch.float32)
-            current_bs = s_batch.shape[0]
+        # 2. Batched SO(3) Rotation Mapping Z-axis to s_gt
+        z_axis = torch.tensor([0.0, 0.0, 1.0], device=device).expand(B, -1)
+        v = torch.cross(z_axis, s_gt, dim=1)  # (B, 3)
+        c = torch.sum(z_axis * s_gt, dim=1, keepdim=True).unsqueeze(-1)  # (B, 1, 1)
 
-            img_exp = img[0:1].expand(current_bs, -1, -1, -1)
-            dtm_exp = dtm[0:1].expand(current_bs, -1, -1, -1)
-            mask_exp = mask[0:1].expand(current_bs, -1, -1, -1)
-            amb_exp = ambient[0:1].expand(current_bs)
-            int_exp = intensity[0:1].expand(current_bs)
+        # Construct skew-symmetric matrices (B, 3, 3)
+        v_x, v_y, v_z = v[:, 0], v[:, 1], v[:, 2]
+        zeros = torch.zeros_like(v_x)
+        V = torch.stack([
+            torch.stack([zeros, -v_z, v_y], dim=1),
+            torch.stack([v_z, zeros, -v_x], dim=1),
+            torch.stack([-v_y, v_x, zeros], dim=1)
+        ], dim=1)
 
-            # Evaluate the entire chunk of sun positions natively on the GPU
-            losses = loss_fn(
-                dtm_exp, img_exp, mask_exp, s_batch, amb_exp, int_exp, reduction='none'
-            )
+        I = torch.eye(3, device=device).expand(B, -1, -1)
+        # Rodrigues' formula for rotation matrix R: (B, 3, 3)
+        R = I + V + torch.bmm(V, V) / (1 + c + 1e-8)
 
-            # Transfer the tensor list back to CPU in one go
-            batch_landscape.extend(losses.cpu().tolist())
+        # Apply rotation to canonical grid to get query vectors relative to each sample
+        # canonical_grid: (N_points, 3) -> (B, N_points, 3)
+        s_queries = torch.einsum('bij, nj -> bni', R, canonical_grid)
 
-        aggregate_losses[b_idx, :] = batch_landscape
+        # 3. Evaluate Batched Loss
+        # Expanding images to match query grid size is memory intensive.
+        # Evaluate iteratively over the grid points across the entire image batch.
+        N_points = canonical_grid.shape[0]
+        batch_losses = torch.zeros((B, N_points), device=device)
 
-    # Compute statistically significant mean and Standard Error of the Mean (SEM)
-    L_mean = np.mean(aggregate_losses, axis=0).reshape(T.shape)
+        eval_chunk_size = 64  # Chunking grid points to save memory
+        for i in range(0, N_points, eval_chunk_size):
+            end_idx = min(i + eval_chunk_size, N_points)
+            current_chunk_size = end_idx - i
 
-    # Calculate SEM instead of raw standard deviation
-    L_sem = (np.std(aggregate_losses, axis=0) / np.sqrt(num_batches)).reshape(T.shape)
+            # Shape (B, chunk_size, 3) -> Flatten to (B * chunk_size, 3)
+            s_batch = s_queries[:, i:end_idx, :].reshape(-1, 3)
 
+            # Tile images and DTMs to match the flattened query vectors
+            img_exp = img.repeat_interleave(current_chunk_size, dim=0)
+            dtm_exp = dtm.repeat_interleave(current_chunk_size, dim=0)
+            mask_exp = mask.repeat_interleave(current_chunk_size, dim=0)
+            amb_exp = ambient.repeat_interleave(current_chunk_size)
+            int_exp = intensity.repeat_interleave(current_chunk_size)
+
+            # Evaluate Photoclinometric Loss
+            chunk_loss = loss_fn(dtm_exp, img_exp, mask_exp, s_batch, amb_exp, int_exp, reduction='none')
+
+            # Reshape back and store: (B * chunk_size) -> (B, chunk_size)
+            # Assuming loss_fn with reduction='none' returns a scalar per image/vector pair
+            # You may need to take the mean over spatial dimensions here if loss_fn returns spatial maps:
+            if chunk_loss.dim() > 1:
+                chunk_loss = chunk_loss.view(B * current_chunk_size, -1).mean(dim=1)
+
+            batch_losses[:, i:end_idx] = chunk_loss.view(B, current_chunk_size)
+
+        aggregate_losses.append(batch_losses.cpu())
+
+    # 4. Compute Statistical Topography
+    all_losses = torch.cat(aggregate_losses, dim=0).numpy()  # (Total_Samples, N_points)
+    L_mean = np.mean(all_losses, axis=0).reshape(T.shape)
+    L_sem = (np.std(all_losses, axis=0) / np.sqrt(total_samples)).reshape(T.shape)
+
+    # 5. Lambert Azimuthal Equal-Area Projection Plotting
     R_proj = 2 * np.sin(T / 2)
     X = R_proj * np.sin(P)
     Y = R_proj * np.cos(P)
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
 
-    # Plot Mean Expected Loss
+    # Left: Expected Loss (The Convex Basin)
     contour_mean = axes[0].contourf(X, Y, L_mean, levels=50, cmap='viridis')
     axes[0].contour(X, Y, L_mean, levels=20, colors='black', linewidths=0.3, alpha=0.5)
-    axes[0].set_title(r'Expected Loss Surface $\mathbb{E}_{x \sim \mathcal{D}}[\mathcal{L}]$')
+    axes[0].plot(0, 0, marker='*', color='white', markersize=15, markeredgecolor='black', label=r'GT $\mathbf{s}^*$')
+    axes[0].set_title(r'Expected Empirical Risk $\mathbb{E}_{x \sim \mathcal{D}}[\mathcal{L}]$')
+    axes[0].legend(loc='upper right')
     fig.colorbar(contour_mean, ax=axes[0], shrink=0.7)
 
-    # Plot Variance/Uncertainty
+    # Right: Standard Error (Statistical Significance)
     contour_sem = axes[1].contourf(X, Y, L_sem, levels=50, cmap='magma')
+    axes[1].plot(0, 0, marker='*', color='white', markersize=15, markeredgecolor='black')
     axes[1].set_title(r'Uncertainty of the Mean ($SEM_{\mathcal{L}}$)')
     fig.colorbar(contour_sem, ax=axes[1], shrink=0.7)
 
     for ax in axes:
         ax.set_aspect('equal')
-
-        # Axis labels indicating the projection plane
-        ax.set_xlabel(r"Projected $X$ (West $\leftrightarrow$ East)")
-        ax.set_ylabel(r"Projected $Y$ (South $\leftrightarrow$ North)")
-
-        # Add faint crosshairs to denote the Zenith (0,0)
+        ax.set_xlabel(r"Relative $X$ (LAEA Projection)")
+        ax.set_ylabel(r"Relative $Y$ (LAEA Projection)")
         ax.axhline(0, color='white', linestyle='--', linewidth=0.8, alpha=0.6)
         ax.axvline(0, color='white', linestyle='--', linewidth=0.8, alpha=0.6)
+        limit = np.sqrt(2)
+        ax.set_xlim(-limit * 1.05, limit * 1.05)
+        ax.set_ylim(-limit * 1.05, limit * 1.05)
 
-        # Optional: Clean up the ticks to show just the center and extents
-        limit = np.sqrt(2)  # Max radius for this projection
-        ticks = [-limit, 0, limit]
-        ax.set_xticks(ticks)
-        ax.set_yticks(ticks)
-        ax.set_xticklabels(['-Horizon', 'Zenith', '+Horizon'])
-        ax.set_yticklabels(['-Horizon', 'Zenith', '+Horizon'])
+        # Add outer horizon circle
+        horizon = plt.Circle((0, 0), limit, color='white', fill=False, linewidth=1.5, linestyle=':')
+        ax.add_patch(horizon)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_fig(fig, output_dir / 'spherical_loss_landscape.pdf', bbox_inches='tight', dpi=300)
+    save_fig(fig, output_dir / 'photoclinometric_loss_significance.pdf', bbox_inches='tight', dpi=300)
     plt.close(fig)
+
+
+from tqdm import tqdm
+from torch.func import vmap, grad, hessian
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+
+def compute_manifold_diagnostics(
+        s_true: torch.Tensor,
+        grad_E: torch.Tensor,
+        H_R: torch.Tensor,
+        U: torch.Tensor,
+        valid_mask: torch.Tensor
+):
+    """
+    Computes Tangent Gradient Norms and Principal Curvature Alignment.
+    """
+    B = s_true.shape[0]
+    device = s_true.device
+
+    # ---------------------------------------------------------
+    # 1. Tangent Gradient Norms (Criticality Validation)
+    # ---------------------------------------------------------
+    # Map Euclidean gradient to the 2D tangent space: ∇_R L = U^T ∇_E L
+    # grad_E: (B, 3), U: (B, 3, 2) -> U_T: (B, 2, 3)
+    U_T = U.transpose(1, 2)
+    grad_R = torch.bmm(U_T, grad_E.unsqueeze(2)).squeeze(2)  # (B, 2)
+
+    # Compute the L2 norm of the projected Riemannian gradient
+    grad_R_norm = torch.linalg.norm(grad_R, dim=1)  # (B,)
+
+    # ---------------------------------------------------------
+    # 2. Principal Curvature Alignment
+    # ---------------------------------------------------------
+    # Eigendecomposition of the Riemannian Hessian
+    # eigh returns eigenvalues in ascending order, so index 1 is lambda_max
+    eigvals, eigvecs = torch.linalg.eigh(H_R)  # eigvecs: (B, 2, 2)
+
+    # Extract the 2D principal eigenvector (u_max) and map it back to 3D
+    u_max_2d = eigvecs[:, :, 1]  # (B, 2)
+    u_max_3d = torch.bmm(U, u_max_2d.unsqueeze(2)).squeeze(2)  # (B, 3)
+
+    # Define physical axes in the tangent plane
+    # Zenith reference: Z-axis
+    Z = torch.tensor([0.0, 0.0, 1.0], device=device).expand(B, 3)
+
+    # Azimuth direction: cross product of Z and s_true (tangent to sphere, parallel to equator)
+    azimuth_dir = F.normalize(torch.linalg.cross(Z, s_true, dim=1), dim=1)
+
+    # Elevation direction: cross product of azimuth and s_true (points toward the pole)
+    elevation_dir = torch.linalg.cross(azimuth_dir, s_true, dim=1)  # Automatically unit norm
+
+    # Project u_max_3d onto the physical axes (Absolute dot product for alignment)
+    align_azimuth = torch.abs(torch.sum(u_max_3d * azimuth_dir, dim=1))
+    align_elevation = torch.abs(torch.sum(u_max_3d * elevation_dir, dim=1))
+
+    return {
+        "grad_R_norm": grad_R_norm[valid_mask].cpu().numpy(),
+        "align_azimuth": align_azimuth[valid_mask].cpu().numpy(),
+        "align_elevation": align_elevation[valid_mask].cpu().numpy(),
+        "eigvals": eigvals
+    }
+
+
+def plot_spherical_loss_landscape(
+        loss_fn, med_idx: int, s_true: torch.Tensor, U: torch.Tensor,
+        dtm: torch.Tensor, img: torch.Tensor, mask: torch.Tensor,
+        ambient: torch.Tensor, intensity: torch.Tensor, output_dir: Path,
+        filename: str = 'spherical_contour_projection.pdf',
+        title_suffix: str = ''
+):
+    """
+    Samples the local loss manifold around the empirical minimum and projects it onto a 2D heatmap.
+    Safely batched to prevent CUDA OOM on dense grid evaluations.
+    """
+    device = s_true.device
+
+    # Extract the median sample's vectors and inputs
+    s_star = s_true[med_idx]  # (3,)
+    U_star = U[med_idx]  # (3, 2)
+
+    d_i = dtm[med_idx:med_idx + 1]
+    i_i = img[med_idx:med_idx + 1]
+    m_i = mask[med_idx:med_idx + 1]
+    a_i = ambient[med_idx:med_idx + 1]
+    int_i = intensity[med_idx:med_idx + 1]
+
+    # Create a 2D grid in the tangent plane
+    grid_res = 60
+    span = 0.5
+    x = torch.linspace(-span, span, grid_res, device=device)
+    y = torch.linspace(-span, span, grid_res, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+
+    # Flatten grid to (N, 2)
+    grid_2d = torch.stack([xx.flatten(), yy.flatten()], dim=1)
+    N = grid_2d.shape[0]  # Total evaluations: 3600
+
+    # Map 2D grid points to the 3D tangent plane, then retract to the sphere
+    p_3d = s_star.unsqueeze(0) + grid_2d @ U_star.transpose(0, 1)
+    s_eval = F.normalize(p_3d, p=2, dim=1)  # (N, 3)
+
+    # Expand scene inputs to match the grid batch size N
+    d_eval = d_i.expand(N, -1, -1, -1)
+    i_eval = i_i.expand(N, -1, -1, -1)
+    m_eval = m_i.expand(N, -1, -1, -1)
+    a_eval = a_i.expand(N, -1)
+    int_eval = int_i.expand(N, -1)
+
+    # ---------------------------------------------------------
+    # MEMORY SAFE EVALUATION LOOP
+    # ---------------------------------------------------------
+    chunk_size = 64  # Adjust based on image resolution. 64 is very safe.
+    losses_list = []
+
+    with torch.no_grad():
+        for i in range(0, N, chunk_size):
+            end_idx = min(i + chunk_size, N)
+
+            # Slice the expanded views to strictly cap VRAM usage
+            chunk_losses = loss_fn(
+                d_eval[i:end_idx],
+                i_eval[i:end_idx],
+                m_eval[i:end_idx],
+                s_eval[i:end_idx],
+                a_eval[i:end_idx],
+                int_eval[i:end_idx],
+                reduction='none'
+            )
+
+            if chunk_losses.dim() > 1:
+                chunk_losses = chunk_losses.view(end_idx - i, -1).mean(dim=1)
+
+            # Move immediately to CPU to free device memory for the next chunk
+            losses_list.append(chunk_losses.cpu())
+
+    # Concatenate results back into a single tensor
+    losses = torch.cat(losses_list, dim=0)
+    loss_surface = losses.view(grid_res, grid_res).numpy()
+
+    # ---------------------------------------------------------
+    # Plotting the Tangent Heatmap
+    # ---------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 7))
+    extent = [-span, span, -span, span]
+
+    im = ax.imshow(loss_surface, origin='lower', extent=extent, cmap='viridis', aspect='auto')
+    contours = ax.contour(loss_surface, levels=15, colors='white', alpha=0.5, origin='lower', extent=extent)
+    ax.clabel(contours, inline=True, fontsize=8, fmt='%.4f')
+
+    ax.plot(0, 0, 'r*', markersize=12, label=r'Empirical Min ($s^*$)')
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(r'Photoclinometric Loss $\mathcal{L}$', rotation=270, labelpad=15)
+
+    # Inject the dynamic title suffix
+    ax.set_title(rf'Spherical Loss Contour on Tangent Plane $T_{{s^*}} S^2$ {title_suffix}')
+    ax.set_xlabel(r'Tangent Basis $u_1$')
+    ax.set_ylabel(r'Tangent Basis $u_2$')
+    ax.legend(loc='upper right')
+
+    plt.tight_layout()
+    # Save with the dynamic filename
+    save_fig(fig, output_dir / filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+import geoopt
+
+@torch.no_grad()
+def prove_and_visualize_local_convexity(
+        dataloader, loss_fn, output_dir: Path, num_batches: int = 200, opt_steps: int = 100
+):
+    device = next(loss_fn.parameters()).device if hasattr(loss_fn, 'parameters') else torch.device("cuda")
+    loss_fn.eval()
+
+    # Statistical aggregators
+    eigenvalues_min = []
+    eigenvalues_max = []
+    angular_shifts = []
+
+    all_grad_R_norms = []
+    all_align_azimuth = []
+    all_align_elevation = []
+
+    rep_convex = None
+    rep_saddle = None
+
+    for b_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Computing Eigenspectra")):
+        if b_idx >= num_batches: break
+
+        # 1. Extract and freeze standard inputs
+        img = batch["image"].to(device).float().detach()
+        dtm = batch["dtm"][:, :1].to(device).float().detach()
+        mask = batch["confidence"].to(device).float().detach()
+        ambient = batch["ambient"].to(device).float().detach()
+        intensity = batch["intensity"].to(device).float().detach()
+        s_gt = batch["sun_vector"].to(device).float().detach()
+
+        B = s_gt.shape[0]
+
+        s_gt_initial = torch.zeros_like(s_gt)
+        s_gt_initial[:, -1] = 1.0
+
+        # 2. Find True Empirical Minimum (s_true) via Riemannian Optimization
+        with torch.enable_grad():
+            eps = 1e-6
+
+            # Clamp initial GT to upper hemisphere just to be safe
+            # s_init = torch.cat([s_gt_initial[:, :2], torch.clamp(s_gt_initial[:, 2:], min=eps)], dim=1)
+            s_init = s_gt_initial
+            s_init = F.normalize(s_init, p=2, dim=1)
+
+            # Wrap the tensor in a Geoopt Manifold Parameter
+            # This tells the optimizer that this parameter explicitly lives on the unit sphere
+            s_opt = geoopt.ManifoldParameter(s_init, manifold=geoopt.Sphere())
+
+            # Use Riemannian Adam. It natively handles geodesic steps and momentum transport.
+            optimizer = geoopt.optim.RiemannianAdam([s_opt], lr=0.1)
+
+            for _ in range(opt_steps):
+                optimizer.zero_grad()
+
+                # Because s_opt is a ManifoldParameter, it is GUARANTEED to be unit-norm here.
+                # We do not need to call F.normalize before the forward pass.
+                loss = loss_fn(dtm, img, mask, s_opt, ambient, intensity).mean()
+                loss.backward()
+
+                # The optimizer step computes the Riemannian gradient and steps along the curve
+                optimizer.step()
+
+                with torch.no_grad():
+                    # Apply the non-manifold constraint (Upper Hemisphere Z >= eps)
+                    # If Z drops below eps, clamp it, then ask geoopt to re-project it to the sphere
+                    if (s_opt.data[:, 2] < eps).any():
+                        s_opt.data[:, 2].clamp_(min=eps)
+                        s_opt.proj_()  # Geoopt's native spherical retraction
+
+            s_true = s_opt.detach()
+
+        # 3. Vectorized Computation of the Riemannian Hessian (Loop-Free)
+        # Define a single-sample closure for torch.func
+        def sample_loss_fn(s_vec, d_i, img_i, m_i, amb_i, int_i):
+            # Expand dims to simulate batch size of 1 for the loss function
+            l = loss_fn(
+                d_i.unsqueeze(0), img_i.unsqueeze(0), m_i.unsqueeze(0),
+                s_vec.unsqueeze(0), amb_i.unsqueeze(0), int_i.unsqueeze(0)
+            )
+            return l.mean()  # Strict scalar enforcement
+
+        # Vectorize the gradient and hessian operators across the batch dimension
+        compute_batch_grad = vmap(grad(sample_loss_fn), in_dims=(0, 0, 0, 0, 0, 0))
+        compute_batch_hess = vmap(hessian(sample_loss_fn), in_dims=(0, 0, 0, 0, 0, 0))
+
+        with torch.enable_grad():
+            grad_E = compute_batch_grad(s_true, dtm, img, mask, ambient, intensity)  # (B, 3)
+            H_E = compute_batch_hess(s_true, dtm, img, mask, ambient, intensity)  # (B, 3, 3)
+
+        # 4. Tangent Space Projection
+        # Dynamically assign reference vectors to avoid collinearity
+        v_ref = torch.tensor([1.0, 0.0, 0.0], device=device).expand(B, 3)
+        dot_products = torch.abs(torch.sum(s_true * v_ref, dim=1))
+        # Mask where s_true is too close to [1, 0, 0]
+        collinear_mask = (dot_products > 0.99).unsqueeze(1)
+        v_ref = torch.where(collinear_mask, torch.tensor([0.0, 1.0, 0.0], device=device).expand(B, 3), v_ref)
+
+        # Orthonormal basis U: (B, 3, 2)
+        u1 = F.normalize(torch.linalg.cross(s_true, v_ref), p=2, dim=1)
+        u2 = F.normalize(torch.linalg.cross(s_true, u1), p=2, dim=1)
+        U = torch.stack([u1, u2], dim=2)
+
+        # Compute radial gradient scalar: <∇g, s*> for each sample -> (B,)
+        radial_grad = torch.sum(grad_E * s_true, dim=1)
+
+        # H_R = U^T * H_E * U - <∇g, s*> * I_2
+        # Batched matrix multiplications
+        U_T = U.transpose(1, 2)  # (B, 2, 3)
+        H_R_projected = torch.bmm(torch.bmm(U_T, H_E), U)  # (B, 2, 2)
+        I_2_batched = torch.eye(2, device=device).expand(B, 2, 2)  # (B, 2, 2)
+        radial_penalty = radial_grad.view(B, 1, 1) * I_2_batched  # (B, 2, 2)
+
+        H_R = H_R_projected - radial_penalty  # (B, 2, 2)
+
+        # 5. Eigenspectrum Decomposition
+        eigvals = torch.linalg.eigvalsh(H_R)  # Returns ascending order: (B, 2)
+
+        # Filter out NaN/Inf values that may occur from masked/zero-loss samples
+        valid_mask_tensor = ~torch.isnan(eigvals[:, 0]) & ~torch.isinf(eigvals[:, 0])
+        eigenvalues_min.extend(eigvals[valid_mask_tensor, 0].cpu().tolist())
+        eigenvalues_max.extend(eigvals[valid_mask_tensor, 1].cpu().tolist())
+
+        # 6. Angular offset from GT
+        cos_sim = torch.sum(s_true * s_gt, dim=1).clamp(-1.0, 1.0)
+        shift_deg = torch.acos(cos_sim) * (180.0 / np.pi)
+        angular_shifts.extend(shift_deg[valid_mask_tensor].cpu().tolist())
+
+        # 7. NEW: Compute Manifold Diagnostics
+        diagnostics = compute_manifold_diagnostics(s_true, grad_E, H_R, U, valid_mask_tensor)
+        all_grad_R_norms.extend(diagnostics["grad_R_norm"])
+        all_align_azimuth.extend(diagnostics["align_azimuth"])
+        all_align_elevation.extend(diagnostics["align_elevation"])
+
+        # ---------------------------------------------------------
+        # 8. GLOBAL CACHING: Capture the first saddle & convex point
+        # ---------------------------------------------------------
+        if rep_convex is None:
+            convex_mask = valid_mask_tensor & (eigvals[:, 0] > 0) & (eigvals[:, 1] > 0)
+            if convex_mask.any():
+                idx = torch.where(convex_mask)[0][0]
+                # Slice and move to CPU to avoid VRAM leaks
+                rep_convex = {
+                    "s_true": s_true[idx].cpu(),
+                    "U": U[idx].cpu(),
+                    "dtm": dtm[idx:idx + 1].cpu(),
+                    "img": img[idx:idx + 1].cpu(),
+                    "mask": mask[idx:idx + 1].cpu(),
+                    "ambient": ambient[idx:idx + 1].cpu(),
+                    "intensity": intensity[idx:idx + 1].cpu()
+                }
+
+        if rep_saddle is None:
+            saddle_mask = valid_mask_tensor & (eigvals[:, 0] < 0) & (eigvals[:, 1] > 0)
+            if saddle_mask.any():
+                print(b_idx)
+                idx = torch.where(saddle_mask)[0][0]
+                rep_saddle = {
+                    "s_true": s_true[idx].cpu(),
+                    "U": U[idx].cpu(),
+                    "dtm": dtm[idx:idx + 1].cpu(),
+                    "img": img[idx:idx + 1].cpu(),
+                    "mask": mask[idx:idx + 1].cpu(),
+                    "ambient": ambient[idx:idx + 1].cpu(),
+                    "intensity": intensity[idx:idx + 1].cpu()
+                }
+
+    # ---------------------------------------------------------
+    # Statistical Aggregation & Rigorous Validation
+    # ---------------------------------------------------------
+    L_min = np.array(eigenvalues_min)
+    L_max = np.array(eigenvalues_max)
+    shifts = np.array(angular_shifts)
+    grad_norms = np.array(all_grad_R_norms)
+    azimuth_aligns = np.array(all_align_azimuth)
+    elevation_aligns = np.array(all_align_elevation)
+
+    # Diagnostic check for negative eigenvalues
+    negative_lambdas = L_min[L_min < 0]
+    if len(negative_lambdas) > 0:
+        print(f"\n--- Topology Diagnostic ---")
+        print(f"Total non-convex samples: {len(negative_lambdas)}")
+        print(f"Mean negative magnitude: {np.mean(negative_lambdas):.2e}")
+        print(f"Worst-case lambda_min: {np.min(negative_lambdas):.2e}")
+        print(f"Percentage < -1e-5 (True Saddles): {np.mean(negative_lambdas < -1e-5) * 100:.2f}%")
+
+    # Topological Categorization (Morse Index)
+    idx_convex = np.sum((L_min > 0) & (L_max > 0))
+    idx_saddle = np.sum((L_min <= 0) & (L_max > 0))
+    idx_concave = np.sum((L_min <= 0) & (L_max <= 0))
+    total_valid = len(L_min)
+
+    # Non-parametric Bootstrap for Convexity Confidence Interval
+    np.random.seed(42)
+    n_bootstraps = 1000
+    bootstrapped_ratios = []
+    for _ in range(n_bootstraps):
+        resample = np.random.choice(L_min, size=total_valid, replace=True)
+        bootstrapped_ratios.append(np.mean(resample > 0) * 100)
+
+    convex_mean = np.mean(bootstrapped_ratios)
+    ci_lower = np.percentile(bootstrapped_ratios, 2.5)
+    ci_upper = np.percentile(bootstrapped_ratios, 97.5)
+
+    # ---------------------------------------------------------
+    # Generate Contour Map from Last Batch
+    # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    # Generate Contour Maps from Last Batch (Convex vs Saddle)
+    # ---------------------------------------------------------
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if rep_convex is not None:
+        # Push back to GPU for fast grid evaluation
+        rc = {k: v.to(device) for k, v in rep_convex.items()}
+        plot_spherical_loss_landscape(
+            loss_fn, 0,  # Index is 0 because tensors are already sliced to size 1
+            rc["s_true"].unsqueeze(0), rc["U"].unsqueeze(0),
+            rc["dtm"], rc["img"], rc["mask"], rc["ambient"], rc["intensity"],
+            output_dir, filename='spherical_contour_convex.pdf', title_suffix="(Index 0: Local Minimum)"
+        )
+
+    if rep_saddle is not None:
+        rs = {k: v.to(device) for k, v in rep_saddle.items()}
+        plot_spherical_loss_landscape(
+            loss_fn, 0,
+            rs["s_true"].unsqueeze(0), rs["U"].unsqueeze(0),
+            rs["dtm"], rs["img"], rs["mask"], rs["ambient"], rs["intensity"],
+            output_dir, filename='spherical_contour_saddle.pdf', title_suffix="(Index 1: Saddle Point)"
+        )
+    else:
+        print("No saddle points detected across all batches evaluated.")
+    # ---------------------------------------------------------
+    # Publication-Grade Plotting
+    # ---------------------------------------------------------
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
+    fig, axes = plt.subplots(2, 3, figsize=(24, 12))
+
+    # Plot A: ECDF of Eigenspectrum (Replaces deceptive KDE)
+    sns.ecdfplot(L_min, ax=axes[0, 0], color='blue', label=r'$\lambda_{min}(H_R)$', linewidth=2)
+    sns.ecdfplot(L_max, ax=axes[0, 0], color='red', label=r'$\lambda_{max}(H_R)$', linewidth=2, linestyle='--')
+    axes[0, 0].axvline(0, color='black', linestyle=':', linewidth=2)
+    axes[0, 0].set_title(r'Empirical CDF of Riemannian Eigenspectrum')
+    axes[0, 0].set_xlabel("Eigenvalue Magnitude")
+    axes[0, 0].set_ylabel("Cumulative Probability")
+    axes[0, 0].set_xlim([np.percentile(L_min, 1), np.percentile(L_max, 99)])
+    axes[0, 0].legend()
+
+    # Plot B: Topological Basin Categorization
+    categories = [
+        'Strictly Convex\n(Index 0)',
+        'Saddle Point\n(Index 1)',
+        'Strictly Concave\n(Index 2)'
+    ]
+
+    counts = [idx_convex, idx_saddle, idx_concave]
+
+    ax = sns.barplot(
+        x=categories,
+        y=counts,
+        hue=categories,
+        ax=axes[0, 1],
+        palette=['#2ecc71', '#f1c40f', '#e74c3c'],
+        legend=False
+    )
+
+    for container in ax.containers:
+        ax.bar_label(container, fontsize=10, padding=3)
+
+    axes[0, 1].set_title(rf'Local Topology at Empirical Minimum $\mathbf{{s}}^*$')
+    axes[0, 1].set_ylabel("Sample Count")
+    axes[0, 1].text(0, idx_convex * 0.5, rf'{convex_mean:.1f}%' '\n' rf'95% CI: [{ci_lower:.1f}, {ci_upper:.1f}]',
+                    ha='center', va='center', color='black', fontweight='bold',
+                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+    # Plot C: Logarithmic Basin Anisotropy (Strictly Convex Subsets Only)
+    convex_mask = L_min > 0
+    if np.any(convex_mask):
+        cond_numbers = L_max[convex_mask] / L_min[convex_mask]
+        log_cond = np.log10(cond_numbers + 1e-12)  # Log10 mapping
+        sns.histplot(log_cond, ax=axes[0, 2], bins=40, color='purple', kde=True)
+        axes[0, 2].set_title(r'Log-Anisotropy of Convex Basins ($\log_{10} \kappa$)')
+        axes[0, 2].set_xlabel(r'$\log_{10}(\lambda_{max} / \lambda_{min})$')
+        axes[0, 2].set_ylabel("Count")
+    else:
+        axes[0, 2].text(0.5, 0.5, "No strictly convex\nsamples detected.", ha='center', va='center')
+
+    # Plot D: Empirical Angular Shift Distribution
+    sns.histplot(shifts, ax=axes[1, 2], bins=40, color='teal', kde=True)
+    axes[1, 2].set_title(r'Deviation: $\mathbf{s}_{gt}$ vs Empirical $\mathbf{s}^*$')
+    axes[1, 2].set_xlabel("Angular Shift (Degrees)")
+    axes[1, 2].set_ylabel("Count")
+
+    # Plot 5: NEW - Tangent Gradient Norms
+    sns.histplot(grad_norms, ax=axes[1, 0], bins=40, color='crimson', kde=True)
+    axes[1, 0].set_title(r'Riemannian Gradient Norms $\Vert \nabla_R \mathcal{L} \Vert_2$')
+    axes[1, 0].set_xlabel(r'$\Vert U^T \nabla_E \mathcal{L}(s^*) \Vert_2$')
+    axes[1, 0].set_ylabel('Sample Count')
+    axes[1, 0].axvline(np.median(grad_norms), color='black', linestyle='--',
+                       label=f'Median: {np.median(grad_norms):.1e}')
+    axes[1, 0].legend()
+
+    # Plot 6: NEW - Principal Curvature Alignment
+    sns.scatterplot(x=azimuth_aligns, y=elevation_aligns, ax=axes[1, 1], alpha=0.6, color='indigo')
+    axes[1, 1].plot([0, 1], [1, 0], 'k--', alpha=0.3)
+    axes[1, 1].set_title(r'Alignment of $u_{max}$ with Physical Axes')
+    axes[1, 1].set_xlabel(r'Azimuth Alignment $\vert \langle u_{max}, \hat{a} \rangle \vert$')
+    axes[1, 1].set_ylabel(r'Elevation Alignment $\vert \langle u_{max}, \hat{e} \rangle \vert$')
+    axes[1, 1].set_xlim(0, 1.05)
+    axes[1, 1].set_ylim(0, 1.05)
+
+    # Remove the unused subplots
+    # fig.delaxes(axes[1, 2])
+    # fig.delaxes(axes[1, 3])
+
+    plt.tight_layout()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_fig(fig, output_dir / 'eigenspectrum_convexity_proof.pdf', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    return {
+        "lambda_min_avg": np.mean(L_min),
+        "convex_ratio_mean": convex_mean,
+        "convex_ratio_ci": (ci_lower, ci_upper),
+        "mean_angular_shift": np.mean(shifts),
+        "median_grad_R_norm": np.median(grad_norms)
+    }
 
 
 def compute_distance_correlation_gpu(X: torch.Tensor, Y: torch.Tensor) -> float:
@@ -3422,10 +3949,11 @@ def main():
                 loss_fn = PhotoclinometricLoss().to("cuda")
 
                 # plot_global_umap_invariance(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
-                # plot_spherical_loss_landscape(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                # plot_statistically_significant_landscape(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                prove_and_visualize_local_convexity(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
                 # plot_umap_invariance(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
                 # plot_component_ablation(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
-                plot_qualitative_physics_errors(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                # plot_qualitative_physics_errors(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
                 # plot_radial_sun_sweep(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
 
             logger.info("Data inspection complete. Exiting without training.")

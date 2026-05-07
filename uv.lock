@@ -728,6 +728,19 @@ http = [
 ]
 
 [[package]]
+name = "geoopt"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/0f/f8d4afc40ffd1d2e8a4386bad152176cdc726b077c9bd5d65621b122559d/geoopt-0.5.1-py3-none-any.whl", hash = "sha256:d6ee06e943e7e882ba785db09a6d705d34b8bf5408d4d546b3a8ac2e4ff3496d", size = 90072, upload-time = "2025-06-19T20:13:58.92Z" },
+]
+
+[[package]]
 name = "geopandas"
 version = "1.1.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1254,6 +1267,7 @@ depthfm = [
     { name = "diffusers" },
     { name = "einops" },
     { name = "focal-frequency-loss" },
+    { name = "geoopt" },
     { name = "jsonargparse", extra = ["signatures"] },
     { name = "lightning" },
     { name = "litdata" },
@@ -1305,6 +1319,7 @@ requires-dist = [
     { name = "diffusers", marker = "extra == 'depthfm'", specifier = ">=0.37.1" },
     { name = "einops", marker = "extra == 'depthfm'", specifier = ">=0.8.2" },
     { name = "focal-frequency-loss", marker = "extra == 'depthfm'", specifier = ">=0.3.0" },
+    { name = "geoopt", marker = "extra == 'depthfm'", specifier = ">=0.5.1" },
     { name = "graphviz", marker = "extra == 'viz'", specifier = ">=0.21" },
     { name = "huggingface-hub", specifier = ">=1.8.0" },
     { name = "jsonargparse", extras = ["signatures"], marker = "extra == 'depthfm'", specifier = ">=4.47.0" },
