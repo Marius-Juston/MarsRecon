@@ -31,7 +31,7 @@ import logging
 import math
 import os
 from copy import deepcopy
-from typing import Callable
+from typing import Callable, Optional, Any
 
 import cuml
 import matplotlib.patches as mpatches
@@ -76,16 +76,21 @@ from depth_fm.visualization import (
 import matplotlib.gridspec as gridspec
 from scipy.spatial.transform import Rotation as R
 
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
 from depth_fm.depthfm_adapter import compute_topographic_residual
 import torch.distributed as dist
 import re
 from depth_fm.visualization import plot_timestep_ablation
-import seaborn as sns
 import pandas as pd
+from tqdm import tqdm
+from torch.func import vmap, grad, hessian
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import geoopt
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -1826,200 +1831,428 @@ def plot_statistically_significant_landscape(
     plt.close(fig)
 
 
-from tqdm import tqdm
-from torch.func import vmap, grad, hessian
-import torch
-import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-
-
 def compute_manifold_diagnostics(
-        s_true: torch.Tensor,
+        s_star: torch.Tensor,
         grad_E: torch.Tensor,
         H_R: torch.Tensor,
         U: torch.Tensor,
-        valid_mask: torch.Tensor
-):
+        valid_mask: torch.Tensor,
+) -> dict[str, list[float]]:
+    """Per-sample diagnostics for the eigenspectrum analysis.
+
+    Returns
+    -------
+    grad_R_norm     : tangent gradient magnitude at s_star.
+    align_azimuth   : |⟨u_max, â⟩|, alignment of the dominant Hessian
+                      eigenvector with the local azimuth tangent.
+    align_elevation : |⟨u_max, ê⟩|, alignment with the local elevation tangent.
     """
-    Computes Tangent Gradient Norms and Principal Curvature Alignment.
-    """
-    B = s_true.shape[0]
-    device = s_true.device
+    B = s_star.shape[0]
+    device = s_star.device
 
-    # ---------------------------------------------------------
-    # 1. Tangent Gradient Norms (Criticality Validation)
-    # ---------------------------------------------------------
-    # Map Euclidean gradient to the 2D tangent space: ∇_R L = U^T ∇_E L
-    # grad_E: (B, 3), U: (B, 3, 2) -> U_T: (B, 2, 3)
-    U_T = U.transpose(1, 2)
-    grad_R = torch.bmm(U_T, grad_E.unsqueeze(2)).squeeze(2)  # (B, 2)
+    grad_R = grad_E - (grad_E * s_star).sum(dim=1, keepdim=True) * s_star
+    grad_R_norm = grad_R.norm(dim=1)
 
-    # Compute the L2 norm of the projected Riemannian gradient
-    grad_R_norm = torch.linalg.norm(grad_R, dim=1)  # (B,)
+    # Dominant tangent eigenvector (in tangent coords), then lifted to ambient
+    eigvals, eigvecs = torch.linalg.eigh(H_R)  # ascending
+    v_max = eigvecs[:, :, -1]  # (B, 2)
+    u_max = torch.einsum("bij,bj->bi", U, v_max)  # (B, 3)
+    u_max = F.normalize(u_max, p=2, dim=1, eps=1e-12)
 
-    # ---------------------------------------------------------
-    # 2. Principal Curvature Alignment
-    # ---------------------------------------------------------
-    # Eigendecomposition of the Riemannian Hessian
-    # eigh returns eigenvalues in ascending order, so index 1 is lambda_max
-    eigvals, eigvecs = torch.linalg.eigh(H_R)  # eigvecs: (B, 2, 2)
+    # Local azimuth and elevation tangent directions at s_star.
+    # Azimuth: â ∝ e_z × s, lies in the horizontal plane and is tangent to S^2.
+    # Elevation: ê = s × â completes a right-handed frame in the tangent plane.
+    e_z = torch.tensor([0.0, 0.0, 1.0], device=device).expand(B, 3)
+    a_hat_raw = torch.linalg.cross(e_z, s_star, dim=1)
+    a_norm = a_hat_raw.norm(dim=1, keepdim=True)
+    pole = a_norm.squeeze(-1) < 1e-6
+    a_hat_fallback = torch.tensor([1.0, 0.0, 0.0], device=device).expand(B, 3)
+    a_hat = torch.where(
+        pole.unsqueeze(-1),
+        a_hat_fallback,
+        a_hat_raw / a_norm.clamp(min=1e-12),
+    )
+    e_hat = torch.linalg.cross(s_star, a_hat, dim=1)
+    e_hat = F.normalize(e_hat, p=2, dim=1, eps=1e-12)
 
-    # Extract the 2D principal eigenvector (u_max) and map it back to 3D
-    u_max_2d = eigvecs[:, :, 1]  # (B, 2)
-    u_max_3d = torch.bmm(U, u_max_2d.unsqueeze(2)).squeeze(2)  # (B, 3)
-
-    # Define physical axes in the tangent plane
-    # Zenith reference: Z-axis
-    Z = torch.tensor([0.0, 0.0, 1.0], device=device).expand(B, 3)
-
-    # Azimuth direction: cross product of Z and s_true (tangent to sphere, parallel to equator)
-    azimuth_dir = F.normalize(torch.linalg.cross(Z, s_true, dim=1), dim=1)
-
-    # Elevation direction: cross product of azimuth and s_true (points toward the pole)
-    elevation_dir = torch.linalg.cross(azimuth_dir, s_true, dim=1)  # Automatically unit norm
-
-    # Project u_max_3d onto the physical axes (Absolute dot product for alignment)
-    align_azimuth = torch.abs(torch.sum(u_max_3d * azimuth_dir, dim=1))
-    align_elevation = torch.abs(torch.sum(u_max_3d * elevation_dir, dim=1))
+    align_az = (u_max * a_hat).sum(dim=1).abs()
+    align_el = (u_max * e_hat).sum(dim=1).abs()
 
     return {
-        "grad_R_norm": grad_R_norm[valid_mask].cpu().numpy(),
-        "align_azimuth": align_azimuth[valid_mask].cpu().numpy(),
-        "align_elevation": align_elevation[valid_mask].cpu().numpy(),
-        "eigvals": eigvals
+        "grad_R_norm": grad_R_norm[valid_mask].cpu().tolist(),
+        "align_azimuth": align_az[valid_mask].cpu().tolist(),
+        "align_elevation": align_el[valid_mask].cpu().tolist(),
     }
 
 
-def plot_spherical_loss_landscape(
-        loss_fn, med_idx: int, s_true: torch.Tensor, U: torch.Tensor,
-        dtm: torch.Tensor, img: torch.Tensor, mask: torch.Tensor,
-        ambient: torch.Tensor, intensity: torch.Tensor, output_dir: Path,
-        filename: str = 'spherical_contour_projection.pdf',
-        title_suffix: str = ''
-):
-    """
-    Samples the local loss manifold around the empirical minimum and projects it onto a 2D heatmap.
-    Safely batched to prevent CUDA OOM on dense grid evaluations.
-    """
-    device = s_true.device
-
-    # Extract the median sample's vectors and inputs
-    s_star = s_true[med_idx]  # (3,)
-    U_star = U[med_idx]  # (3, 2)
-
-    d_i = dtm[med_idx:med_idx + 1]
-    i_i = img[med_idx:med_idx + 1]
-    m_i = mask[med_idx:med_idx + 1]
-    a_i = ambient[med_idx:med_idx + 1]
-    int_i = intensity[med_idx:med_idx + 1]
-
-    # Create a 2D grid in the tangent plane
-    grid_res = 60
-    span = 0.5
-    x = torch.linspace(-span, span, grid_res, device=device)
-    y = torch.linspace(-span, span, grid_res, device=device)
-    yy, xx = torch.meshgrid(y, x, indexing='ij')
-
-    # Flatten grid to (N, 2)
-    grid_2d = torch.stack([xx.flatten(), yy.flatten()], dim=1)
-    N = grid_2d.shape[0]  # Total evaluations: 3600
-
-    # Map 2D grid points to the 3D tangent plane, then retract to the sphere
-    p_3d = s_star.unsqueeze(0) + grid_2d @ U_star.transpose(0, 1)
-    s_eval = F.normalize(p_3d, p=2, dim=1)  # (N, 3)
-
-    # Expand scene inputs to match the grid batch size N
-    d_eval = d_i.expand(N, -1, -1, -1)
-    i_eval = i_i.expand(N, -1, -1, -1)
-    m_eval = m_i.expand(N, -1, -1, -1)
-    a_eval = a_i.expand(N, -1)
-    int_eval = int_i.expand(N, -1)
-
-    # ---------------------------------------------------------
-    # MEMORY SAFE EVALUATION LOOP
-    # ---------------------------------------------------------
-    chunk_size = 64  # Adjust based on image resolution. 64 is very safe.
-    losses_list = []
-
-    with torch.no_grad():
-        for i in range(0, N, chunk_size):
-            end_idx = min(i + chunk_size, N)
-
-            # Slice the expanded views to strictly cap VRAM usage
-            chunk_losses = loss_fn(
-                d_eval[i:end_idx],
-                i_eval[i:end_idx],
-                m_eval[i:end_idx],
-                s_eval[i:end_idx],
-                a_eval[i:end_idx],
-                int_eval[i:end_idx],
-                reduction='none'
-            )
-
-            if chunk_losses.dim() > 1:
-                chunk_losses = chunk_losses.view(end_idx - i, -1).mean(dim=1)
-
-            # Move immediately to CPU to free device memory for the next chunk
-            losses_list.append(chunk_losses.cpu())
-
-    # Concatenate results back into a single tensor
-    losses = torch.cat(losses_list, dim=0)
-    loss_surface = losses.view(grid_res, grid_res).numpy()
-
-    # ---------------------------------------------------------
-    # Plotting the Tangent Heatmap
-    # ---------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 7))
-    extent = [-span, span, -span, span]
-
-    im = ax.imshow(loss_surface, origin='lower', extent=extent, cmap='viridis', aspect='auto')
-    contours = ax.contour(loss_surface, levels=15, colors='white', alpha=0.5, origin='lower', extent=extent)
-    ax.clabel(contours, inline=True, fontsize=8, fmt='%.4f')
-
-    ax.plot(0, 0, 'r*', markersize=12, label=r'Empirical Min ($s^*$)')
-
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label(r'Photoclinometric Loss $\mathcal{L}$', rotation=270, labelpad=15)
-
-    # Inject the dynamic title suffix
-    ax.set_title(rf'Spherical Loss Contour on Tangent Plane $T_{{s^*}} S^2$ {title_suffix}')
-    ax.set_xlabel(r'Tangent Basis $u_1$')
-    ax.set_ylabel(r'Tangent Basis $u_2$')
-    ax.legend(loc='upper right')
-
-    plt.tight_layout()
-    # Save with the dynamic filename
-    save_fig(fig, output_dir / filename, dpi=300, bbox_inches='tight')
-    plt.close()
-
-import geoopt
-
 @torch.no_grad()
+def plot_spherical_loss_landscape(
+        loss_fn: nn.Module,
+        idx: int,
+        s_star: torch.Tensor, U: torch.Tensor,
+        dtm, img, mask, ambient, intensity,
+        output_dir: Path, filename: str,
+        title_suffix: str = "",
+        grid_size: int = 51, radius: float = 0.5, chunk_size: int = 64,
+        grad_R_norm: float | None = None,  # NEW
+        stationarity_ratio: float | None = None,  # NEW
+) -> None:
+    """Loss landscape on T_{s*} S^2. Now also annotates stationarity."""
+    was_training = loss_fn.training
+    loss_fn.eval()
+    try:
+        device = s_star.device
+
+        u_axis = torch.linspace(-radius, radius, grid_size, device=device)
+        U1, U2 = torch.meshgrid(u_axis, u_axis, indexing="xy")
+        xi = torch.stack([U1.flatten(), U2.flatten()], dim=1)
+        G = xi.shape[0]
+
+        s_base = s_star.expand(G, 3).contiguous()
+        U_b = U.expand(G, 3, 2).contiguous()
+        v = torch.einsum("bij,bj->bi", U_b, xi)
+        s_grid = sphere_expmap(s_base, v)
+
+        losses: list[torch.Tensor] = []
+        for i in range(0, G, chunk_size):
+            s_chunk = s_grid[i: i + chunk_size]
+            n = s_chunk.shape[0]
+            l = loss_fn(
+                dtm.expand(n, *dtm.shape[1:]).contiguous(),
+                img.expand(n, *img.shape[1:]).contiguous(),
+                mask.expand(n, *mask.shape[1:]).contiguous(),
+                s_chunk,
+                ambient.expand(n, *ambient.shape[1:]).contiguous(),
+                intensity.expand(n, *intensity.shape[1:]).contiguous(),
+                reduction="none",
+            )
+            losses.append(l.detach().cpu())
+        L_grid = torch.cat(losses).reshape(grid_size, grid_size).numpy()
+
+        fig, ax = plt.subplots(figsize=(8, 7))
+        u_np = u_axis.cpu().numpy()
+        pcm = ax.pcolormesh(u_np, u_np, L_grid, cmap="viridis", shading="auto")
+        cs = ax.contour(u_np, u_np, L_grid, levels=20, colors="white",
+                        alpha=0.6, linewidths=0.8)
+        ax.clabel(cs, inline=True, fontsize=8, fmt="%.4f")
+        ax.scatter([0], [0], marker="*", s=220, color="crimson",
+                   edgecolor="white", linewidth=1.5,
+                   label=r"Empirical Min ($s^*$)", zorder=5)
+        ax.set_xlabel(r"Tangent Basis $u_1$")
+        ax.set_ylabel(r"Tangent Basis $u_2$")
+        ax.set_title(rf"Spherical Loss Contour on Tangent Plane $T_{{s^*}}S^2$ {title_suffix}")
+        fig.colorbar(pcm, ax=ax, label=r"Photoclinometric Loss $\mathcal{L}$")
+
+        # Stationarity readout — flags unconverged inputs at a glance
+        if grad_R_norm is not None or stationarity_ratio is not None:
+            txt_lines = []
+            if grad_R_norm is not None:
+                txt_lines.append(rf"$\Vert\nabla_R\Vert = {grad_R_norm:.2e}$")
+            if stationarity_ratio is not None:
+                txt_lines.append(rf"$\Vert\nabla_R\Vert / \max|\lambda| = {stationarity_ratio:.2e}$")
+            ax.text(0.02, 0.02, "\n".join(txt_lines),
+                    transform=ax.transAxes, fontsize=9,
+                    bbox=dict(facecolor="white", alpha=0.85, edgecolor="0.5"),
+                    verticalalignment="bottom")
+
+        ax.legend(loc="upper right")
+        ax.grid(alpha=0.3)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        save_fig(fig, output_dir / filename, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    finally:
+        if was_training:
+            loss_fn.train()
+
+
+def riemannian_grad_norm(s: torch.Tensor, grad_E: torch.Tensor) -> torch.Tensor:
+    """Per-sample ‖proj_{T_s S^2}(∇_E)‖_2 → shape (B,).
+
+    For x on the unit sphere, the tangent projection is
+        ∇_R = ∇_E − ⟨∇_E, x⟩ x.
+    """
+    grad_R = grad_E - (grad_E * s).sum(dim=1, keepdim=True) * s
+    return grad_R.norm(dim=1)
+
+
+def sphere_expmap(s: torch.Tensor, v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Exponential map on S^2:  exp_s(v) = cos(‖v‖) s + sin(‖v‖) v / ‖v‖."""
+    theta = torch.linalg.norm(v, dim=-1, keepdim=True).clamp_min(eps)
+    return torch.cos(theta) * s + torch.sin(theta) * (v / theta)
+
+
+def tangent_basis(s: torch.Tensor) -> torch.Tensor:
+    """Orthonormal tangent basis U ∈ R^{B×3×2} at each s ∈ S^2.
+
+    Uses cross-products with a reference axis, switching the reference
+    when s is close to colinear with [1,0,0] to avoid degeneracy.
+    """
+    B = s.shape[0]
+    device = s.device
+
+    v_ref = torch.tensor([1.0, 0.0, 0.0], device=device).expand(B, 3)
+    collinear = (s * v_ref).sum(dim=1).abs() > 0.99
+    v_ref_alt = torch.tensor([0.0, 1.0, 0.0], device=device).expand(B, 3)
+    v_ref = torch.where(collinear.unsqueeze(1), v_ref_alt, v_ref)
+
+    u1 = F.normalize(torch.linalg.cross(s, v_ref, dim=1), p=2, dim=1, eps=1e-12)
+    u2 = F.normalize(torch.linalg.cross(s, u1, dim=1), p=2, dim=1, eps=1e-12)
+    return torch.stack([u1, u2], dim=2)
+
+
+# =============================================================================
+# 3. Convergence-driven Riemannian optimizer
+# =============================================================================
+def optimize_s_on_sphere(
+        loss_fn: nn.Module,
+        dtm: torch.Tensor,
+        img: torch.Tensor,
+        mask: torch.Tensor,
+        ambient: torch.Tensor,
+        intensity: torch.Tensor,
+        s_init: torch.Tensor,
+        *,
+        # Phase 1: coarse descent
+        coarse_lr: float = 0.1,
+        coarse_max_steps: int = 300,
+        coarse_grad_tol: float = 1e-3,
+        coarse_rel_grad_tol: float = 1e-2,
+        coarse_plateau_tol: float = 1e-7,
+        coarse_plateau_patience: int = 15,
+        # Phase 2: fine refinement
+        fine_lr: float = 1e-2,
+        fine_max_steps: int = 2000,
+        fine_grad_tol: float = 1e-6,
+        fine_loss_tol: float = 1e-10,
+        fine_patience: int = 25,
+        fine_lr_decay: float = 0.5,
+        fine_lr_decay_patience: int = 50,
+        fine_lr_min: float = 1e-6,
+        verbose: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Two-phase Riemannian minimization on S^2.
+
+    Phase 1: RiemannianAdam (lr=coarse_lr) — fast traversal to the basin.
+    Phase 2: RiemannianSGD (lr=fine_lr, no momentum) — precise descent to
+             a stationary point. Adam's momentum is intentionally dropped
+             here because it undermines the precision needed for valid
+             second-order analysis.
+
+    Termination is driven by the worst per-sample tangent gradient norm
+    across the batch, NOT by step count. The per-sample final ‖∇_R L‖
+    is returned so downstream code can gate eigenvalue classification.
+
+    Returns
+    -------
+    s_final : (B, 3) tensor on S^2 (detached).
+    final_grad_R : (B,) per-sample tangent gradient norms at s_final.
+    info : dict with `phase{1,2}_steps`, `phase{1,2}_exit`, and history.
+    """
+    s = geoopt.ManifoldParameter(
+        F.normalize(s_init, dim=1).clone(),
+        manifold=geoopt.Sphere(),
+    )
+
+    def closure_loss() -> torch.Tensor:
+        return loss_fn(dtm, img, mask, s, ambient, intensity).mean()
+
+    info: dict[str, Any] = {
+        "phase1_steps": 0, "phase2_steps": 0,
+        "phase1_exit": None, "phase2_exit": None,
+        "loss_history": [], "grad_history": [],
+    }
+
+    # ---- Phase 1 ----------------------------------------------------------
+    opt = geoopt.optim.RiemannianAdam([s], lr=coarse_lr)
+    init_grad: Optional[float] = None
+    plateau = 0
+    prev_loss: Optional[float] = None
+    p1_break = False
+
+    for step in range(coarse_max_steps):
+        opt.zero_grad()
+        loss = closure_loss()
+        loss.backward()
+        gn = riemannian_grad_norm(s.detach(), s.grad).max().item()
+
+        if init_grad is None:
+            init_grad = max(gn, 1e-12)
+
+        info["loss_history"].append(loss.item())
+        info["grad_history"].append(gn)
+
+        if gn < coarse_grad_tol:
+            info["phase1_exit"] = "abs_grad"
+            info["phase1_steps"] = step + 1
+            p1_break = True
+            break
+        if gn < coarse_rel_grad_tol * init_grad:
+            info["phase1_exit"] = "rel_grad"
+            info["phase1_steps"] = step + 1
+            p1_break = True
+            break
+        if prev_loss is not None and abs(prev_loss - loss.item()) < coarse_plateau_tol:
+            plateau += 1
+            if plateau >= coarse_plateau_patience:
+                info["phase1_exit"] = "loss_plateau"
+                info["phase1_steps"] = step + 1
+                p1_break = True
+                break
+        else:
+            plateau = 0
+        prev_loss = loss.item()
+
+        opt.step()
+
+    if not p1_break:
+        info["phase1_exit"] = "max_steps"
+        info["phase1_steps"] = coarse_max_steps
+
+    # ---- Phase 2 ----------------------------------------------------------
+    lr = fine_lr
+    opt = geoopt.optim.RiemannianSGD([s], lr=lr, momentum=0.0)
+    plateau = 0
+    lr_plateau = 0
+    prev_loss = None
+    best_loss = float("inf")
+    p2_break = False
+
+    for step in range(fine_max_steps):
+        opt.zero_grad()
+        loss = closure_loss()
+        loss.backward()
+        gn = riemannian_grad_norm(s.detach(), s.grad).max().item()
+
+        info["loss_history"].append(loss.item())
+        info["grad_history"].append(gn)
+
+        if gn < fine_grad_tol:
+            info["phase2_exit"] = "grad_converged"
+            info["phase2_steps"] = step + 1
+            p2_break = True
+            break
+
+        if prev_loss is not None:
+            dloss = abs(prev_loss - loss.item())
+            if dloss < fine_loss_tol:
+                plateau += 1
+                if plateau >= fine_patience:
+                    info["phase2_exit"] = "loss_plateau"
+                    info["phase2_steps"] = step + 1
+                    p2_break = True
+                    break
+            else:
+                plateau = 0
+
+            # Adaptive step shrinking when descent stalls
+            if loss.item() >= best_loss - fine_loss_tol:
+                lr_plateau += 1
+                if lr_plateau >= fine_lr_decay_patience and lr > fine_lr_min:
+                    lr = max(lr * fine_lr_decay, fine_lr_min)
+                    for g in opt.param_groups:
+                        g["lr"] = lr
+                    lr_plateau = 0
+                    if verbose:
+                        print(f"[refine] step={step} lr→{lr:.2e} gn={gn:.2e}")
+            else:
+                lr_plateau = 0
+
+        prev_loss = loss.item()
+        best_loss = min(best_loss, loss.item())
+
+        opt.step()
+
+    if not p2_break:
+        info["phase2_exit"] = "max_steps"
+        info["phase2_steps"] = fine_max_steps
+
+    # Final per-sample tangent gradient norms (used for stationarity gate)
+    opt.zero_grad()
+    closure_loss().backward()
+    final_grad_R = riemannian_grad_norm(s.detach(), s.grad).detach()
+
+    return s.detach(), final_grad_R, info
+
+
 def prove_and_visualize_local_convexity(
-        dataloader, loss_fn, output_dir: Path, num_batches: int = 200, opt_steps: int = 100
-):
-    device = next(loss_fn.parameters()).device if hasattr(loss_fn, 'parameters') else torch.device("cuda")
+        dataloader,
+        loss_fn: nn.Module,
+        output_dir: Path,
+        num_batches: int = 200,
+        stationarity_tol: float = 1e-2,
+        classification_tol_rel: float = 1e-4,
+        optimizer_kwargs: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Estimate local topology of the photoclinometric loss at the empirical
+    minimum on S^2 across a dataset.
+
+    Pipeline per batch
+    ------------------
+    1. Optimize sun vector to a stationary point on S^2 (convergence-driven).
+    2. Compute Euclidean gradient ∇_E and Hessian H_E via vmap+grad+hessian.
+    3. Build orthonormal tangent basis U at s*.
+    4. Riemannian Hessian: H_R = U^T H_E U − ⟨∇_E, s*⟩ I_2.
+    5. Eigendecompose H_R.
+    6. Stationarity gate:
+            ‖∇_R L(s*)‖ / max|λ(H_R)| < stationarity_tol
+       Samples failing the gate are reported as 'unconverged' and excluded
+       from topological statistics.
+    7. Tolerance-based topological classification (Index 0 / 1 / 2).
+
+    Parameters
+    ----------
+    stationarity_tol :
+        Maximum allowed ratio of ‖∇_R‖ to the dominant Hessian eigenvalue
+        for a sample to be classifiable. Default 1e-2 means the linear
+        term of the local Taylor expansion is at least 100× smaller than
+        the quadratic term.
+    classification_tol_rel :
+        Eigenvalue tolerance, relative to max|λ|, for distinguishing
+        positive/negative/zero curvature. Default 1e-4.
+    """
+    optimizer_kwargs = optimizer_kwargs or {}
+
+    device = (
+        next(loss_fn.parameters()).device
+        if any(True for _ in loss_fn.parameters())
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
     loss_fn.eval()
 
-    # Statistical aggregators
-    eigenvalues_min = []
-    eigenvalues_max = []
-    angular_shifts = []
+    # Vectorized first- and second-order operators over the batch
+    def sample_loss_fn(s_vec, d_i, img_i, m_i, amb_i, int_i):
+        return loss_fn(
+            d_i.unsqueeze(0), img_i.unsqueeze(0), m_i.unsqueeze(0),
+            s_vec.unsqueeze(0), amb_i.unsqueeze(0), int_i.unsqueeze(0),
+        ).mean()
 
-    all_grad_R_norms = []
-    all_align_azimuth = []
-    all_align_elevation = []
+    compute_batch_grad = vmap(grad(sample_loss_fn), in_dims=(0, 0, 0, 0, 0, 0))
+    compute_batch_hess = vmap(hessian(sample_loss_fn), in_dims=(0, 0, 0, 0, 0, 0))
 
-    rep_convex = None
-    rep_saddle = None
+    # Aggregators
+    eigenvalues_min: list[float] = []
+    eigenvalues_max: list[float] = []
+    angular_shifts: list[float] = []
+    stationarity_ratios: list[float] = []
+    unconverged_grad_norms: list[float] = []
 
-    for b_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Computing Eigenspectra")):
-        if b_idx >= num_batches: break
+    all_grad_R_norms: list[float] = []
+    all_align_azimuth: list[float] = []
+    all_align_elevation: list[float] = []
 
-        # 1. Extract and freeze standard inputs
+    rep_convex: Optional[dict[str, torch.Tensor]] = None
+    rep_saddle: Optional[dict[str, torch.Tensor]] = None
+
+    n_total = 0
+    n_unconverged = 0
+
+    for b_idx, batch in enumerate(tqdm(dataloader, total=num_batches,
+                                       desc="Computing Eigenspectra")):
+        if b_idx >= num_batches:
+            break
+
+        # 1. Inputs
         img = batch["image"].to(device).float().detach()
         dtm = batch["dtm"][:, :1].to(device).float().detach()
         mask = batch["confidence"].to(device).float().detach()
@@ -2029,193 +2262,168 @@ def prove_and_visualize_local_convexity(
 
         B = s_gt.shape[0]
 
-        s_gt_initial = torch.zeros_like(s_gt)
-        s_gt_initial[:, -1] = 1.0
+        # 2. Initialization at the upper-hemisphere pole, then convergence-driven optimization
+        s_init = torch.zeros_like(s_gt)
+        s_init[:, -1] = 1.0
+        s_init = F.normalize(s_init, p=2, dim=1)
 
-        # 2. Find True Empirical Minimum (s_true) via Riemannian Optimization
-        with torch.enable_grad():
-            eps = 1e-6
+        s_true, final_grad_R, opt_info = optimize_s_on_sphere(
+            loss_fn, dtm, img, mask, ambient, intensity, s_init,
+            **optimizer_kwargs,
+        )
 
-            # Clamp initial GT to upper hemisphere just to be safe
-            # s_init = torch.cat([s_gt_initial[:, :2], torch.clamp(s_gt_initial[:, 2:], min=eps)], dim=1)
-            s_init = s_gt_initial
-            s_init = F.normalize(s_init, p=2, dim=1)
-
-            # Wrap the tensor in a Geoopt Manifold Parameter
-            # This tells the optimizer that this parameter explicitly lives on the unit sphere
-            s_opt = geoopt.ManifoldParameter(s_init, manifold=geoopt.Sphere())
-
-            # Use Riemannian Adam. It natively handles geodesic steps and momentum transport.
-            optimizer = geoopt.optim.RiemannianAdam([s_opt], lr=0.1)
-
-            for _ in range(opt_steps):
-                optimizer.zero_grad()
-
-                # Because s_opt is a ManifoldParameter, it is GUARANTEED to be unit-norm here.
-                # We do not need to call F.normalize before the forward pass.
-                loss = loss_fn(dtm, img, mask, s_opt, ambient, intensity).mean()
-                loss.backward()
-
-                # The optimizer step computes the Riemannian gradient and steps along the curve
-                optimizer.step()
-
-                with torch.no_grad():
-                    # Apply the non-manifold constraint (Upper Hemisphere Z >= eps)
-                    # If Z drops below eps, clamp it, then ask geoopt to re-project it to the sphere
-                    if (s_opt.data[:, 2] < eps).any():
-                        s_opt.data[:, 2].clamp_(min=eps)
-                        s_opt.proj_()  # Geoopt's native spherical retraction
-
-            s_true = s_opt.detach()
-
-        # 3. Vectorized Computation of the Riemannian Hessian (Loop-Free)
-        # Define a single-sample closure for torch.func
-        def sample_loss_fn(s_vec, d_i, img_i, m_i, amb_i, int_i):
-            # Expand dims to simulate batch size of 1 for the loss function
-            l = loss_fn(
-                d_i.unsqueeze(0), img_i.unsqueeze(0), m_i.unsqueeze(0),
-                s_vec.unsqueeze(0), amb_i.unsqueeze(0), int_i.unsqueeze(0)
-            )
-            return l.mean()  # Strict scalar enforcement
-
-        # Vectorize the gradient and hessian operators across the batch dimension
-        compute_batch_grad = vmap(grad(sample_loss_fn), in_dims=(0, 0, 0, 0, 0, 0))
-        compute_batch_hess = vmap(hessian(sample_loss_fn), in_dims=(0, 0, 0, 0, 0, 0))
-
+        # 3. Euclidean gradient and Hessian at s*
         with torch.enable_grad():
             grad_E = compute_batch_grad(s_true, dtm, img, mask, ambient, intensity)  # (B, 3)
             H_E = compute_batch_hess(s_true, dtm, img, mask, ambient, intensity)  # (B, 3, 3)
 
-        # 4. Tangent Space Projection
-        # Dynamically assign reference vectors to avoid collinearity
-        v_ref = torch.tensor([1.0, 0.0, 0.0], device=device).expand(B, 3)
-        dot_products = torch.abs(torch.sum(s_true * v_ref, dim=1))
-        # Mask where s_true is too close to [1, 0, 0]
-        collinear_mask = (dot_products > 0.99).unsqueeze(1)
-        v_ref = torch.where(collinear_mask, torch.tensor([0.0, 1.0, 0.0], device=device).expand(B, 3), v_ref)
-
-        # Orthonormal basis U: (B, 3, 2)
-        u1 = F.normalize(torch.linalg.cross(s_true, v_ref), p=2, dim=1)
-        u2 = F.normalize(torch.linalg.cross(s_true, u1), p=2, dim=1)
-        U = torch.stack([u1, u2], dim=2)
-
-        # Compute radial gradient scalar: <∇g, s*> for each sample -> (B,)
-        radial_grad = torch.sum(grad_E * s_true, dim=1)
-
-        # H_R = U^T * H_E * U - <∇g, s*> * I_2
-        # Batched matrix multiplications
+        # 4. Tangent basis and Riemannian Hessian
+        U = tangent_basis(s_true)  # (B, 3, 2)
         U_T = U.transpose(1, 2)  # (B, 2, 3)
-        H_R_projected = torch.bmm(torch.bmm(U_T, H_E), U)  # (B, 2, 2)
-        I_2_batched = torch.eye(2, device=device).expand(B, 2, 2)  # (B, 2, 2)
-        radial_penalty = radial_grad.view(B, 1, 1) * I_2_batched  # (B, 2, 2)
+        H_E_proj = torch.bmm(torch.bmm(U_T, H_E), U)  # (B, 2, 2)
+        radial_grad = (grad_E * s_true).sum(dim=1)  # (B,)
+        I_2 = torch.eye(2, device=device).expand(B, 2, 2)
+        H_R = H_E_proj - radial_grad.view(B, 1, 1) * I_2  # (B, 2, 2)
 
-        H_R = H_R_projected - radial_penalty  # (B, 2, 2)
+        # 5. Eigendecomposition
+        eigvals = torch.linalg.eigvalsh(H_R)  # (B, 2) ascending
 
-        # 5. Eigenspectrum Decomposition
-        eigvals = torch.linalg.eigvalsh(H_R)  # Returns ascending order: (B, 2)
+        # 6. Validity & stationarity gate
+        finite_mask = (
+                ~torch.isnan(eigvals[:, 0]) & ~torch.isinf(eigvals[:, 0])
+                & ~torch.isnan(final_grad_R) & ~torch.isinf(final_grad_R)
+        )
+        hess_scale = eigvals.abs().max(dim=1).values.clamp(min=1e-12)
+        stationarity = final_grad_R / hess_scale  # (B,)
+        is_stationary = stationarity < stationarity_tol
 
-        # Filter out NaN/Inf values that may occur from masked/zero-loss samples
-        valid_mask_tensor = ~torch.isnan(eigvals[:, 0]) & ~torch.isinf(eigvals[:, 0])
+        valid_mask_tensor = finite_mask & is_stationary
+        unconv_mask = finite_mask & ~is_stationary
+
+        n_total += int(finite_mask.sum().item())
+        n_unconverged += int(unconv_mask.sum().item())
+
+        # 7. Aggregate
         eigenvalues_min.extend(eigvals[valid_mask_tensor, 0].cpu().tolist())
         eigenvalues_max.extend(eigvals[valid_mask_tensor, 1].cpu().tolist())
+        stationarity_ratios.extend(stationarity[finite_mask].cpu().tolist())
+        unconverged_grad_norms.extend(final_grad_R[unconv_mask].cpu().tolist())
 
-        # 6. Angular offset from GT
         cos_sim = torch.sum(s_true * s_gt, dim=1).clamp(-1.0, 1.0)
         shift_deg = torch.acos(cos_sim) * (180.0 / np.pi)
         angular_shifts.extend(shift_deg[valid_mask_tensor].cpu().tolist())
 
-        # 7. NEW: Compute Manifold Diagnostics
         diagnostics = compute_manifold_diagnostics(s_true, grad_E, H_R, U, valid_mask_tensor)
         all_grad_R_norms.extend(diagnostics["grad_R_norm"])
         all_align_azimuth.extend(diagnostics["align_azimuth"])
         all_align_elevation.extend(diagnostics["align_elevation"])
 
-        # ---------------------------------------------------------
-        # 8. GLOBAL CACHING: Capture the first saddle & convex point
-        # ---------------------------------------------------------
+        # 8. Cache representative convex / saddle points (stationary only!)
+        # Tolerance-based classification with per-sample scale
+        scale = eigvals[:, 1].abs().clamp_min(1e-8)
+        tol_per = classification_tol_rel * scale
+
         if rep_convex is None:
-            convex_mask = valid_mask_tensor & (eigvals[:, 0] > 0) & (eigvals[:, 1] > 0)
+            convex_mask = valid_mask_tensor & (eigvals[:, 0] > tol_per)
             if convex_mask.any():
-                idx = torch.where(convex_mask)[0][0]
-                # Slice and move to CPU to avoid VRAM leaks
+                idx_pick = torch.where(convex_mask)[0][0]
                 rep_convex = {
-                    "s_true": s_true[idx].cpu(),
-                    "U": U[idx].cpu(),
-                    "dtm": dtm[idx:idx + 1].cpu(),
-                    "img": img[idx:idx + 1].cpu(),
-                    "mask": mask[idx:idx + 1].cpu(),
-                    "ambient": ambient[idx:idx + 1].cpu(),
-                    "intensity": intensity[idx:idx + 1].cpu()
+                    "s_true": s_true[idx_pick].cpu(),
+                    "U": U[idx_pick].cpu(),
+                    "dtm": dtm[idx_pick: idx_pick + 1].cpu(),
+                    "img": img[idx_pick: idx_pick + 1].cpu(),
+                    "mask": mask[idx_pick: idx_pick + 1].cpu(),
+                    "ambient": ambient[idx_pick: idx_pick + 1].cpu(),
+                    "intensity": intensity[idx_pick: idx_pick + 1].cpu(),
                 }
 
         if rep_saddle is None:
-            saddle_mask = valid_mask_tensor & (eigvals[:, 0] < 0) & (eigvals[:, 1] > 0)
+            saddle_mask = (
+                    valid_mask_tensor
+                    & (eigvals[:, 0] < -tol_per)
+                    & (eigvals[:, 1] > tol_per)
+            )
             if saddle_mask.any():
-                print(b_idx)
-                idx = torch.where(saddle_mask)[0][0]
+                idx_pick = torch.where(saddle_mask)[0][0]
                 rep_saddle = {
-                    "s_true": s_true[idx].cpu(),
-                    "U": U[idx].cpu(),
-                    "dtm": dtm[idx:idx + 1].cpu(),
-                    "img": img[idx:idx + 1].cpu(),
-                    "mask": mask[idx:idx + 1].cpu(),
-                    "ambient": ambient[idx:idx + 1].cpu(),
-                    "intensity": intensity[idx:idx + 1].cpu()
+                    "s_true": s_true[idx_pick].cpu(),
+                    "U": U[idx_pick].cpu(),
+                    "dtm": dtm[idx_pick: idx_pick + 1].cpu(),
+                    "img": img[idx_pick: idx_pick + 1].cpu(),
+                    "mask": mask[idx_pick: idx_pick + 1].cpu(),
+                    "ambient": ambient[idx_pick: idx_pick + 1].cpu(),
+                    "intensity": intensity[idx_pick: idx_pick + 1].cpu(),
+                    "grad_R_norm": final_grad_R[idx_pick].item(),
+                    "stationarity": stationarity[idx_pick].item(),
                 }
 
-    # ---------------------------------------------------------
-    # Statistical Aggregation & Rigorous Validation
-    # ---------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Aggregation & validation
+    # ---------------------------------------------------------------------
     L_min = np.array(eigenvalues_min)
     L_max = np.array(eigenvalues_max)
     shifts = np.array(angular_shifts)
     grad_norms = np.array(all_grad_R_norms)
     azimuth_aligns = np.array(all_align_azimuth)
     elevation_aligns = np.array(all_align_elevation)
+    stat_ratios = np.array(stationarity_ratios)
 
-    # Diagnostic check for negative eigenvalues
+    print(f"\n--- Stationarity Diagnostic ---")
+    print(f"Total finite samples:                    {n_total}")
+    print(f"Unconverged (excluded from topology):    {n_unconverged}"
+          f"  ({100.0 * n_unconverged / max(n_total, 1):.2f}%)")
+    if len(stat_ratios) > 0:
+        print(f"Stationarity ratio  median:              {np.median(stat_ratios):.2e}")
+        print(f"Stationarity ratio  p99:                 {np.quantile(stat_ratios, 0.99):.2e}")
+    if n_unconverged > 0:
+        u_arr = np.array(unconverged_grad_norms)
+        print(f"Unconverged ‖∇_R‖   median:              {np.median(u_arr):.2e}")
+        print(f"Unconverged ‖∇_R‖   max:                 {np.max(u_arr):.2e}")
+
+    print(f"\n--- Topology Diagnostic (classifiable subset) ---")
+    print(f"Classifiable samples:                    {len(L_min)}")
     negative_lambdas = L_min[L_min < 0]
     if len(negative_lambdas) > 0:
-        print(f"\n--- Topology Diagnostic ---")
-        print(f"Total non-convex samples: {len(negative_lambdas)}")
-        print(f"Mean negative magnitude: {np.mean(negative_lambdas):.2e}")
-        print(f"Worst-case lambda_min: {np.min(negative_lambdas):.2e}")
-        print(f"Percentage < -1e-5 (True Saddles): {np.mean(negative_lambdas < -1e-5) * 100:.2f}%")
+        print(f"Non-convex samples among classifiable:   {len(negative_lambdas)}")
+        print(f"Mean negative magnitude:                 {np.mean(negative_lambdas):.2e}")
+        print(f"Worst-case lambda_min:                   {np.min(negative_lambdas):.2e}")
 
-    # Topological Categorization (Morse Index)
-    idx_convex = np.sum((L_min > 0) & (L_max > 0))
-    idx_saddle = np.sum((L_min <= 0) & (L_max > 0))
-    idx_concave = np.sum((L_min <= 0) & (L_max <= 0))
+    # Topological categorization
+    scale_glob = np.maximum(np.abs(L_max), 1e-8)
+    tol_glob = classification_tol_rel * scale_glob
+    idx_convex = int(np.sum((L_min > tol_glob) & (L_max > tol_glob)))
+    idx_saddle = int(np.sum((L_min < -tol_glob) & (L_max > tol_glob)))
+    idx_concave = int(np.sum((L_min < -tol_glob) & (L_max < -tol_glob)))
     total_valid = len(L_min)
 
-    # Non-parametric Bootstrap for Convexity Confidence Interval
-    np.random.seed(42)
-    n_bootstraps = 1000
-    bootstrapped_ratios = []
-    for _ in range(n_bootstraps):
-        resample = np.random.choice(L_min, size=total_valid, replace=True)
-        bootstrapped_ratios.append(np.mean(resample > 0) * 100)
+    # Bootstrap CI for convexity ratio
+    convex_mean: float = float("nan")
+    ci_lower: float = float("nan")
+    ci_upper: float = float("nan")
+    if total_valid > 0:
+        rng = np.random.default_rng(42)
+        bootstrapped_ratios = []
+        for _ in range(1000):
+            resample = rng.choice(L_min, size=total_valid, replace=True)
+            bootstrapped_ratios.append(np.mean(resample > 0) * 100)
+        convex_mean = float(np.mean(bootstrapped_ratios))
+        ci_lower = float(np.percentile(bootstrapped_ratios, 2.5))
+        ci_upper = float(np.percentile(bootstrapped_ratios, 97.5))
 
-    convex_mean = np.mean(bootstrapped_ratios)
-    ci_lower = np.percentile(bootstrapped_ratios, 2.5)
-    ci_upper = np.percentile(bootstrapped_ratios, 97.5)
-
-    # ---------------------------------------------------------
-    # Generate Contour Map from Last Batch
-    # ---------------------------------------------------------
-    # ---------------------------------------------------------
-    # Generate Contour Maps from Last Batch (Convex vs Saddle)
-    # ---------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Contour maps from cached representatives
+    # ---------------------------------------------------------------------
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if rep_convex is not None:
-        # Push back to GPU for fast grid evaluation
         rc = {k: v.to(device) for k, v in rep_convex.items()}
         plot_spherical_loss_landscape(
-            loss_fn, 0,  # Index is 0 because tensors are already sliced to size 1
+            loss_fn, 0,
             rc["s_true"].unsqueeze(0), rc["U"].unsqueeze(0),
             rc["dtm"], rc["img"], rc["mask"], rc["ambient"], rc["intensity"],
-            output_dir, filename='spherical_contour_convex.pdf', title_suffix="(Index 0: Local Minimum)"
+            output_dir, filename="spherical_contour_convex.pdf",
+            title_suffix="(Index 0: Local Minimum)",
         )
 
     if rep_saddle is not None:
@@ -2224,104 +2432,117 @@ def prove_and_visualize_local_convexity(
             loss_fn, 0,
             rs["s_true"].unsqueeze(0), rs["U"].unsqueeze(0),
             rs["dtm"], rs["img"], rs["mask"], rs["ambient"], rs["intensity"],
-            output_dir, filename='spherical_contour_saddle.pdf', title_suffix="(Index 1: Saddle Point)"
+            output_dir, filename="spherical_contour_saddle.pdf",
+            title_suffix="(Index 1: Saddle Point)",
+            grad_R_norm=rs["grad_R_norm"],
+            stationarity_ratio=rs["stationarity"],
         )
     else:
-        print("No saddle points detected across all batches evaluated.")
-    # ---------------------------------------------------------
-    # Publication-Grade Plotting
-    # ---------------------------------------------------------
+        print("No saddle points detected among classifiable samples.")
+
+    # ---------------------------------------------------------------------
+    # Summary figure
+    # ---------------------------------------------------------------------
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
     fig, axes = plt.subplots(2, 3, figsize=(24, 12))
 
-    # Plot A: ECDF of Eigenspectrum (Replaces deceptive KDE)
-    sns.ecdfplot(L_min, ax=axes[0, 0], color='blue', label=r'$\lambda_{min}(H_R)$', linewidth=2)
-    sns.ecdfplot(L_max, ax=axes[0, 0], color='red', label=r'$\lambda_{max}(H_R)$', linewidth=2, linestyle='--')
-    axes[0, 0].axvline(0, color='black', linestyle=':', linewidth=2)
-    axes[0, 0].set_title(r'Empirical CDF of Riemannian Eigenspectrum')
+    # A. Eigenspectrum CDF
+    if total_valid > 0:
+        sns.ecdfplot(L_min, ax=axes[0, 0], color="blue",
+                     label=r"$\lambda_{min}(H_R)$", linewidth=2)
+        sns.ecdfplot(L_max, ax=axes[0, 0], color="red",
+                     label=r"$\lambda_{max}(H_R)$", linewidth=2, linestyle="--")
+        axes[0, 0].axvline(0, color="black", linestyle=":", linewidth=2)
+        axes[0, 0].set_xlim([np.percentile(L_min, 1), np.percentile(L_max, 99)])
+        axes[0, 0].legend()
+    axes[0, 0].set_title(r"Empirical CDF of Riemannian Eigenspectrum")
     axes[0, 0].set_xlabel("Eigenvalue Magnitude")
     axes[0, 0].set_ylabel("Cumulative Probability")
-    axes[0, 0].set_xlim([np.percentile(L_min, 1), np.percentile(L_max, 99)])
-    axes[0, 0].legend()
 
-    # Plot B: Topological Basin Categorization
+    # B. Topology counts
     categories = [
-        'Strictly Convex\n(Index 0)',
-        'Saddle Point\n(Index 1)',
-        'Strictly Concave\n(Index 2)'
+        "Strictly Convex\n(Index 0)",
+        "Saddle Point\n(Index 1)",
+        "Strictly Concave\n(Index 2)",
     ]
-
     counts = [idx_convex, idx_saddle, idx_concave]
-
-    ax = sns.barplot(
-        x=categories,
-        y=counts,
-        hue=categories,
-        ax=axes[0, 1],
-        palette=['#2ecc71', '#f1c40f', '#e74c3c'],
-        legend=False
+    ax_b = sns.barplot(
+        x=categories, y=counts, hue=categories, ax=axes[0, 1],
+        palette=["#2ecc71", "#f1c40f", "#e74c3c"], legend=False,
     )
-
-    for container in ax.containers:
-        ax.bar_label(container, fontsize=10, padding=3)
-
-    axes[0, 1].set_title(rf'Local Topology at Empirical Minimum $\mathbf{{s}}^*$')
+    for container in ax_b.containers:
+        ax_b.bar_label(container, fontsize=10, padding=3)
+    axes[0, 1].set_title(r"Local Topology at Empirical Minimum $\mathbf{s}^*$")
     axes[0, 1].set_ylabel("Sample Count")
-    axes[0, 1].text(0, idx_convex * 0.5, rf'{convex_mean:.1f}%' '\n' rf'95% CI: [{ci_lower:.1f}, {ci_upper:.1f}]',
-                    ha='center', va='center', color='black', fontweight='bold',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+    if total_valid > 0:
+        axes[0, 1].text(
+            0, max(idx_convex, 1) * 0.5,
+            rf"{convex_mean:.1f}%" "\n" rf"95% CI: [{ci_lower:.1f}, {ci_upper:.1f}]",
+            ha="center", va="center", color="black", fontweight="bold",
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+        )
 
-    # Plot C: Logarithmic Basin Anisotropy (Strictly Convex Subsets Only)
+    # C. Convex-basin anisotropy
     convex_mask = L_min > 0
     if np.any(convex_mask):
         cond_numbers = L_max[convex_mask] / L_min[convex_mask]
-        log_cond = np.log10(cond_numbers + 1e-12)  # Log10 mapping
-        sns.histplot(log_cond, ax=axes[0, 2], bins=40, color='purple', kde=True)
-        axes[0, 2].set_title(r'Log-Anisotropy of Convex Basins ($\log_{10} \kappa$)')
-        axes[0, 2].set_xlabel(r'$\log_{10}(\lambda_{max} / \lambda_{min})$')
+        log_cond = np.log10(cond_numbers + 1e-12)
+        sns.histplot(log_cond, ax=axes[0, 2], bins=40, color="purple", kde=True)
+        axes[0, 2].set_title(r"Log-Anisotropy of Convex Basins ($\log_{10}\kappa$)")
+        axes[0, 2].set_xlabel(r"$\log_{10}(\lambda_{max}/\lambda_{min})$")
         axes[0, 2].set_ylabel("Count")
     else:
-        axes[0, 2].text(0.5, 0.5, "No strictly convex\nsamples detected.", ha='center', va='center')
+        axes[0, 2].text(0.5, 0.5, "No strictly convex\nsamples detected.",
+                        ha="center", va="center")
 
-    # Plot D: Empirical Angular Shift Distribution
-    sns.histplot(shifts, ax=axes[1, 2], bins=40, color='teal', kde=True)
-    axes[1, 2].set_title(r'Deviation: $\mathbf{s}_{gt}$ vs Empirical $\mathbf{s}^*$')
-    axes[1, 2].set_xlabel("Angular Shift (Degrees)")
-    axes[1, 2].set_ylabel("Count")
+    # D. Tangent gradient norms
+    if len(grad_norms) > 0:
+        sns.histplot(grad_norms, ax=axes[1, 0], bins=40, color="crimson", kde=True)
+        axes[1, 0].axvline(np.median(grad_norms), color="black", linestyle="--",
+                           label=f"Median: {np.median(grad_norms):.1e}")
+        axes[1, 0].legend()
+    axes[1, 0].set_title(r"Riemannian Gradient Norms $\Vert\nabla_R\mathcal{L}\Vert_2$")
+    axes[1, 0].set_xlabel(r"$\Vert U^T \nabla_E\mathcal{L}(s^*)\Vert_2$")
+    axes[1, 0].set_ylabel("Sample Count")
 
-    # Plot 5: NEW - Tangent Gradient Norms
-    sns.histplot(grad_norms, ax=axes[1, 0], bins=40, color='crimson', kde=True)
-    axes[1, 0].set_title(r'Riemannian Gradient Norms $\Vert \nabla_R \mathcal{L} \Vert_2$')
-    axes[1, 0].set_xlabel(r'$\Vert U^T \nabla_E \mathcal{L}(s^*) \Vert_2$')
-    axes[1, 0].set_ylabel('Sample Count')
-    axes[1, 0].axvline(np.median(grad_norms), color='black', linestyle='--',
-                       label=f'Median: {np.median(grad_norms):.1e}')
-    axes[1, 0].legend()
-
-    # Plot 6: NEW - Principal Curvature Alignment
-    sns.scatterplot(x=azimuth_aligns, y=elevation_aligns, ax=axes[1, 1], alpha=0.6, color='indigo')
-    axes[1, 1].plot([0, 1], [1, 0], 'k--', alpha=0.3)
-    axes[1, 1].set_title(r'Alignment of $u_{max}$ with Physical Axes')
-    axes[1, 1].set_xlabel(r'Azimuth Alignment $\vert \langle u_{max}, \hat{a} \rangle \vert$')
-    axes[1, 1].set_ylabel(r'Elevation Alignment $\vert \langle u_{max}, \hat{e} \rangle \vert$')
+    # E. Principal curvature alignment
+    if len(azimuth_aligns) > 0:
+        sns.scatterplot(x=azimuth_aligns, y=elevation_aligns,
+                        ax=axes[1, 1], alpha=0.6, color="indigo")
+        axes[1, 1].plot([0, 1], [1, 0], "k--", alpha=0.3)
+    axes[1, 1].set_title(r"Alignment of $u_{max}$ with Physical Axes")
+    axes[1, 1].set_xlabel(r"Azimuth Alignment $|\langle u_{max},\hat a\rangle|$")
+    axes[1, 1].set_ylabel(r"Elevation Alignment $|\langle u_{max},\hat e\rangle|$")
     axes[1, 1].set_xlim(0, 1.05)
     axes[1, 1].set_ylim(0, 1.05)
 
-    # Remove the unused subplots
-    # fig.delaxes(axes[1, 2])
-    # fig.delaxes(axes[1, 3])
+    # F. Angular shift between s_gt and s*
+    if len(shifts) > 0:
+        sns.histplot(shifts, ax=axes[1, 2], bins=40, color="teal", kde=True)
+    axes[1, 2].set_title(r"Deviation: $\mathbf{s}_{gt}$ vs Empirical $\mathbf{s}^*$")
+    axes[1, 2].set_xlabel("Angular Shift (Degrees)")
+    axes[1, 2].set_ylabel("Count")
 
     plt.tight_layout()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    save_fig(fig, output_dir / 'eigenspectrum_convexity_proof.pdf', dpi=300, bbox_inches='tight')
-    plt.close()
+    save_fig(fig, output_dir / "eigenspectrum_convexity_proof.pdf",
+             dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
     return {
-        "lambda_min_avg": np.mean(L_min),
+        "n_total": n_total,
+        "n_unconverged": n_unconverged,
+        "n_classifiable": total_valid,
+        "lambda_min_avg": float(np.mean(L_min)) if total_valid > 0 else float("nan"),
         "convex_ratio_mean": convex_mean,
         "convex_ratio_ci": (ci_lower, ci_upper),
-        "mean_angular_shift": np.mean(shifts),
-        "median_grad_R_norm": np.median(grad_norms)
+        "mean_angular_shift": float(np.mean(shifts)) if len(shifts) > 0 else float("nan"),
+        "median_grad_R_norm": float(np.median(grad_norms)) if len(grad_norms) > 0 else float("nan"),
+        "median_stationarity": float(np.median(stat_ratios)) if len(stat_ratios) > 0 else float("nan"),
+        "topology_counts": {
+            "convex": idx_convex,
+            "saddle": idx_saddle,
+            "concave": idx_concave,
+        },
     }
 
 
@@ -3948,12 +4169,12 @@ def main():
             if all_viz or args.view_lambert_ablation:
                 loss_fn = PhotoclinometricLoss().to("cuda")
 
-                # plot_global_umap_invariance(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
-                # plot_statistically_significant_landscape(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                plot_global_umap_invariance(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                plot_statistically_significant_landscape(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
                 prove_and_visualize_local_convexity(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
                 # plot_umap_invariance(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
-                # plot_component_ablation(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
-                # plot_qualitative_physics_errors(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                plot_component_ablation(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
+                plot_qualitative_physics_errors(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
                 # plot_radial_sun_sweep(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
 
             logger.info("Data inspection complete. Exiting without training.")
