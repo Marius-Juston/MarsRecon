@@ -17,8 +17,8 @@ if str(_SRC) not in sys.path:
 
 import torch
 
-from dataset.mars_hirise import MarsHiRISE
-from dataset.mars_hirise_base import _SPATIAL_TOL
+from dataset.core.rdr import MarsHiRISE
+from dataset.core.base import _SPATIAL_TOL
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ class TestFootprintIntersection:
     def test_sampled_centers_within_jp2_bounds(self, strip_polygon: Polygon, mars_crs):
         """Centers from HiRISEGeoSampler must lie inside the footprint geometry."""
         from helpers import make_mock_dataset
-        from dataset.hirise_sampler import HiRISEGeoSampler
+        from dataset.sampling.sampler import HiRISEGeoSampler
         from torchgeo.samplers import Units
 
         # Simulate the intersection: JP2 bbox is slightly inset from corners
@@ -175,7 +175,7 @@ class TestMarsHiRISEIntegration:
 
     @pytest.fixture(scope="class")
     def dataset(self):
-        from dataset.mars_hirise import MarsHiRISE
+        from dataset.core.rdr import MarsHiRISE
 
         return MarsHiRISE(
             bbox=self._BBOX,
@@ -235,7 +235,7 @@ class TestMarsHiRISEIntegration:
         """HiRISEGeoSampler must not trigger IndexError for sampled patches."""
         from torch.utils.data import DataLoader
 
-        from dataset.hirise_sampler import HiRISEGeoSampler
+        from dataset.sampling.sampler import HiRISEGeoSampler
         from torchgeo.samplers import Units
 
         sampler = HiRISEGeoSampler(dataset, size=0.005, length=20, units=Units.CRS)
@@ -259,8 +259,8 @@ class TestMarsHiRISEIntegration:
         """
         from torch.utils.data import DataLoader
 
-        from dataset.hirise_sampler import HiRISEGeoSampler
-        from dataset.mars_hirise import MarsHiRISE
+        from dataset.sampling.sampler import HiRISEGeoSampler
+        from dataset.core.rdr import MarsHiRISE
         from torchgeo.samplers import Units
 
         ds = MarsHiRISE(

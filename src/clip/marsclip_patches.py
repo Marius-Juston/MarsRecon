@@ -14,8 +14,8 @@ from shapely.geometry import box as shapely_box
 from torch.utils.data import Dataset
 from torchgeo.samplers import Units
 
-from dataset.hirise_sampler import HiRISEGeoSampler, _to_tuple
-from dataset.mars_hirise import ALL_CHANNELS, MarsHiRISE
+from dataset.sampling.sampler import HiRISEGeoSampler, _to_tuple
+from dataset.core.rdr import ALL_CHANNELS, MarsHiRISE
 from clip.marsclip_dataset import (
     GEO_FEATURE_NAMES,
     VIEWING_FEATURE_NAMES,

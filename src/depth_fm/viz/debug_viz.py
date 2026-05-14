@@ -1,3 +1,14 @@
+"""Training-side analysis and debugging visualizations.
+
+Imported wholesale by `depth_fm.training.train_lightning` via
+``from depth_fm.viz.debug_viz import *`` — it carries the heavy visualization
+and analysis code that used to live in `train_lightning.py`. Publication
+figures live in `train_viz.py`.
+
+[REFACTOR NOTE] 3382 LOC. Candidate for future split into multiple files
+(e.g. analysis/, residual_plots/, pareto/). Out of scope for the structural
+refactor that produced this layout.
+"""
 
 import argparse
 import concurrent.futures
@@ -15,8 +26,8 @@ import xgboost as xgb
 from matplotlib.figure import Figure
 from matplotlib.patches import ConnectionPatch
 
-from depth_fm.litdata_datamodule import _build_litdata_loaders
-from depth_fm.losses import PhotoclinometricLoss, AbsoluteDepthLoss, LaplacianLoss, \
+from depth_fm.data.datamodule import _build_litdata_loaders
+from depth_fm.objectives.losses import PhotoclinometricLoss, AbsoluteDepthLoss, LaplacianLoss, \
     OrdinalRankingLoss
 
 # ---------------------------------------------------------------------------
@@ -39,10 +50,10 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from depth_fm.depthfm_adapter import (
+from depth_fm.data.adapter import (
     DepthFMHiRISEAdapterCached, fill_voids_gmrf, estimate_sun_vector_irls, SeamResult, detect_seam_artifact)
-from depth_fm.lightning_module import DepthFMLightningModule, FasterEMAWeightAveraging
-from src.depth_fm.viz.train_viz import (
+from depth_fm.training.lightning_module import DepthFMLightningModule, FasterEMAWeightAveraging
+from depth_fm.viz.train_viz import (
     plot_convergence_curves,
     plot_metric_distributions,
     plot_multi_run_summary_table,
@@ -52,11 +63,11 @@ from src.depth_fm.viz.train_viz import (
 import matplotlib.gridspec as gridspec
 from scipy.spatial.transform import Rotation as R
 
-from depth_fm.depthfm_adapter import compute_topographic_residual
-from depth_fm.scalers import GlobalLogNormalizer, DEFAULT_ELEV_REF_SCALE
+from depth_fm.data.adapter import compute_topographic_residual
+from depth_fm.data.scalers import GlobalLogNormalizer, DEFAULT_ELEV_REF_SCALE
 import torch.distributed as dist
 import re
-from src.depth_fm.viz.train_viz import plot_timestep_ablation
+from depth_fm.viz.train_viz import plot_timestep_ablation
 import pandas as pd
 from tqdm import tqdm
 from torch.func import vmap, grad, hessian

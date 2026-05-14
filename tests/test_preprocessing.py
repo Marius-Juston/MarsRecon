@@ -26,7 +26,7 @@ _SRC = pathlib.Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from dataset.preprocessing import (
+from dataset.preprocessing.cog_conversion import (
     _available_memory_bytes,
     _is_corrupt_jp2_error,
     _safe_worker_count,

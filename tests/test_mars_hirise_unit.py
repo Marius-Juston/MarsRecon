@@ -35,10 +35,10 @@ import matplotlib
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
-from dataset.mars_hirise import MarsHiRISE
+from dataset.core.rdr import MarsHiRISE
 
 
-from dataset.mars_hirise_base import (ProductMeta,
+from dataset.core.base import (ProductMeta,
                                       corners_to_polygon,
                                       extract_footprint,
                                       filter_maker,
@@ -1590,7 +1590,7 @@ class TestDownloadImages:
 class TestLoadTileFilterNamesFallback:
     def test_no_lbl_uses_default_color_band_map(self, mock_dataset, tmp_path):
         """filter_names=[] on meta → _COLOR_BAND.copy() fallback (line 1318)."""
-        from dataset.mars_hirise import ProductMeta
+        from dataset.core.rdr import ProductMeta
 
         color_path = tmp_path / "test_COLOR.tif"
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 16, 16)
@@ -1637,9 +1637,9 @@ class TestLoadFromJp2BoundsException:
 class TestMain:
     def test_main_runs_without_error_with_all_mocked(self):
         """main() exercises lines 1747-1794 with all I/O mocked."""
-        from dataset import hirise_sampler
+        from dataset.sampling import sampler as hirise_sampler
         import torch.utils.data
-        from dataset.mars_hirise import main
+        from dataset.core.rdr import main
 
         mock_ds = MagicMock()
         mock_fig = MagicMock()

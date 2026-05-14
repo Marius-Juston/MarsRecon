@@ -34,7 +34,7 @@ import numpy as np
 import seaborn as sns
 import torch
 
-from depth_fm.losses import PhotoclinometricLoss
+from depth_fm.objectives.losses import PhotoclinometricLoss
 
 logger = logging.getLogger(__name__)
 
@@ -798,7 +798,7 @@ def plot_hillshade_comparison(
     """
     set_neurips_style()
 
-    from depth_fm.metrics import affine_align
+    from depth_fm.objectives.metrics import affine_align
     pred_aligned, _, _ = affine_align(pred_dtm, gt_dtm)
 
     # Fill NaN for gradient computation

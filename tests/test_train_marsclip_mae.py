@@ -952,7 +952,7 @@ def test_run_mae_training_logs_to_wandb_when_enabled(monkeypatch, tmp_path):
 
 @pytest.mark.integration
 def test_train_mae_steps_real_patch_smoke():
-    from dataset.mars_hirise import MarsHiRISE
+    from dataset.core.rdr import MarsHiRISE
     from clip.marsclip_patches import (
         MarsCLIPPatchDataset,
         build_patch_observation_metadata,
