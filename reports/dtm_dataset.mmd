@@ -1,0 +1,28 @@
+flowchart LR
+    Trigger([Triggered by:<br>_verify]) -.-> V1
+    
+    subgraph Indexing
+        V1{Index LBL/TAB<br>Exist?} -->|No| V2[_download_index]
+        V1 -->|Yes| V3[_load_index]
+        V2 --> V3
+        V3 --> V3a[Apply Text/Box<br>Filters] --> V4[_build_spatial_index]
+    end
+
+    subgraph Spatial Caching & Extraction
+        V4 --> V4a{Cache Exists?}
+        V4a -->|Yes| V4b[_try_load_cache]
+        V4a -->|No| V4c[Group by obs_id]
+        V4c --> V4d[Extract Footprints<br>via ThreadPool] --> V4f[Save to GeoPackage]
+    end
+
+    subgraph Download Routine
+        V4b --> V5{Download=True?}
+        V4f --> V5
+        V5 -->|Yes| V6a[Map Missing<br>JP2s/LBLs] --> V6b[Async Download<br>Pool]
+        V6b --> V6c{Success?}
+        V6c -->|Yes| V4c
+        V6c -->|No| V7[_post_download_verify]
+        V5 -->|No| V7
+    end
+
+    style Trigger fill:#e2e3e5,stroke:#6c757d,stroke-dasharray: 5 5
