@@ -76,7 +76,7 @@ docs = [
 ]
 
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=82.0.1"]
 build-backend = "setuptools.build_meta"
 
 [[tool.uv.index]]
