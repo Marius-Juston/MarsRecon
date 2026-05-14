@@ -55,7 +55,9 @@ data:
   random_flip: true
   brightness_jitter: 0.0
 
-  clip: true
+  clip: false
+
+  elev_ref_scale: 45.90752235993998  # GlobalLogNormalizer ref_scale — must match scalers.py DEFAULT_ELEV_REF_SCALE
 
   signal_boost: 1.0
 
