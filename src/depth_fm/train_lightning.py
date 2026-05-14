@@ -60,7 +60,7 @@ from lightning.pytorch.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
 )
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
@@ -273,6 +273,61 @@ def build_dataloaders(config, split_seed: int = 42, parallel: bool = True) -> di
 # ---------------------------------------------------------------------------
 
 
+def run_test_only(
+        config,
+        ckpt_path: str,
+        test_tag: str = "",
+        seed: int = 42,
+) -> dict:
+    """Load a checkpoint and run only the test loop.
+
+    Used by the ablation orchestrator to evaluate each variant from both the
+    `best-rmse` and `best-photo` checkpoints, tagging the per-patch output
+    files so downstream paired statistics can read both.
+    """
+    if config.training.get("num_gpus", 1) and "WORLD_SIZE" not in os.environ:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    L.seed_everything(seed, workers=True)
+
+    output_dir = Path(config.training.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    loaders = build_dataloaders(config, split_seed=seed, parallel=config.data.get("parallel_load", False))
+
+    module = DepthFMLightningModule(config)
+    module._test_tag = test_tag
+
+    _prec = config.training.mixed_precision
+    if _prec == "bf16":
+        precision = "bf16-mixed"
+    elif _prec in ("f16", "fp16"):
+        precision = "16-mixed"
+    else:
+        precision = "32-true"
+
+    using_litdata = loaders["train"].__class__.__name__ == "StreamingDataLoader"
+
+    csv_logger = CSVLogger(save_dir=str(output_dir), name=f"csv_test_{test_tag}" if test_tag else "csv_test")
+
+    trainer = L.Trainer(
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices="auto",
+        strategy="ddp" if config.training.num_gpus > 1 else "auto",
+        precision=precision,
+        logger=[csv_logger],
+        enable_progress_bar=True,
+        default_root_dir=str(output_dir),
+        use_distributed_sampler=not using_litdata,
+    )
+
+    logger.info("*** TEST-ONLY mode: loading %s (tag=%r) ***", ckpt_path, test_tag)
+    trainer.test(module, loaders["test"], ckpt_path=ckpt_path, weights_only=False)
+
+    return {"output_dir": output_dir, "test_tag": test_tag}
+
+
 def run_single_training(
         config,
         run_idx: int = 0,
@@ -403,8 +458,10 @@ def run_single_training(
             EarlyStopping(monitor="val/rmse_mean", patience=config.training.early_stopping_patience, mode="min")
         )
 
-    # Logger
-    wandb_logger = None
+    # Logger — W&B for dashboards plus a local CSV logger so the ablation
+    # orchestrator's watchdog has a network-independent source of intermediate
+    # metrics (val/rmse_mean, val/photo_consistency_mean).
+    trainer_loggers: list = []
     if config.training.logger == "wandb":
         wandb_logger = WandbLogger(
             project=config.training.project_name,
@@ -413,6 +470,9 @@ def run_single_training(
             group=config.training.run_name,
             tags=["mars", "depthfm", "flow-matching"],
         )
+        trainer_loggers.append(wandb_logger)
+    csv_logger = CSVLogger(save_dir=str(output_dir), name="csv")
+    trainer_loggers.append(csv_logger)
 
     # Precision
     _prec = config.training.mixed_precision
@@ -432,7 +492,7 @@ def run_single_training(
         strategy="ddp" if config.training.num_gpus > 1 else "auto",
         precision=precision,
         callbacks=callbacks,
-        logger=wandb_logger,
+        logger=trainer_loggers if trainer_loggers else False,
         val_check_interval=config.training.val_every_steps,
         log_every_n_steps=config.training.log_every_steps,
         gradient_clip_val=config.training.max_grad_norm,
@@ -792,6 +852,15 @@ def main():
     parser.add_argument("--view_extras", action="store_true")
     parser.add_argument("--view_lambert_ablation", action="store_true")
     parser.add_argument("--all_viz", action="store_true")
+    # Test-only mode for the ablation orchestrator: load a checkpoint, run
+    # the test loop, and write per-patch metrics tagged for downstream paired
+    # statistics. Skips training entirely.
+    parser.add_argument("--test_only", action="store_true",
+                        help="Skip training; run only the test loop on the given checkpoint")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Checkpoint path for --test_only mode (must be set when --test_only is used)")
+    parser.add_argument("--test_tag", type=str, default="",
+                        help="Suffix tag for test output files (e.g. 'rmse_ckpt', 'photo_ckpt')")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
@@ -884,6 +953,13 @@ def main():
                 # plot_radial_sun_sweep(loaders["train"], loss_fn=loss_fn, output_dir=output_path)
 
             logger.info("Data inspection complete. Exiting without training.")
+        return
+
+    # Test-only mode (ablation orchestrator)
+    if args.test_only:
+        if not args.ckpt:
+            raise ValueError("--test_only requires --ckpt <path>")
+        run_test_only(config, ckpt_path=args.ckpt, test_tag=args.test_tag, seed=args.seed)
         return
 
     # Training

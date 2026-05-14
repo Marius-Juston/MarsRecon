@@ -58,7 +58,10 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # Reduce memory fragmentation on large-VRAM cards (A6000 = 48 GB)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+# Respect an externally-set CUDA_VISIBLE_DEVICES (e.g. from the ablation
+# orchestrator pinning a 2-GPU lane); only default to all 4 when unset.
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3}"
+export CUDA_VISIBLE_DEVICES
 
 export TORCHINDUCTOR_CACHE_DIR="${HOME}/.cache/torch_compile"
 mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"

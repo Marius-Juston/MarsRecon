@@ -81,6 +81,7 @@ PERFORMANCE IMPACT (expected)
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import math
 import sys
@@ -411,6 +412,11 @@ class DepthFMLightningModule(L.LightningModule):
         # Metric aggregators (reset each epoch)
         self._val_aggregator = MetricsAggregator()
         self._test_aggregator = MetricsAggregator()
+
+        # Optional tag suffix for test-output files (used by the ablation
+        # orchestrator when running test twice — once per checkpoint type).
+        # Empty string → test_per_patch.npz / test_results.json (default).
+        self._test_tag: str = ""
 
         # Track validation history for convergence plotting
         self.val_history: dict[str, list[float]] = {
@@ -1517,6 +1523,48 @@ class DepthFMLightningModule(L.LightningModule):
     # Test step
     # ------------------------------------------------------------------
 
+    def _dump_per_patch_test_records(self) -> None:
+        """Write per-patch test metrics + summary to disk for paired statistics.
+
+        Each DDP rank writes a per-rank `.npz` so we avoid cross-rank gather
+        collectives during the noisy test-epoch-end window. The downstream
+        aggregator (scripts/run_ablation.py) concatenates these.
+        """
+        if not self._test_aggregator.records:
+            return
+
+        tag = getattr(self, "_test_tag", "") or ""
+        suffix = f"_{tag}" if tag else ""
+        rank = int(self.global_rank)
+
+        try:
+            output_dir = Path(self.config.training.output_dir)
+        except Exception:
+            output_dir = Path("outputs/_default")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        df = self._test_aggregator.per_sample_dataframe()
+        arrays: dict[str, np.ndarray] = {"tile_id": df["tile_id"].to_numpy(dtype=object)}
+        for col in df.columns:
+            if col == "tile_id":
+                continue
+            arrays[col] = df[col].to_numpy(dtype=np.float32)
+        arrays["rank"] = np.full(len(df), rank, dtype=np.int32)
+
+        npz_path = output_dir / f"test_per_patch{suffix}_rank{rank}.npz"
+        np.savez(npz_path, **arrays)
+        logger.info("Wrote per-patch test records (%d rows) to %s", len(df), npz_path)
+
+        # Rank-0 also writes a summary JSON next to the npz for convenience.
+        if self.global_rank == 0:
+            summary = self._test_aggregator.summary()
+            summary_path = output_dir / f"test_results{suffix}.json"
+            try:
+                summary_path.write_text(json.dumps(summary, indent=2))
+                logger.info("Wrote test summary to %s", summary_path)
+            except Exception:
+                logger.exception("Failed to write test summary JSON")
+
     def on_test_epoch_start(self) -> None:
         self._trace("Entered on_test_epoch_start")
         self._test_aggregator = MetricsAggregator()
@@ -1611,6 +1659,15 @@ class DepthFMLightningModule(L.LightningModule):
 
     def on_test_epoch_end(self) -> None:
         self._trace("Entered on_test_epoch_end")
+
+        # ── Persist per-patch test errors for downstream paired statistical
+        # tests (Wilcoxon, bootstrap CIs). Each rank writes its own file;
+        # the ablation aggregator concatenates per-rank files across ranks.
+        try:
+            self._dump_per_patch_test_records()
+        except Exception:
+            logger.exception("Failed to dump per-patch test records (continuing)")
+
         summary = self._test_aggregator.summary()
 
         _FIXED_TEST_METRICS = [

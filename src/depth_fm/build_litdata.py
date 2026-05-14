@@ -418,6 +418,13 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
             )
             npz_paths.append(npz_path)
 
+    # Explicitly shut down persistent DataLoader workers before they linger into
+    # Phase 2 (otherwise they pile up across splits and prevent process exit).
+    try:
+        if getattr(loader, "_iterator", None) is not None:
+            loader._iterator._shutdown_workers()
+    except Exception:
+        pass
     del loader, adapter, sampler, base_dataset
     logger.info(f"[{split}] Phase 1 complete: {len(npz_paths)} .npz files.")
 
@@ -503,5 +510,11 @@ if __name__ == "__main__":
             f'  ds = StreamingDataset(input_dir="hf://datasets/{final_repo_id}/train")\n'
         )
 
-    # Need to manually terminate the program to ensure that the system does not hang
-    sys.exit(0)
+    # Need to manually terminate the program to ensure that the system does not hang.
+    # LitData's optimize() and the persistent spawn-based DataLoader workers leave
+    # lingering child processes whose atexit handlers block a clean sys.exit. Force
+    # immediate termination — all success markers and manifests are already written.
+    import gc
+    gc.collect()
+    logging.shutdown()
+    os._exit(0)

@@ -1,0 +1,71 @@
+# Mars DepthFM — Loss Drop-One Ablation Study
+#
+# Declarative spec read by scripts/run_ablation.py. The orchestrator launches
+# every job here on a 2-lane scheduler (each lane = 2 GPUs of the 4-GPU box).
+#
+# Statistical design: each variant (baseline + 7 drop-ones) is run with the
+# same 3 seeds {42, 1042, 2042}. The same seed across variants gives a paired
+# comparison on data ordering and init — much lower variance than unpaired.
+
+study_name: loss_dropone_v1
+base_config: configs/train_hirise_large.yaml
+output_root: outputs/ablation
+project_name: mars-depthfm-ablation
+group: loss_dropone_v1
+
+# Seeds reused across every variant for paired comparison.
+seeds: [42, 1042, 2042]
+
+# Lanes: list of CUDA_VISIBLE_DEVICES strings. The orchestrator launches at
+# most len(lanes) jobs in parallel; each gets the corresponding lane.
+lanes:
+  - "0,1"
+  - "2,3"
+
+# Per-variant config overrides (OmegaConf dotlist form).
+# L0 is the baseline (no overrides).
+variants:
+  - id: L0
+    label: Baseline (all losses)
+    overrides: []
+  - id: L1
+    label: -velocity
+    overrides: ["training.losses.velocity_weight=0"]
+  - id: L2
+    label: -normals
+    overrides: ["training.losses.normals_weight=0"]
+  - id: L3
+    label: -grad
+    overrides: ["training.losses.grad_weight=0"]
+  - id: L4
+    label: -photo
+    overrides: ["training.losses.photo_weight=0"]
+  - id: L5
+    label: -huber
+    overrides: ["training.losses.huber_weight=0"]
+  - id: L6
+    label: -laplacian
+    overrides: ["training.losses.laplacian_weight=0"]
+  - id: L7
+    label: -ordinal
+    overrides: ["training.losses.ordinal_weight=0"]
+
+# Common overrides applied to every job (2 GPUs per lane).
+common_overrides:
+  - "training.num_gpus=2"
+
+# Crash-detection thresholds for the failure watchdog. NOT a performance
+# pruner — these only trigger on clear training failures (NaN, deadlock,
+# no-learning init). Variants that hurt one metric but help another keep
+# running to full budget.
+watchdog:
+  # Maximum wall-clock gap between successive val/* updates before declaring
+  # the run deadlocked (seconds). Set generously to absorb slow validation.
+  val_stall_timeout_seconds: 7200
+  # Fraction of max_steps after which val/rmse_mean must drop below this
+  # elevation-std threshold; else the run is marked diverged. The constant
+  # is calibrated to the dataset's elevation std (~m) — set to None to disable.
+  noskill_check_fraction: 0.20
+  noskill_rmse_threshold: null   # null disables; orchestrator falls back to "any val/rmse_mean improvement"
+  # Hard retry budget per job before marking failed permanently.
+  max_attempts: 3
