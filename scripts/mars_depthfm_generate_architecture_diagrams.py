@@ -1450,6 +1450,8 @@ def build_pipeline_overview(data: dict, paths: dict[str, Path],
     out_base.parent.mkdir(parents=True, exist_ok=True)
     dot.render(str(out_base), format="pdf", cleanup=True)
     dot.render(str(out_base), format="svg", cleanup=True)
+    dot.graph_attr['dpi'] = '600'
+    dot.render(str(out_base), format="png", cleanup=True)
 
 
 # ===========================================================================
@@ -1699,6 +1701,8 @@ def build_flow_and_losses(data: dict, paths: dict[str, Path],
     out_base.parent.mkdir(parents=True, exist_ok=True)
     dot.render(str(out_base), format="pdf", cleanup=True)
     dot.render(str(out_base), format="svg", cleanup=True)
+    dot.graph_attr['dpi'] = '600'
+    dot.render(str(out_base), format="png", cleanup=True)
 
 
 # ===========================================================================
@@ -1871,6 +1875,8 @@ def build_manifest_filter(data: dict, paths: dict[str, Path],
     out_base.parent.mkdir(parents=True, exist_ok=True)
     dot.render(str(out_base), format="pdf", cleanup=True)
     dot.render(str(out_base), format="svg", cleanup=True)
+    dot.graph_attr['dpi'] = '600'
+    dot.render(str(out_base), format="png", cleanup=True)
 
 
 def build_seam_detector_diagram(data: dict, paths: dict[str, Path],
@@ -2040,6 +2046,8 @@ def build_seam_detector_diagram(data: dict, paths: dict[str, Path],
     out_base.parent.mkdir(parents=True, exist_ok=True)
     dot.render(str(out_base), format="pdf", cleanup=True)
     dot.render(str(out_base), format="svg", cleanup=True)
+    dot.graph_attr['dpi'] = '600'
+    dot.render(str(out_base), format="png", cleanup=True)
 
 # ===========================================================================
 # MAIN
