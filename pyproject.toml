@@ -63,6 +63,17 @@ viz = [
     "cairosvg>=2.9.0",
     "graphviz>=0.21",
 ]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+    "mkdocs-gen-files>=0.5",
+    "mkdocs-literate-nav>=0.6",
+    "mkdocs-section-index>=0.3",
+    "mkdocs-mermaid2-plugin>=1.2",
+    "mkdocs-glightbox>=0.4",
+    "pymdown-extensions>=10.11",
+]
 
 [build-system]
 requires = ["setuptools>=64"]

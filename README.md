@@ -1,7 +1,11 @@
 # MarsRecon
 
+[![Docs](https://github.com/Marius-Juston/MarsRecon/actions/workflows/docs-deploy.yml/badge.svg)](https://marius-juston.github.io/MarsRecon/)
+
 A [TorchGeo](https://torchgeo.readthedocs.io/)-based PyTorch dataset for NASA HiRISE Mars imagery, designed for crater
 segmentation and other geospatial deep-learning tasks.
+
+📖 **Documentation:** <https://marius-juston.github.io/MarsRecon/>
 
 # ISSUES
 

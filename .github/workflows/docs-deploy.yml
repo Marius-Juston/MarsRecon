@@ -1,0 +1,78 @@
+name: docs-deploy
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - "src/**"
+      - "mkdocs.yml"
+      - "scripts/architecture/**"
+      - "README.md"
+      - "MarsHiRISE_Technical_Reference.md"
+      - "MarsHiRISE_DTM_Technical_Reference.md"
+      - "pyproject.toml"
+      - ".github/workflows/docs-deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (graphviz, GDAL)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz gdal-bin libgdal-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync docs dependencies
+        run: uv sync --extra docs
+
+      - name: Render Graphviz pipeline diagrams (best-effort)
+        continue-on-error: true
+        run: |
+          mkdir -p docs/diagrams
+          PYTHONPATH=src uv run --extra viz python scripts/architecture/depthfm_pipeline_diagram.py || true
+          PYTHONPATH=src uv run --extra viz python scripts/architecture/marsclip_diagram.py || true
+          find . -maxdepth 4 -type f -name "*.svg" \
+            -not -path "./.venv/*" -not -path "./site/*" -not -path "./docs/diagrams/*" \
+            -exec cp -v {} docs/diagrams/ \; || true
+
+      - name: Build docs
+        run: uv run mkdocs build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

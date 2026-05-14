@@ -1,0 +1,147 @@
+site_name: MarsRecon
+site_description: Mars HiRISE dataset manager and DepthFM training framework.
+site_url: https://marius-juston.github.io/MarsRecon/
+repo_url: https://github.com/Marius-Juston/MarsRecon
+repo_name: Marius-Juston/MarsRecon
+edit_uri: edit/master/docs/
+
+docs_dir: docs
+site_dir: site
+# strict: false (default) — many pre-existing docstrings produce non-fatal
+# griffe warnings; tighten this once docstring lint is addressed.
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.tracking
+    - navigation.instant
+    - navigation.instant.progress
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - search.suggest
+    - search.highlight
+    - search.share
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: deep orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/telescope
+
+plugins:
+  - search
+  - gen-files:
+      scripts:
+        - docs/gen_ref_pages.py
+  - literate-nav:
+      nav_file: SUMMARY.md
+  - section-index
+  - glightbox
+  - mermaid2
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_signature_annotations: true
+            separate_signature: true
+            merge_init_into_class: true
+            members_order: source
+            docstring_style: google
+            docstring_section_style: table
+            filters: ["!^_"]
+            heading_level: 2
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - def_list
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid_custom
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      check_paths: true
+      base_path: ["."]
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - toc:
+      permalink: true
+      toc_depth: 4
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Marius-Juston/MarsRecon
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - getting-started/index.md
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+      - Configuration: getting-started/configuration.md
+  - Architecture:
+      - architecture/index.md
+      - Overview: architecture/overview.md
+      - Dataset layer: architecture/dataset-layer.md
+      - Sampler: architecture/sampler.md
+      - DepthFM pipeline: architecture/depthfm-pipeline.md
+      - MarsCLIP: architecture/marsclip.md
+      - Coordinate system: architecture/coordinate-system.md
+  - Workflows:
+      - workflows/index.md
+      - Download & COG conversion: workflows/download-and-cog.md
+      - Build LitData chunks: workflows/build-litdata.md
+      - Training: workflows/training.md
+      - Inference: workflows/inference.md
+      - Ablations: workflows/ablations.md
+  - Technical notes:
+      - technical-notes/index.md
+      - HiRISE RDR reference: technical-notes/hirise-rdr-reference.md
+      - HiRISE DTM reference: technical-notes/hirise-dtm-reference.md
+      - Refactor notes: technical-notes/refactor-notes.md
+  - API reference: reference/
+  - Contributing:
+      - contributing/index.md
+      - Project conventions: contributing/project-conventions.md
+      - Testing: contributing/testing.md
