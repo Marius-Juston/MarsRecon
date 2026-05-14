@@ -1,6 +1,6 @@
 """Auto-generate API reference pages and a SUMMARY.md nav for the `src/` tree.
 
-Run automatically by the mkdocs-gen-files plugin during `mkdocs build`.
+Run automatically by the mkdocs-gen-files plugin during `properdocs build`.
 For each Python module under `src/`, emit a one-line stub that mkdocstrings
 expands into a full API page via griffe's static-analysis backend (no runtime
 import of optional heavy deps required).

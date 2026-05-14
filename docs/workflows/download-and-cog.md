@@ -39,7 +39,7 @@ PYTHONPATH=src uv run python -m dataset.core.dtm \
 ```
 
 !!! danger "Always pass a bbox or target"
-    The full DTM archive is >10 TB. Unfiltered downloads will exhaust disk before completing.
+The full DTM archive is >10 TB. Unfiltered downloads will exhaust disk before completing.
 
 ## Pre-convert to COG
 

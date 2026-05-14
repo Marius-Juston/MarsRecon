@@ -15,39 +15,39 @@ provides a flow-matching monocular depth pipeline (DepthFM) and a tri-modal CLIP
 
 <div class="grid cards" markdown>
 
--   :material-database-outline: **Dataset layer**
+- :material-database-outline: **Dataset layer**
 
-    ---
+  ---
 
-    TorchGeo `GeoDataset` wrappers for HiRISE RDR and DTM stereo pairs, with spatiotemporal
-    indexing, async PDS downloading, and radiometric calibration.
+  TorchGeo `GeoDataset` wrappers for HiRISE RDR and DTM stereo pairs, with spatiotemporal
+  indexing, async PDS downloading, and radiometric calibration.
 
-    [:octicons-arrow-right-24: Architecture](architecture/dataset-layer.md)
+  [:octicons-arrow-right-24: Architecture](architecture/dataset-layer.md)
 
--   :material-waveform: **DepthFM training**
+- :material-waveform: **DepthFM training**
 
-    ---
+  ---
 
-    Flow-matching monocular depth estimation adapted for Mars DTMs, on multi-GPU PyTorch
-    Lightning.
+  Flow-matching monocular depth estimation adapted for Mars DTMs, on multi-GPU PyTorch
+  Lightning.
 
-    [:octicons-arrow-right-24: DepthFM pipeline](architecture/depthfm-pipeline.md)
+  [:octicons-arrow-right-24: DepthFM pipeline](architecture/depthfm-pipeline.md)
 
--   :material-image-multiple-outline: **MarsCLIP**
+- :material-image-multiple-outline: **MarsCLIP**
 
-    ---
+  ---
 
-    Tri-modal CLIP (image + elevation + text) for Mars imagery, with MAE pretraining.
+  Tri-modal CLIP (image + elevation + text) for Mars imagery, with MAE pretraining.
 
-    [:octicons-arrow-right-24: MarsCLIP](architecture/marsclip.md)
+  [:octicons-arrow-right-24: MarsCLIP](architecture/marsclip.md)
 
--   :material-rocket-launch-outline: **Get started**
+- :material-rocket-launch-outline: **Get started**
 
-    ---
+  ---
 
-    Install, run the dataset pipeline, and launch a training job.
+  Install, run the dataset pipeline, and launch a training job.
 
-    [:octicons-arrow-right-24: Quickstart](getting-started/quickstart.md)
+  [:octicons-arrow-right-24: Quickstart](getting-started/quickstart.md)
 
 </div>
 

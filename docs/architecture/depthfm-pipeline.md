@@ -51,16 +51,16 @@ uv run python scripts/architecture/depthfm_pipeline_diagram.py
 
 ## Key files
 
-| Concern                       | File                                                |
-|-------------------------------|-----------------------------------------------------|
-| Training entry point          | `src/depth_fm/training/train_lightning.py`          |
-| Lightning loop / EMA / ckpt   | `src/depth_fm/training/lightning_module.py`         |
-| Model wrapper                 | `src/depth_fm/models/mars_depthfm.py`               |
-| Flow-matching noise schedule  | `src/depth_fm/flow/noise.py`                        |
-| Combined loss                 | `src/depth_fm/objectives/losses.py`                 |
-| Metrics (RMSE, AbsRel, photo) | `src/depth_fm/objectives/metrics.py`                |
-| Data adapter                  | `src/depth_fm/data/adapter.py`                      |
-| LitData streaming             | `src/depth_fm/data/datamodule.py`                   |
+| Concern                       | File                                        |
+|-------------------------------|---------------------------------------------|
+| Training entry point          | `src/depth_fm/training/train_lightning.py`  |
+| Lightning loop / EMA / ckpt   | `src/depth_fm/training/lightning_module.py` |
+| Model wrapper                 | `src/depth_fm/models/mars_depthfm.py`       |
+| Flow-matching noise schedule  | `src/depth_fm/flow/noise.py`                |
+| Combined loss                 | `src/depth_fm/objectives/losses.py`         |
+| Metrics (RMSE, AbsRel, photo) | `src/depth_fm/objectives/metrics.py`        |
+| Data adapter                  | `src/depth_fm/data/adapter.py`              |
+| LitData streaming             | `src/depth_fm/data/datamodule.py`           |
 
 ## Dual-checkpoint strategy
 

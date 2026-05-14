@@ -57,7 +57,7 @@ jobs:
       - name: Build docs
         # NOTE: --strict is currently disabled — pre-existing docstring formatting
         # produces non-fatal griffe warnings. Re-enable once those are cleaned up.
-        run: uv run mkdocs build
+        run: uv run properdocs build
 
       - name: Upload site artifact (PR preview)
         uses: actions/upload-artifact@v4

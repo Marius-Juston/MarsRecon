@@ -14,14 +14,14 @@
 Use the routing table from the [overview](../architecture/overview.md). A few of the most
 common entries:
 
-| Task                                  | File                                           |
-|---------------------------------------|------------------------------------------------|
-| Add a loss                            | `src/depth_fm/objectives/losses.py`            |
-| Add a metric                          | `src/depth_fm/objectives/metrics.py`           |
-| Change training loop                  | `src/depth_fm/training/lightning_module.py`    |
-| Change sampling / split logic         | `src/dataset/sampling/sampler.py`              |
-| Change PDS download / footprint       | `src/dataset/core/base.py`                     |
-| New publication figure                | `scripts/visualization/`                       |
+| Task                            | File                                        |
+|---------------------------------|---------------------------------------------|
+| Add a loss                      | `src/depth_fm/objectives/losses.py`         |
+| Add a metric                    | `src/depth_fm/objectives/metrics.py`        |
+| Change training loop            | `src/depth_fm/training/lightning_module.py` |
+| Change sampling / split logic   | `src/dataset/sampling/sampler.py`           |
+| Change PDS download / footprint | `src/dataset/core/base.py`                  |
+| New publication figure          | `scripts/visualization/`                    |
 
 ## Style
 

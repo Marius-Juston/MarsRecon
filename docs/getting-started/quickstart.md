@@ -18,8 +18,8 @@ PYTHONPATH=src uv run python -m dataset.core.dtm \
 ```
 
 !!! warning "Avoid unfiltered downloads"
-    The full HiRISE DTM archive is >10 TB. **Always pass `--bbox`** (or `--target` for a specific
-    observation) when downloading.
+The full HiRISE DTM archive is >10 TB. **Always pass `--bbox`** (or `--target` for a specific
+observation) when downloading.
 
 ## 2. Use the dataset from Python
 

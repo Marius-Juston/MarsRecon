@@ -11,9 +11,9 @@ uv run pytest tests/ --cov=src --cov-report=term-missing -n auto    # with cover
 
 ## Markers
 
-| Marker         | Meaning                                                                   |
-|----------------|---------------------------------------------------------------------------|
-| `integration`  | Requires real HiRISE data at `/scratch/mars_hirise`. Excluded by default. |
+| Marker        | Meaning                                                                   |
+|---------------|---------------------------------------------------------------------------|
+| `integration` | Requires real HiRISE data at `/scratch/mars_hirise`. Excluded by default. |
 
 ```bash
 uv run pytest tests/ -m integration                # run only integration tests

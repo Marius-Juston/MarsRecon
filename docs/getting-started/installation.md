@@ -29,13 +29,13 @@ uv sync --extra docs
 
 ## Optional dependency groups
 
-| Group        | What it adds                                                                   |
-|--------------|--------------------------------------------------------------------------------|
-| `dev`        | `pytest`, `pytest-cov`, `pytest-mock`, `pytest-asyncio`, `pytest-xdist`        |
-| `experiment` | `wandb`                                                                        |
+| Group        | What it adds                                                                  |
+|--------------|-------------------------------------------------------------------------------|
+| `dev`        | `pytest`, `pytest-cov`, `pytest-mock`, `pytest-asyncio`, `pytest-xdist`       |
+| `experiment` | `wandb`                                                                       |
 | `depthfm`    | Lightning, LitData, rasterio, transformers, diffusers, xgboost, scikit-image… |
-| `viz`        | `graphviz` (Python bindings), `cairosvg`                                       |
-| `docs`       | `mkdocs`, `mkdocs-material`, `mkdocstrings`, mermaid / lightbox plugins        |
+| `viz`        | `graphviz` (Python bindings), `cairosvg`                                      |
+| `docs`       | `properdocs`, `mkdocs-material`, `mkdocstrings`, mermaid / lightbox plugins   |
 
 You can combine groups: `uv sync --extra depthfm --extra dev --extra docs`.
 
@@ -45,9 +45,10 @@ You can combine groups: `uv sync --extra depthfm --extra dev --extra docs`.
 uv run pytest tests/ -m "not integration" -n auto
 ```
 
-For the documentation site:
+For the documentation site (built with [ProperDocs](https://properdocs.org/), a drop-in
+continuation of MkDocs 1.x):
 
 ```bash
-uv run mkdocs serve
+uv run properdocs serve
 # open http://127.0.0.1:8000
 ```
