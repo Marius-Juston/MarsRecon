@@ -248,8 +248,7 @@ class PhotoclinometricLoss(nn.Module):
         vc_squeezed = valid_counts.view(B)
         valid_batch = (vc_squeezed > min_pixels)
 
-        if not valid_batch.any():
-            return self._zero_loss(B, reduction)
+        # Removed: if not valid_batch.any(): ...
 
         r_masked = render * valid_mask
         o_masked = ortho * valid_mask
@@ -269,8 +268,7 @@ class PhotoclinometricLoss(nn.Module):
         has_variance = (var_r > min_var) & (var_o > min_var)
         final_valid = valid_batch & has_variance
 
-        if not final_valid.any():
-            return self._zero_loss(B, reduction)
+        # Removed: if not final_valid.any(): ...
 
         # eps INSIDE sqrt to prevent ∞ gradient at var→0
         denom = torch.sqrt(var_r * var_o + 1e-8)
@@ -279,14 +277,18 @@ class PhotoclinometricLoss(nn.Module):
         # Clamp correlation to [-1, 1] — floating point can exceed this
         correlation = correlation.clamp(-1.0, 1.0)
 
-        loss = 1.0 - correlation
+        # Calculate raw loss
+        raw_loss = 1.0 - correlation
+
+        # VECTORIZED ROUTING: If valid, use raw_loss. If invalid, use DDP-safe zero loss.
+        zero_fallback = self._zero_loss(B, reduction='none')
+        loss = torch.where(final_valid, raw_loss, zero_fallback)
 
         if reduction == 'none':
-            out = torch.zeros_like(loss)
-            out[final_valid] = loss[final_valid]
-            return out.clamp(0.0, 2.0)
+            return loss.clamp(0.0, 2.0)
         else:
-            return loss[final_valid].mean().clamp(0.0, 2.0)
+            # Safely compute the mean over only the valid items
+            return (loss.sum() / final_valid.float().sum().clamp(min=1.0)).clamp(0.0, 2.0)
 
     def _masked_ssim(
             self, render: torch.Tensor, ortho: torch.Tensor,
@@ -361,20 +363,23 @@ class PhotoclinometricLoss(nn.Module):
 
         # Calculate batched SSIM values
         valid_items = mask_eroded.view(B, -1).sum(dim=1) >= 10
-        if not valid_items.any():
-            return self._zero_loss(B, reduction)
+
+        # Removed: if not valid_items.any(): ...
 
         ssim_num = (ssim_map * mask_eroded).view(B, -1).sum(dim=1)
         ssim_den = mask_eroded.view(B, -1).sum(dim=1) + 1e-8
         ssim_val = ssim_num / ssim_den
-        loss = 1.0 - ssim_val
+
+        raw_loss = 1.0 - ssim_val
+
+        # VECTORIZED ROUTING
+        zero_fallback = self._zero_loss(B, reduction='none')
+        loss = torch.where(valid_items, raw_loss, zero_fallback)
 
         if reduction == 'none':
-            out = torch.zeros_like(loss)
-            out[valid_items] = loss[valid_items]
-            return out.clamp(0.0, 2.0)
+            return loss.clamp(0.0, 2.0)
         else:
-            return loss[valid_items].mean().clamp(0.0, 2.0)
+            return (loss.sum() / valid_items.float().sum().clamp(min=1.0)).clamp(0.0, 2.0)
 
     @staticmethod
     @lru_cache
@@ -402,9 +407,23 @@ class PhotoclinometricLoss(nn.Module):
         # ---- Force float32 for entire computation ----
         # bf16/fp16 WILL overflow: spatial_scale * sobel_grad can reach
         # 256 * depth_range, easily >65504 (fp16 max).
-        pred_depth = pred_depth.float()
+        # Force numerical stability defensively to avoid .isfinite() control flow
+        
+        # 1. Detect invalid pixels BEFORE altering them
+        valid_depth = torch.isfinite(pred_depth)
+
+        # 2. Safely zero them out so math doesn't propagate NaNs
+        pred_depth = torch.where(valid_depth, pred_depth, torch.zeros_like(pred_depth))
+
+        # 3. Erode the valid depth mask by 1 pixel (because a 3x3 Sobel 
+        #    kernel will contaminate 1 adjacent pixel in every direction)
+        valid_depth_eroded = F.avg_pool2d(valid_depth.float(), kernel_size=3, stride=1, padding=1)
+        valid_depth_eroded = (valid_depth_eroded > 0.99).float()
+
+        # 4. Update the global mask so the loss function ignores the contaminated zones
+        mask = mask.float() * valid_depth_eroded
+
         ortho_gray = ortho_gray.float()
-        mask = mask.float()
         sun_vectors = sun_vectors.float()
         ambient = ambient.float()
         intensity = intensity.float()
@@ -416,11 +435,9 @@ class PhotoclinometricLoss(nn.Module):
         valid_mask = mask
 
         # Check for degenerate inputs: NaN/Inf depth from VAE decoder
-        if not torch.isfinite(pred_depth).all():
-            logger.warning("PhotoclinometricLoss: non-finite pred_depth detected, returning zero loss")
-            return self._zero_loss(B, reduction)
+        # Removed: if not torch.isfinite(pred_depth).all(): ...
 
-        total_loss = self._zero_loss(B, reduction)
+        total_loss = self._zero_loss(B, reduction='none')
 
         for s in self.scales:
             if s > 1:
@@ -438,31 +455,37 @@ class PhotoclinometricLoss(nn.Module):
                 m_s = (valid_mask > 0.99).float()
 
             # Skip scale if mask is nearly empty (< 5% valid)
-            valid_ratio = m_s.sum() / max(m_s.numel(), 1)
-            if valid_ratio < 0.05:
-                continue
+            # VECTORIZED THRESHOLD: Do not use python `if`
+            valid_ratio = m_s.view(B, -1).mean(dim=1)
+            scale_is_valid = valid_ratio >= 0.05
 
             normals = self._get_surface_normals(d_s)
             render = self._lunar_lambert_render(normals, l_dir, intensity, ambient)
 
             # Pearson component (scale- and shift-invariant by construction)
-            pearson_loss = self._masked_pearson(render, o_s, m_s, B, reduction)
+            # Enforce 'none' reduction internally to maintain tensor shapes for torch.where
+            pearson_loss = self._masked_pearson(render, o_s, m_s, B, reduction='none')
 
             # SSIM component (on z-score normalised inputs)
-            ssim_loss = self._masked_ssim(render, o_s, m_s, window_size=7, reduction=reduction)
+            ssim_loss = self._masked_ssim(render, o_s, m_s, window_size=7, reduction='none')
 
             alpha = self.ssim_weight
             # Combined: (1-α)*Pearson + α*SSIM
             scale_loss = (1.0 - alpha) * pearson_loss + alpha * ssim_loss
+
+            # Apply the scale validity mask
+            zero_fallback = self._zero_loss(B, reduction='none')
+            scale_loss = torch.where(scale_is_valid, scale_loss, zero_fallback)
+
             total_loss = total_loss + scale_loss
 
         result = total_loss / len(self.scales)
 
-        # Final NaN guard: if anything slipped through, return zero
-        if not torch.isfinite(result).all():
-            logger.warning("PhotoclinometricLoss: non-finite loss detected, returning zero")
-            return self._zero_loss(B, reduction)
+        # Removed final .isfinite check, replacing with nan_to_num mapping
+        result = torch.nan_to_num(result, nan=0.0)
 
+        if reduction == 'mean':
+            return result.mean()
         return result
 
 
