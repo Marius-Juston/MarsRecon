@@ -32,9 +32,9 @@ per-observation CRSs.
 
 When using `HiRISEGeoSampler`, the `size` parameter is in CRS units:
 
-| `units`      | Interpretation                                |
-|--------------|-----------------------------------------------|
-| `Units.CRS`  | Size in degrees (geographic hub).             |
-| `Units.PIX`  | Size in pixels of the source raster.          |
+| `units`     | Interpretation                       |
+|-------------|--------------------------------------|
+| `Units.CRS` | Size in degrees (geographic hub).    |
+| `Units.PIX` | Size in pixels of the source raster. |
 
 A typical training patch uses `size=0.018` CRS units (~1 km at the equator).

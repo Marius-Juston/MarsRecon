@@ -6,12 +6,12 @@ Each of the files below carries an inline `[REFACTOR NOTE]` comment at the top s
 future split. They were left intact during the structural refactor — treat them as candidates
 **only when you're already touching them for an unrelated reason**.
 
-| File                                              | LOC  |
-|---------------------------------------------------|------|
-| `src/depth_fm/training/lightning_module.py`       | 1982 |
-| `src/depth_fm/objectives/losses.py`               | 1226 |
-| `src/depth_fm/viz/debug_viz.py`                   | 3382 |
-| `src/dataset/core/base.py`                        | 1369 |
+| File                                        | LOC  |
+|---------------------------------------------|------|
+| `src/depth_fm/training/lightning_module.py` | 1982 |
+| `src/depth_fm/objectives/losses.py`         | 1226 |
+| `src/depth_fm/viz/debug_viz.py`             | 3382 |
+| `src/dataset/core/base.py`                  | 1369 |
 
 Don't proactively split unless asked.
 
@@ -31,12 +31,12 @@ Files affected:
 
 Paths to update:
 
-| Old prefix                | New prefix                                |
-|---------------------------|-------------------------------------------|
-| `dataset.mars_hirise`     | `dataset.core.base`                       |
-| `dataset.cog_conversion`  | `dataset.preprocessing.cog_conversion`    |
-| `dataset.sampler`         | `dataset.sampling.sampler`                |
-| `depth_fm.lightning_module` | `depth_fm.training.lightning_module`    |
+| Old prefix                  | New prefix                             |
+|-----------------------------|----------------------------------------|
+| `dataset.mars_hirise`       | `dataset.core.base`                    |
+| `dataset.cog_conversion`    | `dataset.preprocessing.cog_conversion` |
+| `dataset.sampler`           | `dataset.sampling.sampler`             |
+| `depth_fm.lightning_module` | `depth_fm.training.lightning_module`   |
 
 The integration suite (`-m integration`) still requires real data at `/scratch/mars_hirise`.
 

@@ -1,6 +1,6 @@
 """Auto-generate API reference pages and a SUMMARY.md nav for the `src/` tree.
 
-Run automatically by the mkdocs-gen-files plugin during `mkdocs build`.
+Run automatically by the mkdocs-gen-files plugin during `properdocs build`.
 For each Python module under `src/`, emit a one-line stub that mkdocstrings
 expands into a full API page via griffe's static-analysis backend (no runtime
 import of optional heavy deps required).
@@ -18,6 +18,16 @@ SKIP_PARTS = {"__pycache__"}
 SKIP_PREFIXES = (
     "depth_fm/models/unet",  # vendored CompVis LDM — frozen upstream code
 )
+# Explicit module skips. These mirror the [tool.coverage.run].omit list in
+# pyproject.toml — heavy entry-point scripts whose docstrings reference
+# missing imports or external CLI usage and that griffe can fail to collect
+# in some environments.
+SKIP_MODULES = {
+    "dataset.validation.sampling_diagnostics",
+    "dataset.stats.compute_stats",
+    "dataset.stats.compute_stats_litdata",
+    "clip.build_marsclip_split_manifest",
+}
 
 nav = mkdocs_gen_files.Nav()
 
@@ -43,6 +53,8 @@ for path in sorted(SRC_ROOT.rglob("*.py")):
         doc_path = Path(*parts).with_suffix(".md")
 
     module_path = ".".join(parts)
+    if module_path in SKIP_MODULES:
+        continue
     full_doc_path = REF_ROOT / doc_path
 
     nav[tuple(parts)] = doc_path.as_posix()

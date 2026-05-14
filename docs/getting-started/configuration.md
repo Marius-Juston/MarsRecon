@@ -18,16 +18,16 @@ bash scripts/training/launch_train.sh \
 
 ## Major config sections
 
-| Section          | Purpose                                                                 |
-|------------------|-------------------------------------------------------------------------|
-| `data`           | Dataset roots, bbox, ortho type/scale, scaler choice (relative vs log) |
-| `sampling`       | Patch size, units, split method, split axis, k-fold parameters         |
-| `model`          | Backbone selection, UNet hyperparameters                               |
-| `flow`           | Flow-matching noise schedule                                           |
-| `losses`         | Weights for velocity / normals / gradient / photometric / ordinal      |
-| `training`       | Batch size, learning rate, max steps, EMA, checkpoint policy           |
-| `viz`            | Figure cadence, error-map style, debug plots                           |
-| `wandb`          | W&B project, run name, tags                                            |
+| Section    | Purpose                                                                |
+|------------|------------------------------------------------------------------------|
+| `data`     | Dataset roots, bbox, ortho type/scale, scaler choice (relative vs log) |
+| `sampling` | Patch size, units, split method, split axis, k-fold parameters         |
+| `model`    | Backbone selection, UNet hyperparameters                               |
+| `flow`     | Flow-matching noise schedule                                           |
+| `losses`   | Weights for velocity / normals / gradient / photometric / ordinal      |
+| `training` | Batch size, learning rate, max steps, EMA, checkpoint policy           |
+| `viz`      | Figure cadence, error-map style, debug plots                           |
+| `wandb`    | W&B project, run name, tags                                            |
 
 The complete schema is documented in the
 [API reference for `depth_fm.training.train_lightning`](../reference/depth_fm/training/train_lightning.md).

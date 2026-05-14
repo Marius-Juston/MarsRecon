@@ -49,13 +49,13 @@ classDiagram
 
 One row per stereo pair. Each row stores paths to:
 
-| Field             | Format             | Notes                                |
-|-------------------|--------------------|--------------------------------------|
-| `dtm_path`        | `.IMG` float32     | 1 DN = 1 m elevation; NaN = nodata   |
-| `left_red_path`   | JP2, 1 band        | RED orthoimage, calibrated I/F [0,1] |
-| `right_red_path`  | JP2, 1 band        | RED orthoimage, calibrated I/F [0,1] |
-| `left_irb_path`   | JP2, 3 bands       | NIR / RED / BG                       |
-| `right_irb_path`  | JP2, 3 bands       | NIR / RED / BG                       |
+| Field            | Format         | Notes                                |
+|------------------|----------------|--------------------------------------|
+| `dtm_path`       | `.IMG` float32 | 1 DN = 1 m elevation; NaN = nodata   |
+| `left_red_path`  | JP2, 1 band    | RED orthoimage, calibrated I/F [0,1] |
+| `right_red_path` | JP2, 1 band    | RED orthoimage, calibrated I/F [0,1] |
+| `left_irb_path`  | JP2, 3 bands   | NIR / RED / BG                       |
+| `right_irb_path` | JP2, 3 bands   | NIR / RED / BG                       |
 
 `__getitem__` returns a dict with keys `{"elevation", "left_red", "right_red", "left_irb",
 "right_irb", "bounds", "crs"}`. Elevation nodata is `NaN`; orthos are calibrated to I/F `[0, 1]`

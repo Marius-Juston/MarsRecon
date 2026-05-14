@@ -6,10 +6,10 @@ them at training time.
 
 ## Two builders
 
-| Script                                     | Output format                                                                  |
-|--------------------------------------------|--------------------------------------------------------------------------------|
-| `scripts/training/build_litdata.py`        | **Processed**: includes sun-vector estimates, topographic residuals, fills.    |
-| `scripts/training/build_litdata_raw.py`    | **Raw**: elevation + bounds + CRS only — for ablations / custom pipelines.    |
+| Script                                  | Output format                                                               |
+|-----------------------------------------|-----------------------------------------------------------------------------|
+| `scripts/training/build_litdata.py`     | **Processed**: includes sun-vector estimates, topographic residuals, fills. |
+| `scripts/training/build_litdata_raw.py` | **Raw**: elevation + bounds + CRS only — for ablations / custom pipelines.  |
 
 Both write to the directory specified by `data.litdata_root` in your config.
 

@@ -2,7 +2,7 @@ name: docs-deploy
 
 on:
   push:
-    branches: [master]
+    branches: [ master ]
     paths:
       - "docs/**"
       - "src/**"
@@ -59,7 +59,7 @@ jobs:
             -exec cp -v {} docs/diagrams/ \; || true
 
       - name: Build docs
-        run: uv run mkdocs build
+        run: uv run properdocs build
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

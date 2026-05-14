@@ -19,4 +19,4 @@ Outputs should end up here (paths referenced in `docs/architecture/*.md`):
 - `marsclip.svg`
 
 If the upstream scripts write to a different location, the `docs-ci.yml` workflow copies
-them into this directory before `mkdocs build`.
+them into this directory before `properdocs build`.
