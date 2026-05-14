@@ -901,7 +901,7 @@ class MarsHiRISEBase(GeoDataset):
             with lock:
                 done_count += 1
                 if done_count % 50 == 0 or done_count == n_with_files:
-                    logger.info(
+                    logger.debug(
                         "  footprint extraction: %d / %d", done_count, n_with_files
                     )
 
