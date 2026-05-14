@@ -32,14 +32,14 @@ import torch
 import torch.nn as nn
 
 _ROOT = pathlib.Path(__file__).parent.parent
-_SRC  = _ROOT / "src"
+_SRC = _ROOT / "src"
 _ORIG = _ROOT / "depth-fm"
 for _p in (_SRC, _ROOT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-CKPT_PATH    = str(_ROOT / "checkpoints" / "depthfm-v1.ckpt")
-CKPT_EXISTS  = pathlib.Path(CKPT_PATH).exists()
+CKPT_PATH = str(_ROOT / "checkpoints" / "depthfm-v1.ckpt")
+CKPT_EXISTS = pathlib.Path(CKPT_PATH).exists()
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 needs_gpu_and_ckpt = pytest.mark.integration
@@ -92,7 +92,7 @@ def _load_both_models(device="cuda:0"):
     sys.path.insert(0, str(_ORIG / "depthfm"))
     sys.path.insert(0, str(_ORIG))
     from depthfm import DepthFM
-    from depth_fm.model import MarsDepthFM, load_sd21_backend
+    from depth_fm.models.mars_depthfm import MarsDepthFM, load_sd21_backend
 
     orig = DepthFM(CKPT_PATH).to(device).eval()
 
@@ -100,7 +100,7 @@ def _load_both_models(device="cuda:0"):
         CKPT_PATH,
         "runwayml/stable-diffusion-v1-5",
         device=device,
-        use_checkpoint=False,   # must match original (use_checkpoint not in ldm_hparams)
+        use_checkpoint=False,  # must match original (use_checkpoint not in ldm_hparams)
     )
     ours = MarsDepthFM(backbone, vae, noising_step, empty_text_embed).to(device).eval()
     return orig, ours
@@ -115,7 +115,7 @@ def _synthetic_image(device="cuda:0", h=64, w=64):
 def _make_lightning_module(device="cuda:0"):
     """Build a DepthFMLightningModule on device with minimal config."""
     from omegaconf import OmegaConf
-    from depth_fm.lightning_module import DepthFMLightningModule
+    from depth_fm.training.lightning_module import DepthFMLightningModule
 
     cfg = OmegaConf.create({
         "model": {
@@ -124,7 +124,7 @@ def _make_lightning_module(device="cuda:0"):
             "vae_id": "runwayml/stable-diffusion-v1-5",
             "freeze_encoder": False,
             "gradient_checkpointing": False,
-            "use_checkpoint": False,    # match original for numerical correctness
+            "use_checkpoint": False,  # match original for numerical correctness
         },
         "training": {
             "losses": {
@@ -168,23 +168,23 @@ class TestQSample:
     """Verify our q_sample matches the original dfm.py implementation."""
 
     def test_output_shape_preserved(self):
-        from depth_fm.noise import q_sample
+        from depth_fm.flow.noise import q_sample
         x = torch.randn(2, 4, 8, 8)
         assert q_sample(x, t=400).shape == x.shape
 
     def test_output_dtype_preserved(self):
-        from depth_fm.noise import q_sample
+        from depth_fm.flow.noise import q_sample
         for dtype in (torch.float32, torch.float64):
             x = torch.randn(1, 4, 8, 8, dtype=dtype)
             assert q_sample(x, t=400).dtype == dtype
 
     def test_device_preserved(self):
-        from depth_fm.noise import q_sample
+        from depth_fm.flow.noise import q_sample
         x = torch.randn(1, 4, 8, 8)
         assert q_sample(x, t=400).device == x.device
 
     def test_deterministic_with_fixed_noise(self):
-        from depth_fm.noise import q_sample
+        from depth_fm.flow.noise import q_sample
         x = torch.randn(1, 4, 8, 8)
         noise = torch.randn_like(x)
         assert torch.allclose(q_sample(x, t=400, noise=noise),
@@ -192,13 +192,13 @@ class TestQSample:
 
     def test_alpha_bar_at_400(self):
         """cosine_alpha_bar(400/1000) ≈ 0.6545 — checkpoint's noising_step value."""
-        from depth_fm.noise import cosine_alpha_bar
+        from depth_fm.flow.noise import cosine_alpha_bar
         ab = cosine_alpha_bar(400 / 1000)
         assert abs(ab - 0.6545) < 1e-3, f"alpha_bar(0.4)={ab}"
 
     def test_matches_original_formula_exactly(self):
         """Bit-identical to the verbatim dfm.py copy."""
-        from depth_fm.noise import q_sample
+        from depth_fm.flow.noise import q_sample
         torch.manual_seed(7)
         x = torch.randn(2, 4, 16, 16)
         noise = torch.randn_like(x)
@@ -209,24 +209,24 @@ class TestQSample:
 
     @pytest.mark.parametrize("t", [100, 200, 400, 600, 999])
     def test_alpha_bar_decreases_with_t(self, t):
-        from depth_fm.noise import cosine_alpha_bar
+        from depth_fm.flow.noise import cosine_alpha_bar
         ab_prev = cosine_alpha_bar(max(t - 100, 1) / 1000)
         ab_curr = cosine_alpha_bar(t / 1000)
         assert ab_curr <= ab_prev, f"alpha_bar should decrease at t={t}"
 
     def test_noising_step_400_signal_to_noise(self):
         """At noising_step=400: signal≈80.7%, noise≈59%."""
-        from depth_fm.noise import cosine_alpha_bar
+        from depth_fm.flow.noise import cosine_alpha_bar
         ab = cosine_alpha_bar(400 / 1000)
-        assert 0.80 < math.sqrt(ab)      < 0.82
-        assert 0.57 < math.sqrt(1 - ab)  < 0.61
+        assert 0.80 < math.sqrt(ab) < 0.82
+        assert 0.57 < math.sqrt(1 - ab) < 0.61
 
     def test_t0_alpha_bar_near_one(self):
-        from depth_fm.noise import cosine_alpha_bar
+        from depth_fm.flow.noise import cosine_alpha_bar
         assert cosine_alpha_bar(0.0) > 0.999
 
     def test_noise_different_each_call_without_seed(self):
-        from depth_fm.noise import q_sample
+        from depth_fm.flow.noise import q_sample
         x = torch.randn(1, 4, 8, 8)
         out1 = q_sample(x, t=400)
         out2 = q_sample(x, t=400)
@@ -241,7 +241,7 @@ class TestPerSampleMinMax:
     """Verify our normalization matches the original dfm.py implementation."""
 
     def test_output_range_zero_one(self):
-        from depth_fm.noise import per_sample_min_max_normalization
+        from depth_fm.flow.noise import per_sample_min_max_normalization
         torch.manual_seed(1)
         x = torch.randn(4, 1, 16, 16)
         out = per_sample_min_max_normalization(x)
@@ -249,20 +249,20 @@ class TestPerSampleMinMax:
         assert out.max().item() <= 1.0 + 1e-6
 
     def test_output_shape_preserved(self):
-        from depth_fm.noise import per_sample_min_max_normalization
+        from depth_fm.flow.noise import per_sample_min_max_normalization
         x = torch.randn(3, 2, 8, 8)
         assert per_sample_min_max_normalization(x).shape == x.shape
 
     def test_each_sample_independent(self):
         """Each sample normalizes to [0,1] independently of the others."""
-        from depth_fm.noise import per_sample_min_max_normalization
+        from depth_fm.flow.noise import per_sample_min_max_normalization
         # Two samples with very different value ranges
         x = torch.cat([
             torch.full((1, 1, 4, 4), 100.0),
             torch.full((1, 1, 4, 4), 0.001),
         ])
-        x[0, 0, 0, 0] = 200.0   # max for sample 0
-        x[1, 0, 0, 0] = 0.002   # max for sample 1
+        x[0, 0, 0, 0] = 200.0  # max for sample 0
+        x[1, 0, 0, 0] = 0.002  # max for sample 1
         out = per_sample_min_max_normalization(x)
         for i in range(2):
             assert out[i].min().item() == pytest.approx(0.0, abs=1e-5)
@@ -270,7 +270,7 @@ class TestPerSampleMinMax:
 
     def test_matches_original_formula_exactly(self):
         """Bit-identical to the verbatim dfm.py copy."""
-        from depth_fm.noise import per_sample_min_max_normalization
+        from depth_fm.flow.noise import per_sample_min_max_normalization
         torch.manual_seed(3)
         x = torch.randn(4, 1, 8, 8)
         ours = per_sample_min_max_normalization(x)
@@ -279,12 +279,12 @@ class TestPerSampleMinMax:
             f"Max diff: {(ours - orig).abs().max():.2e}"
 
     def test_dtype_preserved(self):
-        from depth_fm.noise import per_sample_min_max_normalization
+        from depth_fm.flow.noise import per_sample_min_max_normalization
         x = torch.randn(2, 1, 8, 8, dtype=torch.float64)
         assert per_sample_min_max_normalization(x).dtype == torch.float64
 
     def test_minimum_is_zero_maximum_is_one(self):
-        from depth_fm.noise import per_sample_min_max_normalization
+        from depth_fm.flow.noise import per_sample_min_max_normalization
         torch.manual_seed(9)
         x = torch.randn(8, 1, 16, 16)
         out = per_sample_min_max_normalization(x)
@@ -303,10 +303,11 @@ class TestMarsDepthFMInterface:
     """MarsDepthFM must expose the same API as DepthFM (no checkpoint needed)."""
 
     def _make_tiny_model(self):
-        from depth_fm.model import MarsDepthFM
+        from depth_fm.models.mars_depthfm import MarsDepthFM
 
         class _StubVAEDist:
             def mode(self):   return torch.zeros(1, 4, 8, 8)
+
             def sample(self): return torch.zeros(1, 4, 8, 8)
 
         class _StubVAEPost:
@@ -320,6 +321,7 @@ class TestMarsDepthFMInterface:
                 post = _StubVAEPost()
                 post.latent_dist = _StubVAEDist()
                 return post
+
             def decode(self, z):
                 # Return spatially scaled, non-constant tensor so min≠max
                 B, _, lH, lW = z.shape
@@ -329,6 +331,7 @@ class TestMarsDepthFMInterface:
 
         class _StubBackbone(nn.Module):
             dtype = torch.float32
+
             def forward(self, x, t, context=None, context_ca=None, **kw):
                 return torch.zeros_like(x)
 
@@ -563,7 +566,7 @@ class TestLightningConsistency:
         Lightning _predict_depth (returns latent) decoded + post-processed
         must equal model.predict_depth (returns normalized depth), same seed.
         """
-        from depth_fm.noise import per_sample_min_max_normalization
+        from depth_fm.flow.noise import per_sample_min_max_normalization
         mod, image, z_img = setup
 
         torch.manual_seed(42)
@@ -635,7 +638,7 @@ class TestLightningConsistency:
         for step_i, ctx in enumerate(contexts):
             assert torch.allclose(ctx, z_img, atol=1e-6), \
                 f"Step {step_i}: context is not clean z_img " \
-                f"(max diff={( ctx - z_img).abs().max():.2e})"
+                f"(max diff={(ctx - z_img).abs().max():.2e})"
 
 
 # =============================================================================
@@ -658,7 +661,7 @@ class TestTrainingStepFlow:
         torch.manual_seed(5)
         return {
             "image": torch.randn(1, 3, 64, 64, device=device).clamp(-1, 1),
-            "dtm":   torch.randn(1, 3, 64, 64, device=device).clamp(-1, 1),
+            "dtm": torch.randn(1, 3, 64, 64, device=device).clamp(-1, 1),
         }
 
     def test_v_target_uses_q_sample_source(self, mod):
@@ -667,9 +670,9 @@ class TestTrainingStepFlow:
         Proof: v_target changes across seeds (stochastic q_sample) but the
         clean-only version z_depth − z_img is constant across seeds.
         """
-        from depth_fm.noise import q_sample
-        batch  = self._batch()
-        z_img  = mod.model.encode_to_latent(batch["image"])
+        from depth_fm.flow.noise import q_sample
+        batch = self._batch()
+        z_img = mod.model.encode_to_latent(batch["image"])
         z_depth = mod.model.encode_to_latent(batch["dtm"])
 
         torch.manual_seed(1)
@@ -677,9 +680,9 @@ class TestTrainingStepFlow:
         torch.manual_seed(2)
         xs2 = q_sample(z_img, mod.model.noising_step)
 
-        vt_1      = z_depth - xs1
-        vt_2      = z_depth - xs2
-        vt_clean  = z_depth - z_img
+        vt_1 = z_depth - xs1
+        vt_2 = z_depth - xs2
+        vt_clean = z_depth - z_img
 
         # Different seeds → different v_target (stochastic)
         assert not torch.allclose(vt_1, vt_2, atol=1e-3), \
@@ -693,8 +696,8 @@ class TestTrainingStepFlow:
         predict_velocity must receive the exact clean z_img as z_img_cond,
         not the noised x_source.
         """
-        batch  = self._batch()
-        z_img  = mod.model.encode_to_latent(batch["image"])
+        batch = self._batch()
+        z_img = mod.model.encode_to_latent(batch["image"])
 
         received_cond = []
         orig_pv = mod.model.predict_velocity
@@ -766,7 +769,7 @@ class TestConfigureOptimizersWarmup:
 
     def _make_minimal_module(self, warmup_steps: int = 100, max_steps: int = 1000):
         from omegaconf import OmegaConf
-        from depth_fm.lightning_module import DepthFMLightningModule
+        from depth_fm.training.lightning_module import DepthFMLightningModule
 
         cfg = OmegaConf.create({
             "model": {

@@ -22,7 +22,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from helpers import make_mock_dataset
-from dataset.hirise_sampler import HiRISEGeoSampler
+from dataset.sampling.sampler import HiRISEGeoSampler
 from torchgeo.samplers import Units
 
 
@@ -206,19 +206,19 @@ class TestToTuple:
     """_to_tuple normalises scalars and 2-tuples to (height, width)."""
 
     def test_integer_returns_symmetric_float_pair(self):
-        from dataset.hirise_sampler import _to_tuple
+        from dataset.sampling.sampler import _to_tuple
 
         result = _to_tuple(3)
         assert result == (3.0, 3.0)
 
     def test_float_returns_symmetric_float_pair(self):
-        from dataset.hirise_sampler import _to_tuple
+        from dataset.sampling.sampler import _to_tuple
 
         result = _to_tuple(0.005)
         assert result == pytest.approx((0.005, 0.005))
 
     def test_tuple_preserved_as_floats(self):
-        from dataset.hirise_sampler import _to_tuple
+        from dataset.sampling.sampler import _to_tuple
 
         result = _to_tuple((0.003, 0.007))
         assert result == pytest.approx((0.003, 0.007))
@@ -447,6 +447,7 @@ class TestReplacement:
             self, single_strip_dataset
     ):
         """torch.randint path: same seed → same sequence; different seeds differ."""
+
         def _run(seed: int):
             gen = torch.Generator()
             gen.manual_seed(seed)

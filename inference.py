@@ -61,7 +61,7 @@ def load_im(fp: str, processing_res: int = -1):
 # ---------------------------------------------------------------------------
 
 def load_model(ckpt_path: str, device: str):
-    from depth_fm.model import MarsDepthFM, load_sd21_backend
+    from depth_fm.models.mars_depthfm import MarsDepthFM, load_sd21_backend
 
     backbone, vae, noising_step, empty_text_embed = load_sd21_backend(
         depthfm_checkpoint=ckpt_path,

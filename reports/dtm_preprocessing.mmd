@@ -1,0 +1,27 @@
+flowchart LR
+    Trigger([Triggered by:<br>Batch Request]) -.-> R1
+    
+    subgraph Selection
+        R1(DataLoader) --> R2[Randomly Select<br>N Points] --> R3[Convert to<br>BBox Slices]
+        R3 --> R4[Dataset.__getitem__] --> R5[Query GeoDF<br>Spatial Index]
+    end
+
+    subgraph Disk Load
+        R5 --> R6{Match?}
+        R6 -->|No| R7[IndexError]
+        R6 -->|Yes| R8[Loop Observations]
+        R8 --> R9{Resolve File:<br>COLOR vs RED} --> R12[Load via<br>Rasterio]
+    end
+
+    subgraph Transform & Tensor
+        R12 --> R14[Reproject to<br>Mars CRS]
+        R14 --> R15[Radiometric<br>Calibration]
+        R15 --> R16[Clip & Mask<br>Nodata]
+        R16 --> R17[Stack Bands] --> R18[Merge Tiles<br>Mosaic]
+        R18 --> R19{Normalize?}
+        R19 -->|Yes| R20[Apply Z-Score] --> R22[TorchGeo<br>Transforms]
+        R19 -->|No| R22
+        R22 --> R23([Yield Sample Dict])
+    end
+
+    style Trigger fill:#e2e3e5,stroke:#6c757d,stroke-dasharray: 5 5

@@ -1000,7 +1000,7 @@ def test_patch_dataset_applies_transform(mars_crs):
 
 @pytest.mark.integration
 def test_real_patch_dataset_returns_stage_a_sample():
-    from dataset.mars_hirise import MarsHiRISE
+    from dataset.core.rdr import MarsHiRISE
 
     geo = MarsHiRISE(
         bbox=(-136.0, 12.0, -124.0, 24.0),

@@ -14,7 +14,7 @@ import torch
 from rasterio.enums import Resampling
 from torch.utils.data import Dataset
 
-from dataset.mars_hirise_base import ProductMeta
+from dataset.core.base import ProductMeta
 from clip.observation_manifest import build_observation_manifest
 from clip.rationale_cache import merge_rationale_cache
 

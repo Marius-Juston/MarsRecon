@@ -29,9 +29,11 @@ experiment = [
 ]
 depthfm = [
     "accelerate>=1.13.0",
+    "cuml-cu13>=26.4.0",
     "diffusers>=0.37.1",
     "einops>=0.8.2",
     "focal-frequency-loss>=0.3.0",
+    "geoopt>=0.5.1",
     "jsonargparse[signatures]>=4.47.0",
     "lightning>=2.6.1",
     "litdata>=0.2.61",
@@ -39,7 +41,7 @@ depthfm = [
     "numpy>=2.4.4",
     "omegaconf>=2.3.0",
     "opencv-python>=4.13.0.92",
-    "pandas>=3.0.1",
+    "pandas>=2.0.1",
     "pillow>=12.1.1",
     "pykrige>=1.7.3",
     "rasterio>=1.5.0",
@@ -53,12 +55,32 @@ depthfm = [
     "torchmetrics>=1.9.0",
     "tqdm>=4.67.3",
     "transformers>=5.5.0",
+    "umap-learn>=0.5.12",
     "wandb>=0.25.1",
+    "xgboost>=3.2.0",
 ]
 viz = [
     "cairosvg>=2.9.0",
     "graphviz>=0.21",
 ]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+    "mkdocs-gen-files>=0.5",
+    "mkdocs-literate-nav>=0.6",
+    "mkdocs-section-index>=0.3",
+    "mkdocs-mermaid2-plugin>=1.2",
+    "mkdocs-glightbox>=0.4",
+    "pymdown-extensions>=10.11",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[[tool.uv.index]]
+url = "https://pypi.nvidia.com/"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -70,9 +92,10 @@ markers = [
 [tool.coverage.run]
 source = ["src"]
 omit = [
-    "src/validate_sampling.py",
+    "src/dataset/validation/sampling_diagnostics.py",
     "src/build_marsclip_split_manifest.py",
-    "src/compute_dataset_stats.py",
+    "src/dataset/stats/compute_stats.py",
+    "src/dataset/stats/compute_stats_litdata.py",
 ]
 
 [tool.coverage.report]

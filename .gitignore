@@ -1,5 +1,5 @@
 # Data
-data/
+/data/
 *.LBL
 *.TAB
 *.JP2
@@ -27,6 +27,12 @@ log*/
 tests/compare*/
 analysis/
 plot.png
+
+# MkDocs build output
+site/
+docs/diagrams/*.svg
+docs/diagrams/*.pdf
+docs/diagrams/*.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

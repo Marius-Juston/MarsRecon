@@ -33,7 +33,7 @@ def _make_samples(num_samples: int = 4, image_size: int = 8) -> list[dict[str, o
         image[2, :, : image_size // 2] = 0.4
         valid_mask = torch.ones(image_size, image_size, dtype=torch.bool)
         if idx == num_samples - 1:
-            valid_mask[:, image_size // 2 :] = False
+            valid_mask[:, image_size // 2:] = False
         samples.append(
             {
                 "image": image,

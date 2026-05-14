@@ -1,6 +1,11 @@
 # MarsRecon
 
-A [TorchGeo](https://torchgeo.readthedocs.io/)-based PyTorch dataset for NASA HiRISE Mars imagery, designed for crater segmentation and other geospatial deep-learning tasks.
+[![Docs](https://github.com/Marius-Juston/MarsRecon/actions/workflows/docs-deploy.yml/badge.svg)](https://marius-juston.github.io/MarsRecon/)
+
+A [TorchGeo](https://torchgeo.readthedocs.io/)-based PyTorch dataset for NASA HiRISE Mars imagery, designed for crater
+segmentation and other geospatial deep-learning tasks.
+
+📖 **Documentation:** <https://marius-juston.github.io/MarsRecon/>
 
 # ISSUES
 
@@ -8,14 +13,21 @@ A [TorchGeo](https://torchgeo.readthedocs.io/)-based PyTorch dataset for NASA Hi
 
 ## Overview
 
-HiRISE (High Resolution Imaging Science Experiment) aboard the Mars Reconnaissance Orbiter produces the highest-resolution images of Mars available (~25 cm/pixel RED, ~50 cm/pixel colour). This library wraps the HiRISE RDR (Reduced Data Records) hosted on the NASA PDS Imaging Node as a `GeoDataset` compatible with TorchGeo's samplers and data loaders.
+HiRISE (High Resolution Imaging Science Experiment) aboard the Mars Reconnaissance Orbiter produces the
+highest-resolution images of Mars available (~25 cm/pixel RED, ~50 cm/pixel colour). This library wraps the HiRISE RDR (
+Reduced Data Records) hosted on the NASA PDS Imaging Node as a `GeoDataset` compatible with TorchGeo's samplers and data
+loaders.
 
 **Key features:**
 
-- Strip-aware sampling — `HiRISEGeoSampler` pre-grids valid patch centres within actual HiRISE strip polygons, avoiding 60–90% of empty-pixel patches that result from bounding-box sampling.
-- Automatic radiometric calibration — `I/F = DN × SCALING_FACTOR + OFFSET`, clipped to `[0, 1]`, using per-product `.LBL` files.
-- Spatial index with polygon footprints — convex hull of non-zero pixels intersected with each JP2's reprojected bounds for accurate footprints.
-- COG-ready — `src/dataset/preprocessing.py` converts JP2 files to Cloud Optimised GeoTIFF for 10–100× faster random-access reads.
+- Strip-aware sampling — `HiRISEGeoSampler` pre-grids valid patch centres within actual HiRISE strip polygons, avoiding
+  60–90% of empty-pixel patches that result from bounding-box sampling.
+- Automatic radiometric calibration — `I/F = DN × SCALING_FACTOR + OFFSET`, clipped to `[0, 1]`, using per-product
+  `.LBL` files.
+- Spatial index with polygon footprints — convex hull of non-zero pixels intersected with each JP2's reprojected bounds
+  for accurate footprints.
+- COG-ready — `src/dataset/preprocessing.py` converts JP2 files to Cloud Optimised GeoTIFF for 10–100× faster
+  random-access reads.
 - Geographic train/test split — longitude- or latitude-blocked splits prevent spatial leakage.
 
 ## Requirements
@@ -32,7 +44,8 @@ uv sync           # installs main + dev dependencies from pyproject.toml
 
 ## Data
 
-HiRISE RDR products are served from the NASA PDS Imaging Node. The dataset expects files mirroring the PDS hierarchy under `root` (default `/scratch/mars_hirise`):
+HiRISE RDR products are served from the NASA PDS Imaging Node. The dataset expects files mirroring the PDS hierarchy
+under `root` (default `/scratch/mars_hirise`):
 
 ```
 <root>/
@@ -99,7 +112,9 @@ sampler = HiRISEGeoSampler(
 )
 ```
 
-At construction, it pre-computes a regular grid of candidate centres for each strip polygon and keeps only those whose corresponding patch intersects the polygon (not just its bounding box). Iteration draws uniformly from this set — O(1) per sample.
+At construction, it pre-computes a regular grid of candidate centres for each strip polygon and keeps only those whose
+corresponding patch intersects the polygon (not just its bounding box). Iteration draws uniformly from this set — O(1)
+per sample.
 
 ## Dataset statisitics
 
@@ -127,7 +142,7 @@ To have even faster dataset throughput you can convert the information for the l
 PYTHONPATH=src uv run -m src.depth_fm.build_litdata
 ```
 
-The sun view is probably doing to be wrong due to the GPU vs CPU computation, this can be validated using 
+The sun view is probably doing to be wrong due to the GPU vs CPU computation, this can be validated using
 
 ```bash
 bash scripts/launch_train.sh configs/train_hirise.yaml 1 4 --view_loss_physics 
@@ -170,7 +185,7 @@ All three library modules are at **100% line coverage** across 274 unit tests:
 | Test file                  | Tests | What it covers                                                                                  |
 |----------------------------|-------|-------------------------------------------------------------------------------------------------|
 | `test_mars_hirise_unit.py` | 100   | `MarsHiRISE` — dataset init, spatial index, tile loading, plotting, download pipeline, `main()` |
-| `test_preprocessing.py`    | 73    | All of `src/dataset/preprocessing.py` — JP2→COG conversion, geographic split, CLI                       |
+| `test_preprocessing.py`    | 73    | All of `src/dataset/preprocessing.py` — JP2→COG conversion, geographic split, CLI               |
 | `test_download.py`         | 22    | Async download helpers, retry logic, disk-space guard, stop-event handling                      |
 | `test_sampler.py`          | 23    | `HiRISEGeoSampler` grid pre-computation, stride, pixel units, reproducibility                   |
 | `test_coordinates.py`      | 16    | Longitude normalisation and CRS helpers                                                         |
@@ -212,22 +227,27 @@ The file uses **synthetic data only** — no real HiRISE files are required.
 
 ### CRS design
 
-The dataset CRS is the Mars IAU 2000 geographic CRS (`+proj=longlat +a=3396190 +b=3376200`). Each HiRISE JP2 has its own per-observation Equirectangular projection; rasterio reprojects into the common geographic CRS at load time. `self.res` is a scalar float in degrees/pixel (`1.0 / 118_502.26` ≈ 8.44 × 10⁻⁶ °/px at HiRISE native resolution).
+The dataset CRS is the Mars IAU 2000 geographic CRS (`+proj=longlat +a=3396190 +b=3376200`). Each HiRISE JP2 has its own
+per-observation Equirectangular projection; rasterio reprojects into the common geographic CRS at load time. `self.res`
+is a scalar float in degrees/pixel (`1.0 / 118_502.26` ≈ 8.44 × 10⁻⁶ °/px at HiRISE native resolution).
 
 ### Spatial index
 
-Built once at dataset construction and cached as a GeoPackage (`spatial_cache{suffix}_v3.gpkg`; suffix encodes any `target`/`bbox` filters). For each observation the geometry is determined in priority order:
+Built once at dataset construction and cached as a GeoPackage (`spatial_cache{suffix}_v3.gpkg`; suffix encodes any
+`target`/`bbox` filters). For each observation the geometry is determined in priority order:
 
 1. **Case A** — convex hull of non-zero pixels extracted from the JP2 (most accurate)
 2. **Case B** — JP2 bounding box when the hull has too few non-zero pixels
 3. **Case C** — cumulative index min/max bbox when no JP2 file is available
 4. **Case D** — corner-coordinate polygon from the PDS index as a last resort
 
-A `_SPATIAL_TOL = 1e-5°` tolerance absorbs floating-point rounding between the index geometry and rasterio's recomputed bounds at load time.
+A `_SPATIAL_TOL = 1e-5°` tolerance absorbs floating-point rounding between the index geometry and rasterio's recomputed
+bounds at load time.
 
 ## Additional Vizualiation
 
 To generate the full `marsrise_dataset.mmd` MarsHiRISE dataset architecture flow diagram as,
+
 ```bash
 npm install -g @mermaid-js/mermaid-cli
 mmdc -i reports/marsrise_dataset.mmd -o architecture.pdf -b transparent -f

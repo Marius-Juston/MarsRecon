@@ -402,7 +402,7 @@ def test_scale_encoding_requires_even_dimension():
 
 @pytest.mark.integration
 def test_mae_real_patch_batch_forward_backward_smoke():
-    from dataset.mars_hirise import MarsHiRISE
+    from dataset.core.rdr import MarsHiRISE
     from clip.marsclip_patches import (
         MarsCLIPPatchDataset,
         build_patch_observation_metadata,
