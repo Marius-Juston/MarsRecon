@@ -43,6 +43,7 @@ import yaml
 from matplotlib.colors import TwoSlopeNorm
 from omegaconf import OmegaConf
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from matplotlib.ticker import FormatStrFormatter
 
 # Allow `python scripts/...` from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -114,9 +115,9 @@ def _plot_panel(scenes: list[dict], out_path: Path, dtm_unit: str = "") -> None:
     n_rows = len(scenes)
     fig, axes = plt.subplots(
         n_rows, 7,
-        # Slightly wider figsize and increased wspace to accommodate the floating colorbars
+        # Bumped width to 15.0 and wspace to 0.35 to give the text breathing room
         figsize=(13.0, 1.95 * n_rows),
-        gridspec_kw={"wspace": 0.15, "hspace": 0.18}, 
+        gridspec_kw={"wspace": 0.05, "hspace": 0.10}, 
     )
     if n_rows == 1:
         axes = axes[None, :]
@@ -179,15 +180,17 @@ def _plot_panel(scenes: list[dict], out_path: Path, dtm_unit: str = "") -> None:
 
         # --- THE FIX: Per-row colourbars using inset_axes ---
         # Anchors the colorbar 4% to the right of the axis bounding box
-        cax_gt = inset_axes(axes[i, 2], width="6%", height="100%", loc='lower left',
-                            bbox_to_anchor=(1.04, 0., 1, 1), bbox_transform=axes[i, 2].transAxes, borderpad=0)
-        cbar_gt = fig.colorbar(im_gt, cax=cax_gt)
-        cbar_gt.ax.tick_params(labelsize=6, length=0)
+        # --- Per-row colourbars using inset_axes ---
+        # cax_gt = inset_axes(axes[i, 2], width="6%", height="100%", loc='lower left',
+        #                     bbox_to_anchor=(1.06, 0., 1, 1), bbox_transform=axes[i, 2].transAxes, borderpad=0)
+        # Added format string to keep labels predictably short
+        # cbar_gt = fig.colorbar(im_gt, cax=cax_gt, format=FormatStrFormatter('%.2f'))
+        # cbar_gt.ax.tick_params(labelsize=6, length=0)
 
-        cax_err = inset_axes(axes[i, 3], width="6%", height="100%", loc='lower left',
-                             bbox_to_anchor=(1.04, 0., 1, 1), bbox_transform=axes[i, 3].transAxes, borderpad=0)
-        cbar_err = fig.colorbar(im_err, cax=cax_err)
-        cbar_err.ax.tick_params(labelsize=6, length=0)
+        # cax_err = inset_axes(axes[i, 3], width="6%", height="100%", loc='lower left',
+        #                      bbox_to_anchor=(1.06, 0., 1, 1), bbox_transform=axes[i, 3].transAxes, borderpad=0)
+        # cbar_err = fig.colorbar(im_err, cax=cax_err, format=FormatStrFormatter('%.2f'))
+        # cbar_err.ax.tick_params(labelsize=6, length=0)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
