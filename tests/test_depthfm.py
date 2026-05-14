@@ -32,14 +32,14 @@ import torch
 import torch.nn as nn
 
 _ROOT = pathlib.Path(__file__).parent.parent
-_SRC  = _ROOT / "src"
+_SRC = _ROOT / "src"
 _ORIG = _ROOT / "depth-fm"
 for _p in (_SRC, _ROOT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-CKPT_PATH    = str(_ROOT / "checkpoints" / "depthfm-v1.ckpt")
-CKPT_EXISTS  = pathlib.Path(CKPT_PATH).exists()
+CKPT_PATH = str(_ROOT / "checkpoints" / "depthfm-v1.ckpt")
+CKPT_EXISTS = pathlib.Path(CKPT_PATH).exists()
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 needs_gpu_and_ckpt = pytest.mark.integration
@@ -100,7 +100,7 @@ def _load_both_models(device="cuda:0"):
         CKPT_PATH,
         "runwayml/stable-diffusion-v1-5",
         device=device,
-        use_checkpoint=False,   # must match original (use_checkpoint not in ldm_hparams)
+        use_checkpoint=False,  # must match original (use_checkpoint not in ldm_hparams)
     )
     ours = MarsDepthFM(backbone, vae, noising_step, empty_text_embed).to(device).eval()
     return orig, ours
@@ -124,7 +124,7 @@ def _make_lightning_module(device="cuda:0"):
             "vae_id": "runwayml/stable-diffusion-v1-5",
             "freeze_encoder": False,
             "gradient_checkpointing": False,
-            "use_checkpoint": False,    # match original for numerical correctness
+            "use_checkpoint": False,  # match original for numerical correctness
         },
         "training": {
             "losses": {
@@ -218,8 +218,8 @@ class TestQSample:
         """At noising_step=400: signal≈80.7%, noise≈59%."""
         from depth_fm.flow.noise import cosine_alpha_bar
         ab = cosine_alpha_bar(400 / 1000)
-        assert 0.80 < math.sqrt(ab)      < 0.82
-        assert 0.57 < math.sqrt(1 - ab)  < 0.61
+        assert 0.80 < math.sqrt(ab) < 0.82
+        assert 0.57 < math.sqrt(1 - ab) < 0.61
 
     def test_t0_alpha_bar_near_one(self):
         from depth_fm.flow.noise import cosine_alpha_bar
@@ -261,8 +261,8 @@ class TestPerSampleMinMax:
             torch.full((1, 1, 4, 4), 100.0),
             torch.full((1, 1, 4, 4), 0.001),
         ])
-        x[0, 0, 0, 0] = 200.0   # max for sample 0
-        x[1, 0, 0, 0] = 0.002   # max for sample 1
+        x[0, 0, 0, 0] = 200.0  # max for sample 0
+        x[1, 0, 0, 0] = 0.002  # max for sample 1
         out = per_sample_min_max_normalization(x)
         for i in range(2):
             assert out[i].min().item() == pytest.approx(0.0, abs=1e-5)
@@ -307,6 +307,7 @@ class TestMarsDepthFMInterface:
 
         class _StubVAEDist:
             def mode(self):   return torch.zeros(1, 4, 8, 8)
+
             def sample(self): return torch.zeros(1, 4, 8, 8)
 
         class _StubVAEPost:
@@ -320,6 +321,7 @@ class TestMarsDepthFMInterface:
                 post = _StubVAEPost()
                 post.latent_dist = _StubVAEDist()
                 return post
+
             def decode(self, z):
                 # Return spatially scaled, non-constant tensor so min≠max
                 B, _, lH, lW = z.shape
@@ -329,6 +331,7 @@ class TestMarsDepthFMInterface:
 
         class _StubBackbone(nn.Module):
             dtype = torch.float32
+
             def forward(self, x, t, context=None, context_ca=None, **kw):
                 return torch.zeros_like(x)
 
@@ -635,7 +638,7 @@ class TestLightningConsistency:
         for step_i, ctx in enumerate(contexts):
             assert torch.allclose(ctx, z_img, atol=1e-6), \
                 f"Step {step_i}: context is not clean z_img " \
-                f"(max diff={( ctx - z_img).abs().max():.2e})"
+                f"(max diff={(ctx - z_img).abs().max():.2e})"
 
 
 # =============================================================================
@@ -658,7 +661,7 @@ class TestTrainingStepFlow:
         torch.manual_seed(5)
         return {
             "image": torch.randn(1, 3, 64, 64, device=device).clamp(-1, 1),
-            "dtm":   torch.randn(1, 3, 64, 64, device=device).clamp(-1, 1),
+            "dtm": torch.randn(1, 3, 64, 64, device=device).clamp(-1, 1),
         }
 
     def test_v_target_uses_q_sample_source(self, mod):
@@ -668,8 +671,8 @@ class TestTrainingStepFlow:
         clean-only version z_depth − z_img is constant across seeds.
         """
         from depth_fm.flow.noise import q_sample
-        batch  = self._batch()
-        z_img  = mod.model.encode_to_latent(batch["image"])
+        batch = self._batch()
+        z_img = mod.model.encode_to_latent(batch["image"])
         z_depth = mod.model.encode_to_latent(batch["dtm"])
 
         torch.manual_seed(1)
@@ -677,9 +680,9 @@ class TestTrainingStepFlow:
         torch.manual_seed(2)
         xs2 = q_sample(z_img, mod.model.noising_step)
 
-        vt_1      = z_depth - xs1
-        vt_2      = z_depth - xs2
-        vt_clean  = z_depth - z_img
+        vt_1 = z_depth - xs1
+        vt_2 = z_depth - xs2
+        vt_clean = z_depth - z_img
 
         # Different seeds → different v_target (stochastic)
         assert not torch.allclose(vt_1, vt_2, atol=1e-3), \
@@ -693,8 +696,8 @@ class TestTrainingStepFlow:
         predict_velocity must receive the exact clean z_img as z_img_cond,
         not the noised x_source.
         """
-        batch  = self._batch()
-        z_img  = mod.model.encode_to_latent(batch["image"])
+        batch = self._batch()
+        z_img = mod.model.encode_to_latent(batch["image"])
 
         received_cond = []
         orig_pv = mod.model.predict_velocity

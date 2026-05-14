@@ -14,8 +14,8 @@ Internal modules are organized into subpackages:
 """
 
 from dataset.core.base import MarsHiRISEBase, ProductMeta, MARS_PROJECTED_CRS
-from dataset.core.rdr import MarsHiRISE
 from dataset.core.dtm import MarsHiRISEDTM
+from dataset.core.rdr import MarsHiRISE
 from dataset.sampling.sampler import HiRISEGeoSampler
 
 __all__ = [

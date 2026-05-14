@@ -41,10 +41,8 @@ from pathlib import Path
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import seaborn as sns
-from accelerate.commands.config import default
 
 logger = logging.getLogger("make_training_figures")
 
@@ -152,9 +150,9 @@ def plot_convergence_curves(
     palette = sns.color_palette("flare", 3)
 
     panels = [
-        ("val/rmse_mean", "Held-out RMSE",                "RMSE (norm.)",     "↓"),
-        ("val/photo_consistency_mean", "Photo-consistency", "SSIM",            "↑"),
-        ("val/delta_1_mean", r"$\delta_1$",               r"$\delta_1$ (\%)", "↑"),
+        ("val/rmse_mean", "Held-out RMSE", "RMSE (norm.)", "↓"),
+        ("val/photo_consistency_mean", "Photo-consistency", "SSIM", "↑"),
+        ("val/delta_1_mean", r"$\delta_1$", r"$\delta_1$ (\%)", "↑"),
     ]
 
     fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.6), sharex=True)

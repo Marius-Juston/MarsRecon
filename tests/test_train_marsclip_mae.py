@@ -73,14 +73,14 @@ class _FakeWandbModule:
         self.runs: list[_FakeWandbRun] = []
 
     def init(
-        self,
-        *,
-        project: str,
-        name: str | None,
-        mode: str,
-        dir: str,
-        config: dict[str, object],
-        reinit: str,
+            self,
+            *,
+            project: str,
+            name: str | None,
+            mode: str,
+            dir: str,
+            config: dict[str, object],
+            reinit: str,
     ) -> _FakeWandbRun:
         assert reinit == "finish_previous"
         run = _FakeWandbRun(project=project, name=name, mode=mode, directory=dir, config=config)
@@ -94,7 +94,7 @@ def _make_samples(num_samples: int = 2, image_size: int = 8) -> list[dict[str, o
         image = torch.rand(3, image_size, image_size)
         valid_mask = torch.ones(image_size, image_size, dtype=torch.bool)
         if idx % 2 == 1:
-            valid_mask[:, image_size // 2 :] = False
+            valid_mask[:, image_size // 2:] = False
         samples.append(
             {
                 "image": image,

@@ -39,19 +39,17 @@ import logging
 import math
 import os
 import pathlib
-import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
+from torchgeo.samplers import Units
 
 from dataset.core.dtm import MarsHiRISEDTM
-
-from dataset.sampling.sampler import HiRISEGeoSampler
 from dataset.core.rdr import MarsHiRISE
-from torchgeo.samplers import Units
+from dataset.sampling.sampler import HiRISEGeoSampler
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +165,7 @@ def _welford_update(
 
     return new_n, mean_new, M2_new
 
+
 def detrend(z_data, mask):
     z_data = z_data.squeeze(0)
     mask = mask.squeeze(0)
@@ -181,6 +180,7 @@ def detrend(z_data, mask):
     detrended = z_data - (C[0] * x_grid + C[1] * y_grid + C[2])
 
     return np.abs(detrended[mask])
+
 
 # ---------------------------------------------------------------------------
 # Per-GPU worker

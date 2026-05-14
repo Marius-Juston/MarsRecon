@@ -42,8 +42,6 @@ import torch
 import yaml
 from matplotlib.colors import TwoSlopeNorm
 from omegaconf import OmegaConf
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from matplotlib.ticker import FormatStrFormatter
 
 # Allow `python scripts/...` from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -55,7 +53,6 @@ from depth_fm.objectives.losses import PhotoclinometricLoss  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Style — matches typical IEEE conference figure conventions
@@ -103,10 +100,10 @@ def _predict_one(model, ortho: torch.Tensor, num_steps: int, ensemble: int) -> n
     """Run DepthFM inference on a single (3,H,W) ortho patch in [-1,1]."""
     model.eval()
     pred = model.predict_depth(
-        ortho.unsqueeze(0),                       # (1,3,H,W)
+        ortho.unsqueeze(0),  # (1,3,H,W)
         num_steps=num_steps,
         ensemble_size=ensemble,
-    )                                              # (1,1,H,W) in [0,1]
+    )  # (1,1,H,W) in [0,1]
     return pred.squeeze().cpu().numpy()
 
 
@@ -117,14 +114,14 @@ def _plot_panel(scenes: list[dict], out_path: Path, dtm_unit: str = "") -> None:
         n_rows, 7,
         # Bumped width to 15.0 and wspace to 0.35 to give the text breathing room
         figsize=(13.0, 1.95 * n_rows),
-        gridspec_kw={"wspace": 0.05, "hspace": 0.10}, 
+        gridspec_kw={"wspace": 0.05, "hspace": 0.10},
     )
     if n_rows == 1:
         axes = axes[None, :]
 
     col_titles = [
         "HiRISE RED ortho", "MarsFM prediction", "GT DTM",
-        "Signed error", "Pred Normals", 
+        "Signed error", "Pred Normals",
         "Pred LL Render", "GT LL Render"
     ]
 
@@ -196,6 +193,7 @@ def _plot_panel(scenes: list[dict], out_path: Path, dtm_unit: str = "") -> None:
     fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
     fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight", pad_inches=0.02, dpi=300)
     log.info("wrote %s and .png", out_path)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -273,16 +271,16 @@ def main() -> None:
     scenes: list[dict] = []
     for label, item in zip(labels, selected):
         batch = item["batch"]
-        ortho = batch["image"][0].to(args.device)            # (3,H,W) in [-1,1]
+        ortho = batch["image"][0].to(args.device)  # (3,H,W) in [-1,1]
         gt = batch["dtm"][0, 0].numpy()
         mask = batch.get("confidence", torch.ones_like(batch["dtm"]))[0, 0].numpy()
         mask = mask > 0.5
 
         pred = _predict_one(module.model, ortho,
                             num_steps=args.num_steps,
-                            ensemble=args.ensemble_size)     # (H,W) in [0,1]
+                            ensemble=args.ensemble_size)  # (H,W) in [0,1]
         # Convert pred from [0,1] to the same signed range as GT, then affine-align
-        pred_signed = 2.0 * pred - 1.0                       # match GT scale
+        pred_signed = 2.0 * pred - 1.0  # match GT scale
         pred_aligned, scale, shift = affine_align(pred_signed, gt, mask)
         err = pred_aligned - gt
 

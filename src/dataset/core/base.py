@@ -45,8 +45,9 @@ from shapely.geometry import Polygon, box
 from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import GeoSlice, Path, Sample, download_url
-from cache import spatial_cache_dir, write_manifest
 from tqdm import tqdm
+
+from cache import spatial_cache_dir, write_manifest
 
 CONFIG = "logger_config.json"
 

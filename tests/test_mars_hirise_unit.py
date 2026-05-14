@@ -37,14 +37,12 @@ from matplotlib import pyplot as plt
 
 from dataset.core.rdr import MarsHiRISE
 
-
 from dataset.core.base import (ProductMeta,
-                                      corners_to_polygon,
-                                      extract_footprint,
-                                      filter_maker,
-                                      setup_logging,
-extract_footprint
-                                      )
+                               corners_to_polygon,
+                               filter_maker,
+                               setup_logging,
+                               extract_footprint
+                               )
 
 # ---------------------------------------------------------------------------
 # Module-level constants for test geometry
@@ -1474,7 +1472,8 @@ class TestBuildSpatialIndexWithFiles:
         # Bowtie coords: (0,0)→(1,1)→(0,1)→(1,0) — self-intersecting, is_valid=False
         bowtie_coords = [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)]
         # Patch the module-level extract_footprint to return the bowtie hull
-        with patch("dataset.mars_hirise_base.extract_footprint", return_value=(bowtie_coords, (-131.0, 18.0, -130.0, 19.0))):
+        with patch("dataset.mars_hirise_base.extract_footprint",
+                   return_value=(bowtie_coords, (-131.0, 18.0, -130.0, 19.0))):
             dataset_with_dense_file._build_spatial_index(force_rebuild=True)
 
         assert len(dataset_with_dense_file.index) == 1

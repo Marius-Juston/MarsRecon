@@ -27,9 +27,9 @@ import os
 import shutil
 from pathlib import Path
 
-from cache import compute_hash, write_manifest
-
 import torch
+
+from cache import compute_hash, write_manifest
 
 # GDAL / threading optimizations for the extraction phase
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"

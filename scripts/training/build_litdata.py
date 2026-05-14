@@ -27,13 +27,11 @@ import json
 import logging
 import os
 import shutil
-import sys
 from pathlib import Path
 
 from cache import (
     litdata_cache_key, litdata_cache_root, litdata_tmp_dir,
-    write_manifest, compute_hash,
-)
+    write_manifest, )
 
 # GDAL / threading optimizations for the extraction phase
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
@@ -519,6 +517,7 @@ if __name__ == "__main__":
     # lingering child processes whose atexit handlers block a clean sys.exit. Force
     # immediate termination — all success markers and manifests are already written.
     import gc
+
     gc.collect()
     logging.shutdown()
     os._exit(0)

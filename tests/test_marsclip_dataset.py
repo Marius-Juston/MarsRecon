@@ -52,15 +52,15 @@ def _write_tiff(path: pathlib.Path, data: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, data.shape[2], data.shape[1])
     with rasterio.open(
-        path,
-        "w",
-        driver="GTiff",
-        count=data.shape[0],
-        dtype=str(data.dtype),
-        width=data.shape[2],
-        height=data.shape[1],
-        crs=_MARS_RCRS,
-        transform=transform,
+            path,
+            "w",
+            driver="GTiff",
+            count=data.shape[0],
+            dtype=str(data.dtype),
+            width=data.shape[2],
+            height=data.shape[1],
+            crs=_MARS_RCRS,
+            transform=transform,
     ) as dst:
         dst.write(data)
 

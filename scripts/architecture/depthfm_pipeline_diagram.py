@@ -89,7 +89,7 @@ try:
         detect_seam_artifact as _real_seam,
         estimate_sun_vector_irls as _real_sun,
         compute_topographic_residual as _real_residual, detect_seam_artifact,
-)
+    )
 
     _USING_REAL_ADAPTER = True
 except Exception:  # pragma: no cover
@@ -765,6 +765,7 @@ def _save_line_plot(path: Path, profile_data: tuple, *,
 
     fig.savefig(path, bbox_inches="tight", pad_inches=0.02, dpi=dpi)
     plt.close(fig)
+
 
 def _save_panels(data: dict, out_dir: Path) -> dict[str, Path]:
     """Render every PNG graphviz will reference, return {key: path} dict."""
@@ -2048,6 +2049,7 @@ def build_seam_detector_diagram(data: dict, paths: dict[str, Path],
     dot.render(str(out_base), format="svg", cleanup=True)
     dot.graph_attr['dpi'] = '600'
     dot.render(str(out_base), format="png", cleanup=True)
+
 
 # ===========================================================================
 # MAIN

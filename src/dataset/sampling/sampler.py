@@ -73,8 +73,6 @@ import json
 import logging
 import pathlib
 from collections.abc import Iterator
-
-from cache import compute_hash, sampler_split_cache_dir, write_manifest
 from typing import Any, Literal
 
 import numpy as np
@@ -84,8 +82,8 @@ from shapely.geometry import box as shapely_box
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.samplers import GeoSampler, Units
 
+from cache import compute_hash, sampler_split_cache_dir, write_manifest
 from dataset.core.base import MARS_PROJECTED_CRS
-
 from dataset.sampling.geometry import (
     generate_valid_center_region,
     pack_patches_independent_strips,
@@ -882,10 +880,10 @@ class HiRISEGeoSampler(GeoSampler):
         )
 
     def _fallback_simple_strip(
-        self,
-        pair_idx: int,
-        footprint,
-        interval,
+            self,
+            pair_idx: int,
+            footprint,
+            interval,
     ) -> int:
         """Process a single strip with the simple algorithm.
 

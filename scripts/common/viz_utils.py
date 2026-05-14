@@ -16,7 +16,6 @@ from typing import Iterable
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-
 _PAPER_RC = {
     "font.family": "serif",
     "font.size": 9,
@@ -40,11 +39,11 @@ def apply_paper_style() -> None:
 
 
 def save_fig(
-    fig: plt.Figure,
-    path: str | Path,
-    *,
-    formats: Iterable[str] = ("pdf", "png"),
-    dpi: int = 300,
+        fig: plt.Figure,
+        path: str | Path,
+        *,
+        formats: Iterable[str] = ("pdf", "png"),
+        dpi: int = 300,
 ) -> list[Path]:
     """Save `fig` to `path` once per format. Returns the list of written paths."""
     base = Path(path)

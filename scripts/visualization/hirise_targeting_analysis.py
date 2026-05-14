@@ -20,21 +20,20 @@ The module is also import-able for use in notebooks.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import sys
 from collections import Counter
 from pathlib import Path
 
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib as mpl
+import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap
 from wordcloud import WordCloud
-import logging
-import seaborn as sns
-
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +44,17 @@ MARS_CMAP = LinearSegmentedColormap.from_list("mars", MARS_COLORS, N=256)
 
 mpl.rcParams.update({
     "figure.facecolor": "white",
-    "axes.facecolor":   "white",
-    "axes.edgecolor":   "#333",
-    "axes.labelcolor":  "#222",
-    "axes.titlesize":   14,
+    "axes.facecolor": "white",
+    "axes.edgecolor": "#333",
+    "axes.labelcolor": "#222",
+    "axes.titlesize": 14,
     "axes.titleweight": "bold",
-    "axes.titlepad":    14,
-    "xtick.color":      "#333",
-    "ytick.color":      "#333",
-    "font.family":      "DejaVu Sans",
-    "savefig.dpi":      200,
-    "savefig.bbox":     "tight",
+    "axes.titlepad": 14,
+    "xtick.color": "#333",
+    "ytick.color": "#333",
+    "font.family": "DejaVu Sans",
+    "savefig.dpi": 200,
+    "savefig.bbox": "tight",
 })
 
 # ---------- I/O ---------------------------------------------------------------
@@ -64,20 +63,20 @@ mpl.rcParams.update({
 # We expose the columns we actually use.
 TAB_FIELDS = [
     # (name,             start_byte_1indexed, length_bytes, dtype)
-    ("volume_id",        2,   10, "str"),
-    ("file_name",        15,  67, "str"),
-    ("observation_id",   100, 15, "str"),
-    ("product_id",       118, 21, "str"),
-    ("target_name",      148, 32, "str"),
-    ("orbit_number",     182, 6,  "int"),
-    ("mission_phase",    190, 30, "str"),
-    ("rationale_desc",   223, 75, "str"),
-    ("start_time",       347, 24, "str"),
-    ("incidence_angle",  461, 7,  "float"),
-    ("min_latitude",     609, 10, "float"),
-    ("max_latitude",     620, 10, "float"),
-    ("min_longitude",    631, 10, "float"),
-    ("max_longitude",    642, 10, "float"),
+    ("volume_id", 2, 10, "str"),
+    ("file_name", 15, 67, "str"),
+    ("observation_id", 100, 15, "str"),
+    ("product_id", 118, 21, "str"),
+    ("target_name", 148, 32, "str"),
+    ("orbit_number", 182, 6, "int"),
+    ("mission_phase", 190, 30, "str"),
+    ("rationale_desc", 223, 75, "str"),
+    ("start_time", 347, 24, "str"),
+    ("incidence_angle", 461, 7, "float"),
+    ("min_latitude", 609, 10, "float"),
+    ("max_latitude", 620, 10, "float"),
+    ("min_longitude", 631, 10, "float"),
+    ("max_longitude", 642, 10, "float"),
 ]
 
 
@@ -93,16 +92,16 @@ def read_tab(path: str | Path) -> pd.DataFrame:
     rows = []
     needed_idx = {
         "observation_id": 4,
-        "target_name":    7,
-        "orbit_number":   8,
-        "mission_phase":  9,
+        "target_name": 7,
+        "orbit_number": 8,
+        "mission_phase": 9,
         "rationale_desc": 10,
-        "start_time":     13,
+        "start_time": 13,
         "incidence_angle": 19,
-        "min_latitude":   35,
-        "max_latitude":   36,
-        "min_longitude":  37,
-        "max_longitude":  38,
+        "min_latitude": 35,
+        "max_latitude": 36,
+        "min_longitude": 37,
+        "max_longitude": 38,
     }
     with open(path, "r", encoding="ascii", errors="replace") as fh:
         for line in fh:
@@ -117,17 +116,17 @@ def read_tab(path: str | Path) -> pd.DataFrame:
                 continue
             try:
                 rec = {
-                    "observation_id":  fields[needed_idx["observation_id"]].strip(),
-                    "target_name":     fields[needed_idx["target_name"]].strip(),
-                    "orbit_number":    int(fields[needed_idx["orbit_number"]]),
-                    "mission_phase":   fields[needed_idx["mission_phase"]].strip(),
-                    "rationale_desc":  fields[needed_idx["rationale_desc"]].strip(),
-                    "start_time":      fields[needed_idx["start_time"]].strip(),
+                    "observation_id": fields[needed_idx["observation_id"]].strip(),
+                    "target_name": fields[needed_idx["target_name"]].strip(),
+                    "orbit_number": int(fields[needed_idx["orbit_number"]]),
+                    "mission_phase": fields[needed_idx["mission_phase"]].strip(),
+                    "rationale_desc": fields[needed_idx["rationale_desc"]].strip(),
+                    "start_time": fields[needed_idx["start_time"]].strip(),
                     "incidence_angle": float(fields[needed_idx["incidence_angle"]]),
-                    "min_latitude":    float(fields[needed_idx["min_latitude"]]),
-                    "max_latitude":    float(fields[needed_idx["max_latitude"]]),
-                    "min_longitude":   float(fields[needed_idx["min_longitude"]]),
-                    "max_longitude":   float(fields[needed_idx["max_longitude"]]),
+                    "min_latitude": float(fields[needed_idx["min_latitude"]]),
+                    "max_latitude": float(fields[needed_idx["max_latitude"]]),
+                    "min_longitude": float(fields[needed_idx["min_longitude"]]),
+                    "max_longitude": float(fields[needed_idx["max_longitude"]]),
                 }
             except (ValueError, IndexError):
                 continue
@@ -135,7 +134,7 @@ def read_tab(path: str | Path) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["latitude"]  = (df["min_latitude"]  + df["max_latitude"])  / 2.0
+    df["latitude"] = (df["min_latitude"] + df["max_latitude"]) / 2.0
     df["longitude"] = (df["min_longitude"] + df["max_longitude"]) / 2.0
     # Each observation has up to two products (RED + COLOR). Dedupe.
     df = df.drop_duplicates("observation_id", keep="first").reset_index(drop=True)
@@ -163,7 +162,7 @@ def load(path: str | Path) -> pd.DataFrame:
 
 
 # ---------- text processing ---------------------------------------------------
- 
+
 # Words that aren't science-meaningful in this context. We strip these so the
 # word cloud reflects what scientists actually study, not connective tissue.
 STOPWORDS = {
@@ -175,7 +174,7 @@ STOPWORDS = {
     "possible", "candidate", "small", "large", "long",
     "monitoring", "monitor", "survey", "survey", "sample",
 }
- 
+
 # Mars geographic feature types — we'll count these specifically.
 GEO_FEATURES = [
     "crater", "chasma", "chasmata", "vallis", "valles", "planitia",
@@ -183,55 +182,55 @@ GEO_FEATURES = [
     "patera", "labyrinthus", "sulci", "rupes", "dorsa", "cavi", "scopulus",
     "colles", "mensa", "mensae", "fluctus",
 ]
- 
+
 # Science themes — keyword sets tuned to the actual vocabulary HiRISE
 # scientists use in RATIONALE_DESC, not the textbook geology vocabulary.
 # Order matters only for the "primary theme" picker on overlapping matches.
 THEMES = {
-    "Impact craters":             [
+    "Impact craters": [
         "crater", "craters", "impact", "ejecta", "rayed",
         "pedestal crater", "secondary crater", "central peak",
         "central uplift", "fresh crater", "fresh impact",
         "candidate impact", "candidate recent impact", "newly formed",
         "rayed crater", "crater rim", "crater wall", "crater floor",
     ],
-    "Gullies & slopes":           [
+    "Gullies & slopes": [
         "gully", "gullies", "slope", "slopes", "scarp", "scarps",
         "RSL", "recurring", "lineae", "slope streak", "slope monitoring",
         "slope feature", "pole-facing", "pole facing",
     ],
-    "Mass wasting & landslides":  [
+    "Mass wasting & landslides": [
         "landslide", "rockfall", "debris flow", "mass wasting", "slump",
         "avalanche", "rock avalanche",
     ],
-    "Polar / ice / frost":        [
+    "Polar / ice / frost": [
         "polar", "ice", "frost", "defrosting", "araneiform", "araneiforms",
         "spider", "geyser", "seasonal", "cryptic", "residual cap",
         "polar layered", "PLD", "polar deposit", "polar dune",
         "polar gypsum", "polar erg", "icy",
     ],
-    "Glacial / periglacial":      [
+    "Glacial / periglacial": [
         "periglacial", "polygon", "polygons", "patterned ground",
         "lobate", "lobate debris", "debris apron", "concentric crater fill",
         "concentric", "viscous flow", "glacier", "glacial", "ice-rich",
         "ice-cemented", "thermokarst",
     ],
-    "Aeolian (wind)":             [
+    "Aeolian (wind)": [
         "dune", "dunes", "ripple", "ripples", "yardang", "TAR",
         "transverse aeolian", "dust devil", "devil track", "barchan",
         "erg", "aeolian", "wind", "active dune", "dust",
     ],
-    "Fluvial / channels":         [
+    "Fluvial / channels": [
         "channel", "channels", "valley", "valleys", "vallis", "valles",
         "fluvial", "alluvial", "delta", "inverted channel", "outflow",
         "tributary", "fan delta", "alluvial fan", "drainage", "sinuous ridge",
     ],
-    "Layers & stratigraphy":      [
+    "Layers & stratigraphy": [
         "layered", "layer", "layers", "bedrock", "stratigraphy",
         "outcrop", "exposure", "exposures", "deposits", "deposit",
         "stratified", "layered deposits", "layered deposit",
     ],
-    "Mineralogy / hydrated":      [
+    "Mineralogy / hydrated": [
         "clay", "clays", "sulfate", "sulfates", "olivine", "olivine-rich",
         "iron-rich", "mafic", "phyllosilicate", "phyllosilicates",
         "phyllosilicate-rich", "carbonate", "carbonates", "hydrated",
@@ -239,27 +238,27 @@ THEMES = {
         "nontronite", "jarosite", "pyroxene", "altered", "alteration",
         "spectral signature", "iron",
     ],
-    "Light/dark-toned":           [
+    "Light/dark-toned": [
         "light-toned", "light toned", "dark-toned", "dark toned",
         "toned material", "toned bedrock", "toned deposit", "toned outcrop",
         "albedo", "bright deposit", "bright material", "dark streak",
         "slope streak",
     ],
-    "Volcanic":                   [
+    "Volcanic": [
         "lava", "lava flow", "volcanic", "vent", "tholus", "patera",
         "caldera", "flow front", "fissure vent", "pyroclastic",
     ],
-    "Tectonic / structural":      [
+    "Tectonic / structural": [
         "fault", "faulted", "graben", "grabens", "fracture", "fractured",
         "wrinkle ridge", "wrinkle", "horst", "tectonic", "thrust",
     ],
-    "Landing sites & rovers":     [
+    "Landing sites & rovers": [
         "landing site", "landing", "rover", "InSight", "Curiosity",
         "Perseverance", "MSL", "Phoenix", "ExoMars", "Spirit",
         "Opportunity", "Pathfinder", "Viking", "future landing",
         "candidate landing", "Beagle",
     ],
-    "Calibration / engineering":  [
+    "Calibration / engineering": [
         "calibration", "ADC", "ADC settings", "settings test",
         "test observation", "MOC image", "validation", "engineering",
         "stray light", "geometry", "test image", "ride-along",
@@ -337,7 +336,7 @@ def fig_wordcloud(df: pd.DataFrame, out: Path) -> None:
     )
     save_fig(fig, out / "01_wordcloud.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'01_wordcloud.png'}")
+    print(f"  -> {out / '01_wordcloud.png'}")
 
 
 def fig_wordcloud_mars_disk(df: pd.DataFrame, out: Path) -> None:
@@ -367,7 +366,7 @@ def fig_wordcloud_mars_disk(df: pd.DataFrame, out: Path) -> None:
                  fontsize=14, pad=10)
     save_fig(fig, out / "02_wordcloud_mars_disk.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'02_wordcloud_mars_disk.png'}")
+    print(f"  -> {out / '02_wordcloud_mars_disk.png'}")
 
 
 def fig_top_words_and_phrases(df: pd.DataFrame, out: Path) -> None:
@@ -380,9 +379,9 @@ def fig_top_words_and_phrases(df: pd.DataFrame, out: Path) -> None:
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     for ax, data, title in zip(
-        axes,
-        [top_unigrams, top_bigrams],
-        ["Top single words", "Top two-word phrases"],
+            axes,
+            [top_unigrams, top_bigrams],
+            ["Top single words", "Top two-word phrases"],
     ):
         labels, counts = zip(*data)
         y = np.arange(len(labels))
@@ -403,7 +402,7 @@ def fig_top_words_and_phrases(df: pd.DataFrame, out: Path) -> None:
     fig.tight_layout()
     save_fig(fig, out / "03_top_words_phrases.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'03_top_words_phrases.png'}")
+    print(f"  -> {out / '03_top_words_phrases.png'}")
 
 
 def fig_geographic_features(df: pd.DataFrame, out: Path) -> None:
@@ -433,7 +432,7 @@ def fig_geographic_features(df: pd.DataFrame, out: Path) -> None:
     fig.tight_layout()
     save_fig(fig, out / "04_geo_features.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'04_geo_features.png'}")
+    print(f"  -> {out / '04_geo_features.png'}")
 
 
 def fig_themes_bar(df: pd.DataFrame, out: Path) -> None:
@@ -456,17 +455,17 @@ def fig_themes_bar(df: pd.DataFrame, out: Path) -> None:
     fig.tight_layout()
     save_fig(fig, out / "05_science_themes.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'05_science_themes.png'}")
+    print(f"  -> {out / '05_science_themes.png'}")
 
 
 def fig_map_themed(df: pd.DataFrame, out: Path) -> None:
     """Mars-map of observations colored by primary science theme."""
     if "latitude" not in df.columns or "longitude" not in df.columns:
         return
-        
+
     # Use the centralized high-contrast palette
     themes, color_for, counts, primary = _theme_palette(df)
-    
+
     df = df.copy()
     df["primary_theme"] = primary
 
@@ -477,10 +476,14 @@ def fig_map_themed(df: pd.DataFrame, out: Path) -> None:
 
     # Auto-tune scatter style for the dataset size
     n = len(df)
-    if   n < 500:    style = dict(s=40,  alpha=0.95, ew=0.6,  raster=False)
-    elif n < 5000:   style = dict(s=12,  alpha=0.85, ew=0.0,  raster=False)
-    elif n < 30000:  style = dict(s=4,   alpha=0.65, ew=0.0,  raster=False)
-    else:            style = dict(s=1.5, alpha=0.52, ew=0.0,  raster=False)
+    if n < 500:
+        style = dict(s=40, alpha=0.95, ew=0.6, raster=False)
+    elif n < 5000:
+        style = dict(s=12, alpha=0.85, ew=0.0, raster=False)
+    elif n < 30000:
+        style = dict(s=4, alpha=0.65, ew=0.0, raster=False)
+    else:
+        style = dict(s=1.5, alpha=0.52, ew=0.0, raster=False)
 
     fig, ax = plt.subplots(figsize=(13, 6.5))
     ax.add_patch(plt.Rectangle((-180, -90), 360, 180,
@@ -500,12 +503,13 @@ def fig_map_themed(df: pd.DataFrame, out: Path) -> None:
                    edgecolor=("white" if style["ew"] > 0 else "none"),
                    linewidth=style["ew"],
                    # Ensure legend label order stays correct later
-                   label=f"{theme} ({m.sum():,})", 
+                   label=f"{theme} ({m.sum():,})",
                    # Increment zorder so smaller categories stay on top
-                   zorder=3 + (1 - m.sum()/len(df)), 
+                   zorder=3 + (1 - m.sum() / len(df)),
                    rasterized=style["raster"])
-                   
-    ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
+
+    ax.set_xlim(-180, 180);
+    ax.set_ylim(-90, 90)
     ax.set_xlabel("east longitude (°)")
     ax.set_ylabel("planetocentric latitude (°)")
     ax.set_title("HiRISE observations on Mars, coloured by primary science theme")
@@ -513,13 +517,16 @@ def fig_map_themed(df: pd.DataFrame, out: Path) -> None:
                     ncol=2, bbox_to_anchor=(1.005, 0), borderaxespad=0)
     # Force legend dots to be readable even when the scatter is tiny.
     for h in leg.legend_handles:
-        try:    h.set_sizes([36])
-        except Exception:  pass
+        try:
+            h.set_sizes([36])
+        except Exception:
+            pass
     ax.set_aspect("equal", adjustable="box")
     fig.tight_layout()
     save_fig(fig, out / "06_themed_map.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'06_themed_map.png'}")
+    print(f"  -> {out / '06_themed_map.png'}")
+
 
 def _theme_palette(df: pd.DataFrame):
     """Return ordered theme list and a stable theme→color mapping."""
@@ -527,18 +534,18 @@ def _theme_palette(df: pd.DataFrame):
     primary = [ts[0] for ts in th["themes"]]
     counts = pd.Series(primary).value_counts()
     themes = counts.index.tolist()
-    
+
     n_themes = len(themes)
-    
+
     # Strategy: Vibrant & Pastel
     # Prevents alpha-blending confusion by using distinct, low-saturation 
     # hues for the long tail, rather than grays.
-    
+
     # 1. Grab up to 5 bold, highly saturated colors for the leaders
     # 'Set1' gives strong, distinct primary/secondary colors
     num_highlight = min(5, n_themes)
     top_colors = sns.color_palette("Set1", num_highlight)
-    
+
     # 2. Grab pale, pastel hues for the remaining categories
     # 'Set3' provides 12 distinct but desaturated/pastel colors
     num_muted = max(0, n_themes - 5)
@@ -546,11 +553,12 @@ def _theme_palette(df: pd.DataFrame):
         bottom_colors = sns.color_palette("Set3", num_muted)
     else:
         bottom_colors = []
-        
+
     # 3. Combine them into the custom palette
     custom_palette = list(top_colors) + list(bottom_colors)
-    
+
     return themes, dict(zip(themes, custom_palette)), counts, primary
+
 
 def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
     """One Mars hex-density map per theme (panels share the same map background).
@@ -588,7 +596,7 @@ def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
 
         # 2. Raise the colormap floor: start at a light gray instead of pure white
         cmap = LinearSegmentedColormap.from_list(
-                    f"th_{i}", ["#e5e5e5", c, "#111111"], N=256)
+            f"th_{i}", ["#e5e5e5", c, "#111111"], N=256)
 
         ax.add_patch(plt.Rectangle((-180, -90), 360, 180,
                                    facecolor="white",
@@ -598,11 +606,12 @@ def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
                       gridsize=grid,
                       extent=(-180, 180, -90, 90),
                       cmap=cmap, mincnt=1,
-                      bins='log', # 3. THE MAGIC BULLET: Logarithmic color scaling
+                      bins='log',  # 3. THE MAGIC BULLET: Logarithmic color scaling
                       linewidths=0, edgecolors="none",
                       zorder=2)
         ax.axhline(0, color="#7a2d18", lw=0.4, alpha=0.45, zorder=3)
-        ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
+        ax.set_xlim(-180, 180);
+        ax.set_ylim(-90, 90)
         ax.set_title(f"{theme} — {int(m.sum()):,}",
                      fontsize=10, color="#222", weight="bold", pad=4)
         ax.set_aspect("equal", adjustable="box")
@@ -616,7 +625,7 @@ def fig_map_themed_smallmultiples(df: pd.DataFrame, out: Path) -> None:
                  fontsize=13, weight="bold", y=1.0)
     save_fig(fig, out / "06b_themed_map_smallmultiples.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'06b_themed_map_smallmultiples.png'}")
+    print(f"  -> {out / '06b_themed_map_smallmultiples.png'}")
 
 
 def fig_map_themed_dominant(df: pd.DataFrame, out: Path) -> None:
@@ -639,7 +648,7 @@ def fig_map_themed_dominant(df: pd.DataFrame, out: Path) -> None:
     # enough that each cell gets a meaningful sample at full-corpus scale.
     nx, ny = 180, 90
     lon_edges = np.linspace(-180, 180, nx + 1)
-    lat_edges = np.linspace( -90,  90, ny + 1)
+    lat_edges = np.linspace(-90, 90, ny + 1)
 
     # Build a per-theme 2D histogram on the common grid.
     H = np.zeros((len(themes), ny, nx), dtype=np.int32)
@@ -656,14 +665,16 @@ def fig_map_themed_dominant(df: pd.DataFrame, out: Path) -> None:
     for i, t in enumerate(themes):
         c = color_for[t]
         sel = dominant == i
-        img[sel, 0] = c[0]; img[sel, 1] = c[1]; img[sel, 2] = c[2]
+        img[sel, 0] = c[0];
+        img[sel, 1] = c[1];
+        img[sel, 2] = c[2]
     log_total = np.log1p(total)
     norm = log_total / log_total.max() if log_total.max() > 0 else log_total
     # Slightly higher base opacity (0.40) to pop against white
     img[..., 3] = np.where(dominant >= 0, 0.40 + 0.60 * norm, 0.0)
 
     fig, ax = plt.subplots(figsize=(13, 6.5))
-    
+
     # --- REPLACE THE BACKGROUND ---
     ax.add_patch(plt.Rectangle((-180, -90), 360, 180,
                                facecolor="white",
@@ -672,7 +683,8 @@ def fig_map_themed_dominant(df: pd.DataFrame, out: Path) -> None:
               extent=(-180, 180, -90, 90), origin="lower",
               interpolation="nearest", aspect="auto", zorder=2)
     ax.axhline(0, color="#7a2d18", lw=0.6, alpha=0.5, zorder=3)
-    ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
+    ax.set_xlim(-180, 180);
+    ax.set_ylim(-90, 90)
     ax.set_xlabel("east longitude (°)")
     ax.set_ylabel("planetocentric latitude (°)")
     ax.set_title("Dominant science theme per region of Mars\n"
@@ -691,7 +703,7 @@ def fig_map_themed_dominant(df: pd.DataFrame, out: Path) -> None:
     fig.tight_layout()
     save_fig(fig, out / "06c_themed_map_dominant.png", bbox_inches="tight", )
     plt.close(fig)
-    print(f"  -> {out/'06c_themed_map_dominant.png'}")
+    print(f"  -> {out / '06c_themed_map_dominant.png'}")
 
 
 def fig_treemap(df: pd.DataFrame, out: Path) -> None:
@@ -721,7 +733,8 @@ def fig_treemap(df: pd.DataFrame, out: Path) -> None:
                     f"{lbl}\n{v}",
                     ha="center", va="center", fontsize=fs,
                     color="white", weight="bold")
-    ax.set_xlim(0, 100); ax.set_ylim(0, 100)
+    ax.set_xlim(0, 100);
+    ax.set_ylim(0, 100)
     ax.set_aspect("equal")
     ax.axis("off")
     ax.set_title("Treemap of HiRISE science themes — area = number of observations",
@@ -729,7 +742,7 @@ def fig_treemap(df: pd.DataFrame, out: Path) -> None:
     fig.tight_layout()
     save_fig(fig, out / "07_themes_treemap.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'07_themes_treemap.png'}")
+    print(f"  -> {out / '07_themes_treemap.png'}")
 
 
 def fig_themes_by_latitude_band(df: pd.DataFrame, out: Path) -> None:
@@ -748,27 +761,27 @@ def fig_themes_by_latitude_band(df: pd.DataFrame, out: Path) -> None:
         for t in themes:
             rows.append((band, t))
     crosstab = (pd.DataFrame(rows, columns=["band", "theme"])
-                  .pivot_table(index="band", columns="theme",
-                               aggfunc=len, fill_value=0,
-                               observed=False))
+                .pivot_table(index="band", columns="theme",
+                             aggfunc=len, fill_value=0,
+                             observed=False))
     # Order columns by overall popularity for a clean look
     order = crosstab.sum().sort_values(ascending=False).index
     crosstab = crosstab[order]
 
     fig, ax = plt.subplots(figsize=(11, 6))
-    
+
     # Grab the centralized mapping
     themes, color_for, counts, primary = _theme_palette(df)
-    
+
     bottom = np.zeros(len(crosstab))
     for col in crosstab.columns:
         vals = crosstab[col].values
         # Look up the globally consistent color
-        c = color_for.get(col, "#888888") 
+        c = color_for.get(col, "#888888")
         ax.bar(crosstab.index.astype(str), vals, bottom=bottom,
                label=col, color=c, edgecolor="white", linewidth=0.5)
         bottom += vals
-        
+
     ax.set_ylabel("observations")
     ax.set_title("Where on Mars does each theme cluster? — themes per latitude band")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0),
@@ -778,7 +791,7 @@ def fig_themes_by_latitude_band(df: pd.DataFrame, out: Path) -> None:
     fig.tight_layout()
     save_fig(fig, out / "08_themes_by_latitude.png", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {out/'08_themes_by_latitude.png'}")
+    print(f"  -> {out / '08_themes_by_latitude.png'}")
 
 
 # ---------- main --------------------------------------------------------------

@@ -33,7 +33,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
@@ -62,17 +62,19 @@ METRICS_RMSE_TRACK = ["rmse", "abs_rel", "si_log", "delta_1", "normal_angular_er
 METRICS_PHOTO_TRACK = ["photo_consistency", "ms_ssim_topo", "dbf_score"]
 ALL_TRACKED_METRICS = sorted(set(METRICS_RMSE_TRACK + METRICS_PHOTO_TRACK))
 
+
 # --------------------------------------------------------------------------
 # Spec + job model
 # --------------------------------------------------------------------------
 
 @dataclass
 class Job:
-    job_id: str            # e.g. "L1_s42"
-    variant_id: str        # e.g. "L1"
+    job_id: str  # e.g. "L1_s42"
+    variant_id: str  # e.g. "L1"
     variant_label: str
     seed: int
-    overrides: list[str]   # OmegaConf dotlist (variant + common)
+    overrides: list[str]  # OmegaConf dotlist (variant + common)
+
 
 @dataclass
 class JobState:
@@ -221,8 +223,8 @@ class RunningJob:
     lane: str
     run_dir: Path
     csv_path: Path
-    log_file: object              # open file handle
-    last_val_seen_at: float       # monotonic time of last new val/* row
+    log_file: object  # open file handle
+    last_val_seen_at: float  # monotonic time of last new val/* row
     last_val_row_count: int = 0
     started_at: float = 0.0
 
@@ -263,7 +265,7 @@ def launch_train(job: Job, lane: str, spec: dict) -> RunningJob:
         env=env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
-        start_new_session=True,   # own process group → reliable group kill
+        start_new_session=True,  # own process group → reliable group kill
     )
     (run_dir / "pid").write_text(str(proc.pid))
 
@@ -344,6 +346,7 @@ def find_best_checkpoint(run_dir: Path, kind: str) -> Optional[Path]:
     candidates = list(run_dir.rglob(f"checkpoints/{pattern}"))
     if not candidates:
         return None
+
     # Filename embeds the metric value; pick lowest RMSE or highest photo.
     def metric_from(p: Path) -> float:
         # e.g. depthfm-best-rmse-1234-0.0456.ckpt
@@ -351,6 +354,7 @@ def find_best_checkpoint(run_dir: Path, kind: str) -> Optional[Path]:
             return float(p.stem.rsplit("-", 1)[-1])
         except ValueError:
             return float("inf") if kind == "rmse" else float("-inf")
+
     if kind == "rmse":
         return min(candidates, key=metric_from)
     else:
@@ -420,7 +424,7 @@ def schedule(spec: dict, store: StateStore, jobs: list[Job], only: Optional[set[
 
     logger.info("Scheduling %d jobs across %d lanes", len(pending), len(lanes))
 
-    running: dict[str, RunningJob] = {}   # lane -> RunningJob
+    running: dict[str, RunningJob] = {}  # lane -> RunningJob
     queue_idx = 0
     poll_interval = 60.0
 
@@ -649,7 +653,9 @@ def aggregate(spec: dict, store: StateStore, jobs: list[Job]) -> None:
                     "variant_mean": float(np.mean(v_means)),
                     "variant_std": float(np.std(v_means, ddof=0 if len(v_means) < 2 else 1)),
                     "baseline_mean": float(np.mean(b_means_by_metric[m])) if b_means_by_metric[m] else None,
-                    "baseline_std": float(np.std(b_means_by_metric[m], ddof=0 if len(b_means_by_metric[m]) < 2 else 1)) if b_means_by_metric[m] else None,
+                    "baseline_std": float(
+                        np.std(b_means_by_metric[m], ddof=0 if len(b_means_by_metric[m]) < 2 else 1)) if
+                    b_means_by_metric[m] else None,
                     "delta_mean": float(np.mean(paired_deltas_run)) if paired_deltas_run else None,
                     "n_seeds": len(v_means),
                 }

@@ -447,6 +447,7 @@ class TestReplacement:
             self, single_strip_dataset
     ):
         """torch.randint path: same seed → same sequence; different seeds differ."""
+
         def _run(seed: int):
             gen = torch.Generator()
             gen.manual_seed(seed)
