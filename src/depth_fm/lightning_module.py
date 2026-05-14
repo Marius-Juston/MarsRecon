@@ -154,7 +154,7 @@ def _vis_worker_main(task_queue: mp.SimpleQueue, staging_dir: str, rank: int):
     import matplotlib.pyplot as _plt
 
     # Re-import plot functions in child (spawn context = fresh interpreter)
-    from depth_fm.visualization import (
+    from depth_fm.viz.train_viz import (
         plot_prediction_triptych as _triptych,
         plot_cross_sections as _cross,
         plot_error_heatmap as _heatmap,
