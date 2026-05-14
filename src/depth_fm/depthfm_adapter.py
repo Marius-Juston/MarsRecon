@@ -81,7 +81,7 @@ _DEFAULT_IMG_P98 = 0.1828855234319496  # average of left_red / right_red p98
 # Scale factor for relative-topography mode: 98th-percentile of patch-centred
 # elevation distribution (metres).  98 % of patches stay within [-1, 1] before
 # clamping while physical slope magnitudes remain consistent across the dataset.
-_DEFAULT_ELEV_SCALE = 45.90752235993998  # centered_p98[elevation] from Olympus stats
+from depth_fm.scalers import DEFAULT_ELEV_REF_SCALE as _DEFAULT_ELEV_SCALE
 
 
 def _load_quantiles(
@@ -1572,7 +1572,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
             clip: bool = False,
             use_manifest: bool = True,
             manifest_workers: int = 16,  # Set this high to build the cache fast
-            manifest_dir: str = ".cache/manifests",
+            manifest_dir: str | None = None,
             erode_radius: int = 2,
             multiprocessing_context='fork'
     ):
@@ -1590,7 +1590,11 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
         self.use_manifest = use_manifest
         self.manifest_workers = manifest_workers
-        self.manifest_dir = self.base.root / Path(manifest_dir)
+        from cache import manifest_cache_dir
+        self.manifest_dir = (
+            Path(manifest_dir) if manifest_dir is not None
+            else manifest_cache_dir(self.base.root)
+        )
         self.clip = clip
 
         # Load global quantiles
@@ -1616,6 +1620,7 @@ class DepthFMHiRISEAdapterCached(Dataset):
 
     def _get_manifest_hash(self) -> str:
         """Create a unique key so the cache rebuilds if dataset/sampler params change."""
+        from cache import compute_hash
         key_parts = {
             "root": str(getattr(self.base, "root", "unknown")),
             "resolution": self.resolution,
@@ -1623,14 +1628,10 @@ class DepthFMHiRISEAdapterCached(Dataset):
             "split": getattr(self.sampler, "split", "unknown"),
             "seed": getattr(self.sampler, "seed", 0),
             "dataset_hash": str(self.base.spatial_index_cache),
-            "sampler_hash": str(self.sampler.cache_hash)
+            "sampler_hash": str(self.sampler.cache_hash),
+            "clip": self.clip,
         }
-
-        if not self.clip:
-            key_parts["clip"] = self.clip
-
-        raw = json.dumps(key_parts, sort_keys=True, default=str)
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+        return compute_hash(key_parts)
 
     def _init_manifest(self):
         """Loads the parquet manifest or triggers a fast multiprocessing build."""
@@ -1692,6 +1693,13 @@ class DepthFMHiRISEAdapterCached(Dataset):
         # 3. Save and return
         df = pd.DataFrame(records)
         df.to_parquet(save_path)
+        from cache import write_manifest
+        write_manifest(save_path, cache_hash=self._get_manifest_hash(), config_snapshot={
+            "root": str(getattr(self.base, "root", "unknown")),
+            "resolution": self.resolution,
+            "split": getattr(self.sampler, "split", "unknown"),
+            "clip": self.clip,
+        })
         return df
 
     def _evaluate_patch_for_manifest(self, idx: int) -> dict:
@@ -1751,13 +1759,11 @@ class DepthFMHiRISEAdapterCached(Dataset):
             # -------------------------------------------------------------
             # 3. Sun Vector Math (Fixed)
             # -------------------------------------------------------------
-            # We MUST normalize the data before computing the OLS sun vector because
-            # the loss function renders shadows in the [-1, 1] normalized latent space.
-            # Physical metadata is incompatible because local scaling distorts Z geometry.
             dtm_norm: TrainingNormResult = self.evel_normalizer.normalize_for_training(dtm_resized, valid_mask_resized)
             image_norm = self.ortho_normalizer.normalize(image_resized)
+            physical_residual = self.evel_normalizer.denormalize_prediction(dtm_norm.normed_residual)
 
-            sun_vec, intensity, ambient = estimate_sun_vector_irls(dtm_norm.normed_residual, image_norm,
+            sun_vec, intensity, ambient = estimate_sun_vector_irls(physical_residual, image_norm,
                                                                    valid_mask_resized)
 
             sun_x = sun_vec[0].item()

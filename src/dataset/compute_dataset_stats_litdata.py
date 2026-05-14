@@ -32,8 +32,7 @@ from matplotlib import pyplot as plt
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# Assuming this exists in your codebase for the hash key
-from depth_fm.build_litdata_raw import get_litdata_cache_key
+from cache import litdata_cache_root
 
 _SRC = pathlib.Path(__file__).parent
 if str(_SRC) not in sys.path:
@@ -439,10 +438,8 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     config = OmegaConf.load(args.config)
-    cache_hash = get_litdata_cache_key(config)
 
-    dataset_root = pathlib.Path(config.data.hirise.root)
-    litdata_dir = dataset_root / f"litdata_cache_{cache_hash}"
+    litdata_dir = litdata_cache_root(config)
 
     if not litdata_dir.exists():
         logger.error(f"LitData cache not found at {litdata_dir}.")

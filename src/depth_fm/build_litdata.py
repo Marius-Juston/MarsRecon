@@ -19,13 +19,17 @@ Usage:
 """
 import argparse
 import glob
-import hashlib
 import json
 import logging
 import os
 import shutil
 import sys
 from pathlib import Path
+
+from cache import (
+    litdata_cache_key, litdata_cache_root, litdata_tmp_dir,
+    write_manifest, compute_hash,
+)
 
 # GDAL / threading optimizations for the extraction phase
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
@@ -47,6 +51,7 @@ from dataset.mars_hirise_dtm import MarsHiRISEDTM
 from dataset.hirise_sampler import HiRISEGeoSampler
 from torchgeo.samplers import Units
 from depth_fm.depthfm_adapter import DepthFMHiRISEAdapterCached, estimate_sun_vector_irls
+from depth_fm.scalers import GlobalLogNormalizer, DEFAULT_ELEV_REF_SCALE
 
 import torch.multiprocessing as mp
 
@@ -214,22 +219,7 @@ def upload_dataset_card(repo_id: str, cache_hash: str, config_yaml: str, private
 
 # ── Core preprocessing (unchanged) ────────────────────────────────────────
 
-def get_litdata_cache_key(config) -> str:
-    """Deterministic hash for the current preprocessing configuration."""
-    key_parts = {
-        "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
-        "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
-        "resolution": config.data.get("resolution", 512),
-        "dtm_normalization": config.data.get("dtm_normalization", "relative"),
-    }
-
-    clip = config.data.get("clip", False)
-
-    if not clip:
-        key_parts["clip"] = clip
-
-    raw = json.dumps(key_parts, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+get_litdata_cache_key = litdata_cache_key  # backwards-compat alias
 
 
 def _configure_worker_logger(worker_id):
@@ -269,7 +259,7 @@ def build_litdata_for_split(
     sc = config.data.sampler
 
     dataset_root = Path(hc.root)
-    output_dir = str(dataset_root / f"litdata_cache_{cache_hash}" / split)
+    output_dir = str(litdata_cache_root(config) / split)
 
     # Check for completion marker
     success_marker = Path(output_dir) / "_SUCCESS"
@@ -362,7 +352,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     # PHASE 1: Extract with fork-based DataLoader → temp .npz files
     # ═══════════════════════════════════════════════════════════════════
 
-    tmp_dir = dataset_root / f"_litdata_tmp_{cache_hash}_{split}"
+    tmp_dir = litdata_tmp_dir(config, split)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     effective_workers = min(workers, max(1, num_samples // 4))
@@ -402,8 +392,11 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
             dtm_fp32 = sample["dtm"].float()
             conf_fp32 = sample["confidence"].float()
 
-            dtm_1ch = dtm_fp32[:1]
-            sun_vec, intensity, ambient = estimate_sun_vector_irls(dtm_1ch, image_fp32, conf_fp32)
+            ref_scale = float(sample.get("residual_scale", DEFAULT_ELEV_REF_SCALE))
+            _norm = GlobalLogNormalizer(ref_scale)
+            dtm_normalised = dtm_fp32[:1]
+            physical_residual = _norm.denormalize_prediction(dtm_normalised)
+            sun_vec, intensity, ambient = estimate_sun_vector_irls(physical_residual, image_fp32, conf_fp32)
             sun_vec = torch.nn.functional.normalize(sun_vec, p=2, dim=0)
 
             npz_path = str(tmp_dir / f"{i:08d}.npz")
@@ -419,6 +412,9 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
                 sun_vector=sun_vec.numpy(),
                 intensity=intensity.numpy(),
                 ambient=ambient.numpy(),
+                residual_scale=np.array(ref_scale, dtype=np.float32),
+                raw_residual_p98=np.array(
+                    float(sample.get("raw_residual_p98", 0.0)), dtype=np.float32),
             )
             npz_paths.append(npz_path)
 
@@ -443,6 +439,13 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     logger.info(f"[{split}] Cleaned up temp directory.")
 
     success_marker.touch()
+
+    from omegaconf import OmegaConf
+    write_manifest(
+        Path(output_dir),
+        cache_hash=cache_hash,
+        config_snapshot=OmegaConf.to_container(config, resolve=True),
+    )
     logger.info(f"[{split}] Done.")
 
 
@@ -464,8 +467,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     config = OmegaConf.load(args.config)
 
-    cache_hash = get_litdata_cache_key(config)
+    cache_hash = litdata_cache_key(config)
     logger.info(f"LitData Cache Hash: {cache_hash}")
+    logger.info(f"LitData Cache Root: {litdata_cache_root(config)}")
 
     # Automatically append the hash to the repo name
     final_repo_id = f"{args.hf_repo}-{cache_hash}" if args.hf_repo else None

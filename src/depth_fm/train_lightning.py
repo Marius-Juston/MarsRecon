@@ -25,13 +25,14 @@ Usage:
 
 import argparse
 import concurrent.futures
-import hashlib
 import json
 import logging
 import math
 import os
 from copy import deepcopy
 from typing import Callable, Optional, Any
+
+from cache import litdata_cache_key, litdata_cache_root, run_id_hash
 
 import cuml
 import matplotlib.patches as mpatches
@@ -127,22 +128,7 @@ def configure_worker_logger(worker_id):
     )
 
 
-def get_litdata_cache_key(config) -> str:
-    """Deterministic hash for LitData cache location (matches build_litdata.py)."""
-    key_parts = {
-        "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
-        "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
-        "resolution": config.data.get("resolution", 512),
-        "dtm_normalization": config.data.get("dtm_normalization", "relative"),
-    }
-
-    clip = config.data.get("clip", False)
-
-    if not clip:
-        key_parts["clip"] = clip
-
-    raw = json.dumps(key_parts, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+get_litdata_cache_key = litdata_cache_key  # backwards-compat alias
 
 
 def _build_cached_loaders(config, split_seed: int = 42, parallel: bool = True) -> dict:
@@ -777,9 +763,7 @@ def dataload_switch_test(config, args):
                 pass
 
 
-def hash_config(config: OmegaConf):
-    raw = json.dumps(OmegaConf.to_container(config, resolve=True), sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()[:4]
+hash_config = run_id_hash  # backwards-compat alias — use run_id_hash(config) directly
 
 
 def main():

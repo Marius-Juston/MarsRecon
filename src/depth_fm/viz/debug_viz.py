@@ -53,6 +53,7 @@ import matplotlib.gridspec as gridspec
 from scipy.spatial.transform import Rotation as R
 
 from depth_fm.depthfm_adapter import compute_topographic_residual
+from depth_fm.scalers import GlobalLogNormalizer, DEFAULT_ELEV_REF_SCALE
 import torch.distributed as dist
 import re
 from src.depth_fm.viz.train_viz import plot_timestep_ablation
@@ -88,6 +89,26 @@ def save_fig(fig: Figure, path: Path, formats: tuple[str, ...] = (".png", ".pdf"
         logger.info(f"Saved {new_path}")
 
 
+def _display_dtm(arr, mask=None) -> np.ndarray:
+    """Percentile-stretch a DTM array to [0,1] for imshow.
+
+    Handles clip=False where log-compressed values can exceed ±1.
+    """
+    if hasattr(arr, 'cpu'):
+        arr = arr.detach().cpu().numpy()
+    arr = np.asarray(arr, dtype=np.float32).squeeze()
+    src = arr[mask] if (mask is not None and mask.any()) else arr[np.isfinite(arr)]
+    if src.size == 0:
+        return np.zeros_like(arr)
+    lo, hi = np.nanpercentile(src, 2), np.nanpercentile(src, 98)
+    if hi - lo < 1e-6:
+        hi = lo + 1e-6
+    out = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    if mask is not None:
+        out[~mask] = np.nan
+    return out
+
+
 def _make_synthetic_pred(
         gt: torch.Tensor, noise_level: float = 0.08, seed: int = 42
 ) -> torch.Tensor:
@@ -104,7 +125,8 @@ def _make_synthetic_pred(
                         generator=g, device=gt.device)
     noise = F.interpolate(noise, size=(H, W), mode="bicubic", align_corners=False)
     bias = torch.randn(B, C, 1, 1, generator=g, device=gt.device) * noise_level * 0.3
-    return (gt + noise_level * noise + bias).clamp(-1.0, 1.0)
+    lo, hi = gt.min(), gt.max()
+    return (gt + noise_level * noise + bias).clamp(lo, hi)
 
 
 def _gray_stretch(x: torch.Tensor, mask: np.ndarray | None = None) -> np.ndarray:
@@ -221,8 +243,8 @@ def visualize_huber_loss(
 
                 # --- Displays ---
                 ortho_d = _gray_stretch(ortho, mask_np)
-                dtm_d = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
-                pred_d = np.clip((pred[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                dtm_d = _display_dtm(dtm[0, 0])
+                pred_d = _display_dtm(pred[0, 0])
                 signed_d, vlim_s = _signed_stretch(signed_err, mask_np)
                 abs_d = abs_err[0, 0].cpu().numpy()
                 if mask_np is not None:
@@ -318,8 +340,8 @@ def visualize_laplacian_loss(
                 _, shared_vlim = _signed_stretch(combined, None)
 
                 ortho_d = _gray_stretch(ortho, mask_np)
-                dtm_d = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
-                pred_d = np.clip((pred[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                dtm_d = _display_dtm(dtm[0, 0])
+                pred_d = _display_dtm(pred[0, 0])
                 gt_lap_d, _ = _signed_stretch(gt_lap, mask_np, shared_vlim)
                 pr_lap_d, _ = _signed_stretch(pr_lap, mask_np, shared_vlim)
                 err_d = lap_err[0, 0].cpu().numpy()
@@ -436,8 +458,8 @@ def visualize_ordinal_ranking(
                 subset = rng.choice(len(idx_i_np), size=draw, replace=False)
 
                 ortho_d = _gray_stretch(ortho, mask_np)
-                dtm_d = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
-                pred_d = np.clip((pred[0, 0].cpu().numpy() + 1.0) / 2.0, 0, 1)
+                dtm_d = _display_dtm(dtm[0, 0])
+                pred_d = _display_dtm(pred[0, 0])
 
                 axes[count, 0].imshow(ortho_d, cmap="gray", vmin=0, vmax=1)
                 axes[count, 1].imshow(dtm_d, cmap="terrain")
@@ -604,7 +626,7 @@ def visualize_random_flips_and_rotations(dataloader, output_dir: Path, num_sampl
 
             # Format for matplotlib
             img_np = np.clip((np.transpose(img.cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
-            dtm_np = np.clip((dtm[0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+            dtm_np = _display_dtm(dtm[0])
             mask_np = conf[0].cpu().numpy()
 
             # Isolate spatial dimensions to place the arrow in the center
@@ -1105,7 +1127,7 @@ def visualize_tin_artifacts(dataloader, output_dir: Path, num_samples: int = 8, 
 
     for count, item in enumerate(selected):
         img_disp = np.clip((np.transpose(item["img"], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
-        dtm_disp = np.clip((item["dtm"] + 1.0) / 2.0, 0.0, 1.0)
+        dtm_disp = _display_dtm(item["dtm"])
         mask_np = item["mask"].astype(bool)
         lap_np = np.abs(item["laplacian"])
         density_np = item["density"]
@@ -1203,7 +1225,7 @@ def visualize_loss_components(dataloader, output_dir, num_samples=4):
                 # Prep for Plotting
                 # ---------------------------------------------------------
                 img_disp = np.clip((np.transpose(img[0].cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
-                dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                dtm_disp = _display_dtm(dtm[0, 0])
                 mask_np = mask[0, 0].cpu().numpy().astype(bool)
                 img_disp[~mask_np] = np.nan
                 dtm_disp[~mask_np] = np.nan
@@ -1282,8 +1304,8 @@ def visualize_invalid_fill(dataloader, output_dir: Path, num_samples: int = 4, i
                 img_masked_np = np.clip((np.transpose(img_masked[0].cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
                 img_filled_np = np.clip((np.transpose(img_filled[0].cpu().numpy(), (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
 
-                dtm_masked_np = np.clip((dtm_masked[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
-                dtm_filled_np = np.clip((dtm_filled[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                dtm_masked_np = _display_dtm(dtm_masked[0, 0])
+                dtm_filled_np = _display_dtm(dtm_filled[0, 0])
 
                 # Set masked regions to NaN for the "Masked" plots so they show up clear white/blank
                 bool_mask = mask_np.astype(bool)
@@ -1321,6 +1343,7 @@ def visualize_loss_physics(
         num_samples: int = 6,
         loss_fn: "PhotoclinometricLoss | None" = None,
         lunar_lambert_weight_override: float | None = None,
+        ref_scale: float = DEFAULT_ELEV_REF_SCALE,
 ):
     """Visualises the internal physics of the Photoclinometric Loss.
 
@@ -1432,21 +1455,29 @@ def visualize_loss_physics(
                     intensity = batch["intensity"][i: i + 1].to(device).float()
                     ambient = batch["ambient"][i: i + 1].to(device).float()
 
+                    # Denormalize DTM to physical metres for rendering
+                    if "residual_scale" in batch:
+                        _scale = batch["residual_scale"][i: i + 1].to(device)
+                        dtm_physical = GlobalLogNormalizer.denormalize_batch(dtm, _scale)
+                    else:
+                        dtm_physical = GlobalLogNormalizer(ref_scale).denormalize_prediction(dtm)
+
                     ortho_gray = img.mean(dim=1, keepdim=True) if img.shape[1] == 3 else img
 
-                    # --- Estimate GT exposure/sun via OLS (for sanity check column) ---
-                    sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_irls(dtm, img, mask)
+                    # --- Estimate GT exposure/sun via OLS from physical DTM ---
+                    sun_vec_gt, intensity_gt, ambient_gt = estimate_sun_vector_irls(
+                        dtm_physical, img, mask)
                     # OLS returns (3,), scalar, scalar — reshape for render_from_depth
                     sun_vec_gt = sun_vec_gt.view(1, 3)
                     intensity_gt = intensity_gt.view(1)
                     ambient_gt = ambient_gt.view(1)
 
-                    # --- Use the ACTUAL loss class methods ---
+                    # --- Use the ACTUAL loss class methods with physical DTM ---
                     render, normals = loss_fn.render_from_depth(
-                        dtm, sun_vec, intensity, ambient,
+                        dtm_physical, sun_vec, intensity, ambient,
                     )
                     render_gt, _ = loss_fn.render_from_depth(
-                        dtm, sun_vec_gt, intensity_gt, ambient_gt,
+                        dtm_physical, sun_vec_gt, intensity_gt, ambient_gt,
                     )
 
                     # --- z-scored versions: what SSIM actually sees ---
@@ -1457,7 +1488,7 @@ def visualize_loss_physics(
                     mask_np = mask[0, 0].cpu().numpy().astype(bool)
 
                     img_disp = _to_gray_display(ortho_gray, mask_np)
-                    dtm_disp = np.clip((dtm[0, 0].cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
+                    dtm_disp = _display_dtm(dtm_physical[0, 0])
                     normals_disp = np.clip(
                         (normals[0].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0, 0.0, 1.0,
                     )
@@ -3302,7 +3333,7 @@ def generate_thumbnail_grids(dataloader, output_dir: Path, num_samples: int = 3)
 
     for idx in tqdm(range(num_samples), desc="Generating thumbnails"):
         img_np = np.clip((np.transpose(images[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
-        dtm_np = np.clip((np.transpose(dtms[idx], (1, 2, 0)) + 1.0) / 2.0, 0.0, 1.0)
+        dtm_np = _display_dtm(np.transpose(dtms[idx], (1, 2, 0)))
         mask_np = masks[idx][0].astype(bool)
         # img_np[~mask_np] = np.nan
         # dtm_np[~mask_np] = np.nan

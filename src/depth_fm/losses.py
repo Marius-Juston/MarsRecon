@@ -1067,6 +1067,7 @@ class CombinedLoss(nn.Module):
             v_target: torch.Tensor,
             pred_depth_pixels: torch.Tensor = None,
             gt_depth_pixels: torch.Tensor = None,
+            pred_depth_physical: torch.Tensor = None,
             confidence: torch.Tensor = None,
             real_ortho: torch.Tensor | None = None,
             sun_vector: torch.Tensor | None = None,
@@ -1146,8 +1147,9 @@ class CombinedLoss(nn.Module):
             if intensity is None:
                 intensity = torch.ones(B_photo, 1, device=pred_depth_pixels.device)
 
+            pred_for_photo = pred_depth_physical if pred_depth_physical is not None else pred_depth_pixels
             l_photo = self.photo_loss(
-                pred_depth=pred_depth_pixels,
+                pred_depth=pred_for_photo,
                 real_ortho=real_ortho,
                 # Use active_conf (gated by use_confidence_weighting) for
                 # consistency with all other aux losses. If the switch is

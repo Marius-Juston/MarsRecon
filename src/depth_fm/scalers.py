@@ -108,6 +108,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Canonical fallback reference scale (metres). Matches _DEFAULT_ELEV_SCALE in
+# depthfm_adapter.py and dataset_stats/dtm/dataset_stats.json (Olympus region).
+DEFAULT_ELEV_REF_SCALE: float = 45.90752235993998
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Data structures
@@ -389,6 +393,25 @@ class GlobalLogNormalizer:
                 * self.ref_scale
                 * torch.expm1(prediction.abs() * self._log2)
         )
+
+    @staticmethod
+    def denormalize_batch(
+            normed: torch.Tensor,
+            residual_scales: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorized per-sample denormalization using per-sample ref scales.
+
+        Args:
+            normed: (B, ...) log-compressed normalized tensor.
+            residual_scales: (B,) ref scale per sample (metres).
+        Returns:
+            Physical residual in metres, same shape as normed.
+        """
+        log2 = float(np.log(2.0))
+        scales = residual_scales.to(normed.device).view(
+            normed.shape[0], *([1] * (normed.dim() - 1))
+        )
+        return torch.sign(normed) * scales * torch.expm1(normed.abs() * log2)
 
 
 # ──────────────────────────────────────────────────────────────────────

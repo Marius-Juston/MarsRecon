@@ -45,6 +45,7 @@ from shapely.geometry import Polygon, box
 from torchgeo.datasets.errors import DatasetNotFoundError
 from torchgeo.datasets.geo import GeoDataset
 from torchgeo.datasets.utils import GeoSlice, Path, Sample, download_url
+from cache import spatial_cache_dir, write_manifest
 from tqdm import tqdm
 
 CONFIG = "logger_config.json"
@@ -125,6 +126,34 @@ class ProductMeta:
     incidence_angle: float = 45.0  # Default safe angle
     solar_azimuth: float = 270.0  # Default safe direction
 
+    # Additional viewing geometry (parsed from VIEWING_PARAMETERS group)
+    emission_angle: float | None = None
+    phase_angle: float | None = None
+    local_time: float | None = None
+    solar_longitude: float | None = None
+    sub_solar_azimuth: float | None = None
+    north_azimuth: float | None = None
+
+    # Identification & timing
+    observation_id: str | None = None
+    product_id: str | None = None
+    product_version_id: str | None = None
+    target_name: str | None = None
+    mission_phase_name: str | None = None
+    orbit_number: int | None = None
+    rationale_desc: str | None = None
+    start_time: str | None = None
+    stop_time: str | None = None
+    product_creation_time: str | None = None
+
+    # Map projection
+    map_scale: float | None = None
+    map_resolution: float | None = None
+    map_projection_type: str | None = None
+    center_latitude: float | None = None
+    center_longitude: float | None = None
+    center_filter_wavelength: float | None = None
+
     @classmethod
     def from_lbl(cls, lbl_path: pathlib.Path) -> ProductMeta:
         """Parse a PDS3 LBL and return a populated instance."""
@@ -146,10 +175,60 @@ class ProductMeta:
             m = re.search(pat, text, re.MULTILINE)
             return int(m.group(1)) if m else None
 
+        def _str(pat: str) -> str | None:
+            m = re.search(pat, text, re.MULTILINE)
+            return m.group(1).strip().strip('"').strip("'") if m else None
+
         if (v := _float(r"^\s*INCIDENCE_ANGLE\s*=\s*([\d.eE+\-]+)")) is not None:
             obj.incidence_angle = v
-        if (v := _float(r"^\s*SOLAR_AZIMUTH\s*=\s*([\d.eE+\-]+)")) is not None:
+        # Match SOLAR_AZIMUTH but not SUB_SOLAR_AZIMUTH
+        if (v := _float(r"^\s*(?<!SUB_)SOLAR_AZIMUTH\s*=\s*([\d.eE+\-]+)")) is not None:
             obj.solar_azimuth = v
+        if (v := _float(r"^\s*EMISSION_ANGLE\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.emission_angle = v
+        if (v := _float(r"^\s*PHASE_ANGLE\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.phase_angle = v
+        if (v := _float(r"^\s*LOCAL_TIME\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.local_time = v
+        if (v := _float(r"^\s*SOLAR_LONGITUDE\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.solar_longitude = v
+        if (v := _float(r"^\s*SUB_SOLAR_AZIMUTH\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.sub_solar_azimuth = v
+            # If solar_azimuth wasn't set from SOLAR_AZIMUTH, fall back here.
+            if not re.search(r"^\s*(?<!SUB_)SOLAR_AZIMUTH\s*=", text, re.MULTILINE):
+                obj.solar_azimuth = v
+        if (v := _float(r"^\s*NORTH_AZIMUTH\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.north_azimuth = v
+
+        # Identification / timing
+        obj.observation_id = _str(r"^\s*OBSERVATION_ID\s*=\s*\"?([^\"\n]+?)\"?\s*$")
+        obj.product_id = _str(r"^\s*PRODUCT_ID\s*=\s*\"?([^\"\n]+?)\"?\s*$")
+        obj.product_version_id = _str(r"^\s*PRODUCT_VERSION_ID\s*=\s*\"?([^\"\n]+?)\"?\s*$")
+        obj.target_name = _str(r"^\s*TARGET_NAME\s*=\s*\"?([^\"\n]+?)\"?\s*$")
+        obj.mission_phase_name = _str(r"^\s*MISSION_PHASE_NAME\s*=\s*\"?([^\"\n]+?)\"?\s*$")
+        obj.rationale_desc = _str(r"^\s*RATIONALE_DESC\s*=\s*\"?([^\"\n]+?)\"?\s*$")
+        obj.start_time = _str(r"^\s*START_TIME\s*=\s*([^\s\n]+)")
+        obj.stop_time = _str(r"^\s*STOP_TIME\s*=\s*([^\s\n]+)")
+        obj.product_creation_time = _str(
+            r"^\s*PRODUCT_CREATION_TIME\s*=\s*([^\s\n]+)"
+        )
+        if (v := _int(r"^\s*ORBIT_NUMBER\s*=\s*(\d+)")) is not None:
+            obj.orbit_number = v
+
+        # Map projection
+        if (v := _float(r"^\s*MAP_SCALE\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.map_scale = v
+        if (v := _float(r"^\s*MAP_RESOLUTION\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.map_resolution = v
+        obj.map_projection_type = _str(
+            r"^\s*MAP_PROJECTION_TYPE\s*=\s*\"?([^\"\n]+?)\"?\s*$"
+        )
+        if (v := _float(r"^\s*CENTER_LATITUDE\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.center_latitude = v
+        if (v := _float(r"^\s*CENTER_LONGITUDE\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.center_longitude = v
+        if (v := _float(r"^\s*CENTER_FILTER_WAVELENGTH\s*=\s*([\d.eE+\-]+)")) is not None:
+            obj.center_filter_wavelength = v
 
         if (v := _float(r"^\s*SCALING_FACTOR\s*=\s*([\d.eE+\-]+)")) is not None:
             obj.scaling_factor = v
@@ -718,7 +797,7 @@ class MarsHiRISEBase(GeoDataset):
             parts.append("_".join(_fmt(v) for v in self.bbox))
         parts.extend(self._cache_suffix_parts())
         suffix = f"_{'_'.join(parts)}" if parts else ""
-        return self.root / f"spatial_cache{suffix}_{self._cache_version()}.gpkg"
+        return spatial_cache_dir(self.root) / f"spatial_cache{suffix}_{self._cache_version()}.gpkg"
 
     def _cache_suffix_parts(self) -> list[str]:
         """Extra tokens appended to the cache filename.
@@ -738,6 +817,11 @@ class MarsHiRISEBase(GeoDataset):
         cache_df["t_start"] = self.index.index.left.astype(str)
         cache_df["t_stop"] = self.index.index.right.astype(str)
         cache_df.reset_index(drop=True).to_file(self.spatial_index_cache)
+        write_manifest(
+            self.spatial_index_cache,
+            cache_hash=self._cache_version(),
+            config_snapshot={"target": self.target, "bbox": self.bbox, "version": self._cache_version()},
+        )
 
     def _try_load_cache(self) -> bool:
         """Try to restore :attr:`index` from cache.  Returns success flag."""

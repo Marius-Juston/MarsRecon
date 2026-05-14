@@ -24,16 +24,18 @@ Drop-in replacement for litdata_datamodule_1.py — same API, same config.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from pathlib import Path
+
+from cache import litdata_cache_root, litdata_cache_key, validate_cache
 
 import lightning as L
 import numpy as np
 import torch
 from litdata import StreamingDataset, StreamingDataLoader
 from omegaconf import DictConfig
+from depth_fm.scalers import DEFAULT_ELEV_REF_SCALE
 
 logger = logging.getLogger(__name__)
 _VAL_WORKERS = 4
@@ -76,6 +78,8 @@ class MarsStreamingDataset(StreamingDataset):
         sun_vector = torch.from_numpy(raw["sun_vector"].astype(np.float32))
         intensity = torch.tensor(float(raw["intensity"]), dtype=torch.float32)
         ambient = torch.tensor(float(raw["ambient"]), dtype=torch.float32)
+        residual_scale = torch.tensor(
+            float(raw.get("residual_scale", DEFAULT_ELEV_REF_SCALE)), dtype=torch.float32)
 
         if self.random_flip:
             if torch.rand(1).item() > 0.5:
@@ -117,23 +121,15 @@ class MarsStreamingDataset(StreamingDataset):
             "sun_vector": sun_vector,
             "intensity": intensity,
             "ambient": ambient,
+            "residual_scale": residual_scale,
         }
 
 
 # ---------------------------------------------------------------------------
-# Cache key (unchanged)
+# Cache key
 # ---------------------------------------------------------------------------
 
-def _get_litdata_cache_key(config) -> str:
-    from omegaconf import OmegaConf
-    key_parts = {
-        "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
-        "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
-        "resolution": config.data.get("resolution", 512),
-        "dtm_normalization": config.data.get("dtm_normalization", "relative"),
-    }
-    raw = json.dumps(key_parts, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+_get_litdata_cache_key = litdata_cache_key  # backwards-compat alias
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +153,8 @@ class MarsDepthFMDataModule(L.LightningDataModule):
         self.hc = config.data.hirise
         self.tc = config.training
 
-        self.cache_hash = _get_litdata_cache_key(config)
-        self.litdata_root = Path(self.hc.root) / f"litdata_cache_{self.cache_hash}"
+        self.cache_hash = litdata_cache_key(config)
+        self.litdata_root = litdata_cache_root(config)
 
         self._train_dataset = None
         # val/test datasets stored only if strategy == "torch"
@@ -178,6 +174,9 @@ class MarsDepthFMDataModule(L.LightningDataModule):
                 f"LitData cache not found at {self.litdata_root}. "
                 f"Run `python build_litdata.py --config <your_config>` first."
             )
+        ok, issues = validate_cache(self.litdata_root / "train")
+        if not ok:
+            logger.warning("LitData cache validation issues: %s", "; ".join(issues))
 
         brightness_jitter = self.config.data.get("brightness_jitter", 0.1)
         seed = self.config.data.get("seed", 42)
@@ -265,8 +264,7 @@ def _build_litdata_loaders(config, split_seed: int = 42) -> dict:
     hc = config.data.hirise
     tc = config.training
 
-    cache_hash = _get_litdata_cache_key(config)
-    litdata_root = Path(hc.root) / f"litdata_cache_{cache_hash}"
+    litdata_root = litdata_cache_root(config)
 
     splits = ("train", "val", "test")
     if not all((litdata_root / s / "_SUCCESS").exists() for s in splits):

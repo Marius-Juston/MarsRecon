@@ -131,6 +131,7 @@ class MarsHiRISE(MarsHiRISEBase):
             reuse_cache: bool = True,
             normalize: bool = False,
             normalization_path: str | None = None,
+            return_meta: bool = False,
     ) -> None:
         """Initialise the dataset.
 
@@ -160,6 +161,8 @@ class MarsHiRISE(MarsHiRISEBase):
             DatasetNotFoundError: If index files are absent and
                 ``download=False``.
         """
+        self.return_meta = return_meta
+
         # ── Channel validation (before super().__init__ triggers _verify) ──
         if channels is None:
             self.channels: list[str] = list(ALL_CHANNELS)
@@ -257,18 +260,27 @@ class MarsHiRISE(MarsHiRISEBase):
             )
 
         tiles: list[torch.Tensor] = []
+        patch_metadata: list[dict] = []
         for _, row in candidates.iterrows():
             # GeoPackage stores None as NaN on round-trip; guard against both.
             cp = row["color_path"]
             rp = row["red_path"]
+            cp_path = pathlib.Path(cp) if isinstance(cp, str) else None
+            rp_path = pathlib.Path(rp) if isinstance(rp, str) else None
             tile = self._load_tile(
-                color_path=pathlib.Path(cp) if isinstance(cp, str) else None,
-                red_path=pathlib.Path(rp) if isinstance(rp, str) else None,
+                color_path=cp_path,
+                red_path=rp_path,
                 x=x,
                 y=y,
             )
-            if tile is not None:
-                tiles.append(tile)
+            if tile is None:
+                continue
+            tiles.append(tile)
+
+            if self.return_meta:
+                patch_metadata.append(
+                    self._collect_meta(row["obs_id"], cp_path, rp_path)
+                )
 
         if not tiles:
             n = len(candidates)
@@ -296,6 +308,8 @@ class MarsHiRISE(MarsHiRISEBase):
             "bounds": self._slice_to_tensor(index),
             "crs": self.crs.to_wkt(),
         }
+        if self.return_meta:
+            sample["meta"] = patch_metadata
         if self.transforms is not None:
             sample = self.transforms(sample)
         return sample
@@ -556,6 +570,64 @@ class MarsHiRISE(MarsHiRISEBase):
     # ------------------------------------------------------------------
     # Tile loading
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _meta_to_dict(meta: ProductMeta) -> dict:
+        """Flatten a ProductMeta to a JSON-serialisable dict."""
+        return {
+            # Identification
+            "observation_id": meta.observation_id,
+            "product_id": meta.product_id,
+            "product_version_id": meta.product_version_id,
+            "target_name": meta.target_name,
+            "mission_phase_name": meta.mission_phase_name,
+            "orbit_number": meta.orbit_number,
+            "rationale_desc": meta.rationale_desc,
+            # Timing
+            "start_time": meta.start_time,
+            "stop_time": meta.stop_time,
+            "product_creation_time": meta.product_creation_time,
+            # Viewing geometry
+            "incidence_angle": meta.incidence_angle,
+            "emission_angle": meta.emission_angle,
+            "phase_angle": meta.phase_angle,
+            "local_time": meta.local_time,
+            "solar_longitude": meta.solar_longitude,
+            "solar_azimuth": meta.solar_azimuth,
+            "sub_solar_azimuth": meta.sub_solar_azimuth,
+            "north_azimuth": meta.north_azimuth,
+            # Map projection
+            "map_projection_type": meta.map_projection_type,
+            "map_scale": meta.map_scale,
+            "map_resolution": meta.map_resolution,
+            "center_latitude": meta.center_latitude,
+            "center_longitude": meta.center_longitude,
+            "center_filter_wavelength": meta.center_filter_wavelength,
+            # Radiometric calibration
+            "scaling_factor": meta.scaling_factor,
+            "offset": meta.offset,
+            "sample_bits": meta.sample_bits,
+            "bands": meta.bands,
+            "filter_names": list(meta.filter_names),
+        }
+
+    def _collect_meta(
+            self,
+            obs_id: str,
+            color_path: pathlib.Path | None,
+            red_path: pathlib.Path | None,
+    ) -> dict:
+        """Collect per-observation metadata from companion LBL files."""
+        entry: dict = {"obs_id": obs_id}
+        for tag, jp2 in (("color", color_path), ("red", red_path)):
+            if jp2 is None:
+                continue
+            # prefer_cog may return .tif; LBL always sits next to the original JP2
+            lbl = jp2.with_suffix(".LBL")
+            if not lbl.exists():
+                continue
+            entry[tag] = self._meta_to_dict(ProductMeta.from_lbl(lbl))
+        return entry
 
     def _load_tile(
             self,

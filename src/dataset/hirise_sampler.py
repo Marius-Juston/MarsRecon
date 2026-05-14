@@ -69,11 +69,12 @@ cache files are transparently reused.  The optimal-mode parameters
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import pathlib
 from collections.abc import Iterator
+
+from cache import compute_hash, sampler_split_cache_dir, write_manifest
 from typing import Any, Literal
 
 import numpy as np
@@ -289,12 +290,7 @@ def _split_cache_key(
         key_parts["packing_phase_steps"] = packing_phase_steps
         key_parts["valid_region_rays"] = valid_region_rays
 
-    raw = json.dumps(key_parts, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-
-def _split_cache_dir(dataset_root: str) -> pathlib.Path:
-    return pathlib.Path(dataset_root) / ".cache" / "sampler_splits"
+    return compute_hash(key_parts)
 
 
 def _load_cached_split(cache_path: pathlib.Path) -> dict[int, str] | None:
@@ -619,7 +615,7 @@ class HiRISEGeoSampler(GeoSampler):
             valid_region_rays=self.valid_region_rays,
         )
 
-        cache_dir = _split_cache_dir(ds_root)
+        cache_dir = sampler_split_cache_dir(ds_root)
         cache_path = cache_dir / f"split_{self.cache_hash}.json"
 
         # Try cache
@@ -675,6 +671,7 @@ class HiRISEGeoSampler(GeoSampler):
             },
         }
         _save_cached_split(cache_path, assignments, metadata)
+        write_manifest(cache_path, cache_hash=self.cache_hash, config_snapshot=metadata)
 
         return assignments
 

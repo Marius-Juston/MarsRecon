@@ -20,12 +20,13 @@ Usage:
 """
 import argparse
 import glob
-import hashlib
 import json
 import logging
 import os
 import shutil
 from pathlib import Path
+
+from cache import compute_hash, write_manifest
 
 import torch
 
@@ -191,13 +192,14 @@ def upload_dataset_card(repo_id: str, cache_hash: str, config_yaml: str, private
 # ── Core preprocessing (unchanged) ────────────────────────────────────────
 
 def get_litdata_cache_key(config) -> str:
-    """Deterministic hash for the current preprocessing configuration."""
+    """Deterministic hash for the raw LitData cache (hirise + sampler only)."""
+    from omegaconf import OmegaConf
     key_parts = {
         "hirise": OmegaConf.to_container(config.data.hirise, resolve=True),
         "sampler": OmegaConf.to_container(config.data.sampler, resolve=True),
+        "pipeline": "raw",
     }
-    raw = json.dumps(key_parts, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return compute_hash(key_parts)
 
 
 def _configure_worker_logger(worker_id):
@@ -236,7 +238,7 @@ def build_litdata_for_split(
     sc = config.data.sampler
 
     dataset_root = Path(hc.root)
-    output_dir = str(dataset_root / f"litdata_cache_{cache_hash}" / split)
+    output_dir = str(dataset_root / ".cache" / "litdata_raw" / cache_hash / split)
 
     # Check for completion marker
     success_marker = Path(output_dir) / "_SUCCESS"
@@ -303,7 +305,7 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
 
     num_samples = len(sampler)
 
-    tmp_dir = dataset_root / f"_litdata_tmp_{cache_hash}_{split}"
+    tmp_dir = dataset_root / ".cache" / f"_tmp_{cache_hash}_{split}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     effective_workers = min(workers, max(1, num_samples // 4))
@@ -383,6 +385,13 @@ def _build_split(config, split, cache_hash, workers, output_dir, success_marker)
     logger.info(f"[{split}] Cleaned up temp directory.")
 
     success_marker.touch()
+
+    from omegaconf import OmegaConf
+    write_manifest(
+        Path(output_dir),
+        cache_hash=cache_hash,
+        config_snapshot=OmegaConf.to_container(config, resolve=True),
+    )
     logger.info(f"[{split}] Done.")
 
 

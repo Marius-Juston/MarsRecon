@@ -102,6 +102,7 @@ import wandb
 from lightning.pytorch.callbacks import EMAWeightAveraging
 
 from depth_fm.losses import CombinedLoss, PhotoclinometricLoss
+from depth_fm.scalers import GlobalLogNormalizer, DEFAULT_ELEV_REF_SCALE
 from depth_fm.metrics import affine_align
 from depth_fm.metrics import compute_depth_metrics, compute_photo_consistency, MetricsAggregator
 from depth_fm.model import build_model
@@ -393,6 +394,15 @@ class DepthFMLightningModule(L.LightningModule):
             ordinal_weight=lc.get("ordinal_weight", 0.0),
             ordinal_start_step=lc.get("ordinal_start_step", 0.0),
 
+        )
+
+        # Elevation normaliser — used as fallback when batch has no residual_scale.
+        # clip must match the adapter so clip=False data (values outside [-1,1]) is
+        # denormalized correctly (clip has no effect on denormalize_prediction but
+        # keeps the object consistent with the data that was produced).
+        self.evel_normalizer = GlobalLogNormalizer(
+            config.data.get("elev_ref_scale", DEFAULT_ELEV_REF_SCALE),
+            clip=config.data.get("clip", False),
         )
 
         # Flow matching config
@@ -783,6 +793,22 @@ class DepthFMLightningModule(L.LightningModule):
         with torch.no_grad():
             return self.model.decode_from_latent(latent)
 
+    def _denorm(
+            self,
+            normed: torch.Tensor,
+            residual_scales: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Convert log-compressed normalised DTM to physical metres.
+
+        Uses per-sample residual_scales from the batch when available so the
+        actual scale stored with each sample is used, not the global default.
+        Falls back to self.evel_normalizer when no scales are provided (e.g.
+        in estimate_uncertainty / _predict_flow_intermediates).
+        """
+        if residual_scales is not None:
+            return GlobalLogNormalizer.denormalize_batch(normed, residual_scales)
+        return self.evel_normalizer.denormalize_prediction(normed)
+
     def _decode_pixel_loss(self, latent: torch.Tensor) -> torch.Tensor:
         return self.model.decode_from_latent(latent)
 
@@ -814,8 +840,8 @@ class DepthFMLightningModule(L.LightningModule):
             # via the _get_x_source() method internally.
             z_pred = self._predict_depth(z_img, num_steps=num_steps)
 
-            # Decode to physical pixel space
-            pred_pix = self._decode(z_pred)[:, 0]
+            pred_pix = self.evel_normalizer.denormalize_prediction(
+                self._decode(z_pred)[:, 0])
             dtm_hypotheses.append(pred_pix)
 
         # Stack into shape: (N, B, 1, H, W)
@@ -847,15 +873,16 @@ class DepthFMLightningModule(L.LightningModule):
         x_source = self._get_x_source(z_img)
         z_t = x_source
         dt = 1.0 / num_steps
-        intermediates[0.0] = self._decode(z_t)[:, 0].float().cpu().numpy()
+        intermediates[0.0] = self.evel_normalizer.denormalize_prediction(
+            self._decode(z_t)[:, 0].float()).cpu().numpy()
         for step in range(num_steps):
             t_val = step * dt
             t = torch.full((z_t.shape[0],), t_val, device=self.device)
             v = self.model.predict_velocity(z_t, t, z_img)
             z_t = z_t + dt * v
             t_after = (step + 1) * dt
-            decoded = self._decode(z_t)[:, 0].float().cpu().numpy()
-            intermediates[t_after] = decoded
+            decoded = self._decode(z_t)[:, 0].float()
+            intermediates[t_after] = self.evel_normalizer.denormalize_prediction(decoded).cpu().numpy()
         return intermediates
 
     # ------------------------------------------------------------------
@@ -909,11 +936,15 @@ class DepthFMLightningModule(L.LightningModule):
 
         # Pixel-space losses
         pred_pix = gt_pix = None
+        pred_pix_physical = gt_pix_physical = None
         if self.loss_fn.needs_pixel_decode(step):
             self._trace("training_step: executing loss_fn.needs_pixel_decode block")
             z_pred_clean = z_t + (1.0 - t_exp) * v_pred
             pred_pix = self._decode_pixel_loss(z_pred_clean)
             gt_pix = self._decode(z_depth)
+            scales = batch.get("residual_scale")
+            pred_pix_physical = self._denorm(pred_pix[:, :1], scales).expand_as(pred_pix)
+            gt_pix_physical = self._denorm(gt_pix[:, :1], scales).expand_as(gt_pix)
 
         self._trace("training_step: calculating loss_dict")
         loss_dict = self.loss_fn(
@@ -921,6 +952,7 @@ class DepthFMLightningModule(L.LightningModule):
             v_target=v_target,
             pred_depth_pixels=pred_pix,
             gt_depth_pixels=gt_pix,
+            pred_depth_physical=pred_pix_physical,
             confidence=batch.get("confidence"),
             global_step=step,
             real_ortho=batch["image"],
@@ -1045,8 +1077,9 @@ class DepthFMLightningModule(L.LightningModule):
 
         z_pred_unboosted = z_pred / signal_boost
 
-        pred_pix_t = self._decode(z_pred_unboosted)[:, 0].float()
-        gt_raw_t = batch["dtm"][:, 0].float()
+        scales = batch.get("residual_scale")
+        pred_pix_t = self._denorm(self._decode(z_pred_unboosted)[:, 0].float(), scales)
+        gt_raw_t = self._denorm(batch["dtm"][:, 0].float(), scales)
 
         gt_raw = gt_raw_t.cpu().numpy()
         pred_pix = pred_pix_t.cpu().numpy()
@@ -1503,11 +1536,12 @@ class DepthFMLightningModule(L.LightningModule):
         z_pred = self._predict_depth(z_img, num_steps=num_steps)
         self._trace(f"test_step batch {batch_idx}: finished _predict_depth")
 
-        pred_pix_t = self._decode(z_pred)[:, 0].float()
-        gt_raw_t = batch["dtm"][:, 0].float().cpu().numpy()
+        scales = batch.get("residual_scale")
+        pred_pix_t = self._denorm(self._decode(z_pred)[:, 0].float(), scales)
+        gt_raw_t = self._denorm(batch["dtm"][:, 0].float(), scales)
 
         pred_pix = pred_pix_t.cpu().numpy()
-        gt_raw = gt_raw_t
+        gt_raw = gt_raw_t.cpu().numpy()
 
         if "confidence" in batch:
             conf_mask = batch["confidence"][:, 0].float().cpu().numpy()
@@ -1671,17 +1705,22 @@ class DepthFMLightningModule(L.LightningModule):
                 z_pred = self._predict_depth(z_img, num_steps=n_steps)
                 self._trace(f"run_timestep_ablation (steps={n_steps}): finished _predict_depth")
 
+                scales = batch.get("residual_scale")
                 if self.trainer.world_size > 1:
                     self._trace(f"run_timestep_ablation (steps={n_steps}): starting all_gather collective")
                     z_pred = self.all_gather(z_pred).view(-1, *z_pred.shape[1:])
                     z_depth_gathered = self.all_gather(z_depth).view(-1, *z_depth.shape[1:])
                     self._trace(f"run_timestep_ablation (steps={n_steps}): finished all_gather collective")
+                    if scales is not None:
+                        scales = scales.repeat(self.trainer.world_size)
                 else:
                     z_depth_gathered = z_depth
 
                 if self.global_rank == 0:
-                    pred_pix = self._decode(z_pred)[:, 0].float().cpu().numpy()
-                    gt_pix = self._decode(z_depth_gathered)[:, 0].float().cpu().numpy()
+                    pred_pix = self._denorm(
+                        self._decode(z_pred)[:, 0].float(), scales).cpu().numpy()
+                    gt_pix = self._denorm(
+                        self._decode(z_depth_gathered)[:, 0].float(), scales).cpu().numpy()
 
                     for i in range(pred_pix.shape[0]):
                         tile_id = f"b{batch_idx}_s{i}"
