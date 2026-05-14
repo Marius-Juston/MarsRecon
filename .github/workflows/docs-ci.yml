@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install system deps (graphviz, GDAL)
         run: |
@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y graphviz gdal-bin libgdal-dev
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -60,7 +60,7 @@ jobs:
         run: uv run properdocs build
 
       - name: Upload site artifact (PR preview)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: site-${{ github.event.pull_request.number || github.run_id }}
           path: site/
