@@ -401,7 +401,7 @@ class TestWorkerProcess:
         from unittest.mock import AsyncMock, patch
 
         mock_download_many = AsyncMock(return_value=None)
-        with patch("dataset.mars_hirise_base._download_many", mock_download_many):
+        with patch("dataset.core.base._download_many", mock_download_many):
             _worker_process([(_URL, dest)], concurrency_per_process=1, stop_event=stop_event)
 
         mock_download_many.assert_called_once_with(

@@ -181,12 +181,16 @@ class TestHiRISESamplerReproducibility:
 
 class TestHiRISESamplerStride:
     def test_smaller_stride_produces_more_centers(self, strip_polygon, mars_crs):
+        # NOTE: stride is only respected in center_mode="simple"; the default
+        # center_mode="optimal" packs patches using patch_overlap instead.
         dataset = make_mock_dataset([strip_polygon], mars_crs)
         coarse = HiRISEGeoSampler(
-            dataset, size=0.005, stride=0.005, units=Units.CRS
+            dataset, size=0.005, stride=0.005, units=Units.CRS,
+            center_mode="simple",
         )
         fine = HiRISEGeoSampler(
-            dataset, size=0.005, stride=0.002, units=Units.CRS
+            dataset, size=0.005, stride=0.002, units=Units.CRS,
+            center_mode="simple",
         )
         assert len(fine._centers) > len(coarse._centers)
 
