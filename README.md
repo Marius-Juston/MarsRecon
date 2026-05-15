@@ -26,7 +26,7 @@ loaders.
   `.LBL` files.
 - Spatial index with polygon footprints — convex hull of non-zero pixels intersected with each JP2's reprojected bounds
   for accurate footprints.
-- COG-ready — `src/dataset/preprocessing.py` converts JP2 files to Cloud Optimised GeoTIFF for 10–100× faster
+- COG-ready — `src/dataset/preprocessing/cog_conversion.py` converts JP2 files to Cloud Optimised GeoTIFF for 10–100× faster
   random-access reads.
 - Geographic train/test split — longitude- or latitude-blocked splits prevent spatial leakage.
 
@@ -64,8 +64,7 @@ Pass `download=True` on first use to auto-download files. Mirrors via `rsync` or
 
 ```python
 from torch.utils.data import DataLoader
-from dataset.mars_hirise import MarsHiRISE
-from dataset.hirise_sampler import HiRISEGeoSampler
+from dataset import MarsHiRISE, HiRISEGeoSampler
 from torchgeo.samplers import Units
 
 # Olympus Mons region, all three colour channels
@@ -100,7 +99,7 @@ When `_COLOR.JP2` is absent for an observation, available channels fall back to 
 
 ## Sampler
 
-`HiRISEGeoSampler` in `src/dataset/hirise_sampler.py` replaces TorchGeo's `RandomGeoSampler` for HiRISE data:
+`HiRISEGeoSampler` in `src/dataset/sampling/sampler.py` replaces TorchGeo's `RandomGeoSampler` for HiRISE data:
 
 ```python
 sampler = HiRISEGeoSampler(
@@ -119,8 +118,8 @@ per sample.
 ## Dataset statisitics
 
 ```bash
-time PYTHONPATH=src uv run -m src.dataset.compute_dataset_stats
-time PYTHONPATH=src uv run -m src.dataset.compute_dataset_stats --dtm
+time PYTHONPATH=src uv run python -m dataset.stats.compute_stats
+time PYTHONPATH=src uv run python -m dataset.stats.compute_stats --dtm
 ```
 
 ## COG conversion (optional, recommended)
@@ -128,8 +127,8 @@ time PYTHONPATH=src uv run -m src.dataset.compute_dataset_stats --dtm
 Converting JP2 files to Cloud Optimised GeoTIFF dramatically speeds up random-window reads:
 
 ```bash
-time PYTHONPATH=src uv run python -m src.dataset.preprocessing --root /scratch/mars_hirise --workers 4
-time PYTHONPATH=src uv run python -m src.dataset.preprocessing --root /scratch/mars_hirise_dtm --workers 4
+time PYTHONPATH=src uv run python -m dataset.preprocessing.cog_conversion --root /scratch/mars_hirise --workers 4
+time PYTHONPATH=src uv run python -m dataset.preprocessing.cog_conversion --root /scratch/mars_hirise_dtm --workers 4
 ```
 
 The dataset transparently prefers `.tif` COG sidecars when they exist alongside `.JP2` files.
@@ -139,13 +138,13 @@ The dataset transparently prefers `.tif` COG sidecars when they exist alongside 
 To have even faster dataset throughput you can convert the information for the liData format
 
 ```bash
-PYTHONPATH=src uv run -m src.depth_fm.build_litdata
+PYTHONPATH=src uv run python scripts/training/build_litdata.py --config configs/train_hirise.yaml --workers 96
 ```
 
 The sun view is probably doing to be wrong due to the GPU vs CPU computation, this can be validated using
 
 ```bash
-bash scripts/launch_train.sh configs/train_hirise.yaml 1 4 --view_loss_physics 
+bash scripts/training/launch_train.sh --config configs/train_hirise.yaml --n_runs 1 --view_loss_physics
 ```
 
 this is an important thing to run otherwise you will not have the correct losses.
@@ -154,7 +153,7 @@ this is an important thing to run otherwise you will not have the correct losses
 
 ```bash
 # Generate coverage map + sample patches (saves to Figures/)
-uv run python src/dataset/mars_hirise.py
+PYTHONPATH=src uv run python -m dataset.core.rdr
 ```
 
 ## Tests
@@ -174,18 +173,18 @@ uv run pytest tests/ -m integration -v -n auto
 
 All three library modules are at **100% line coverage** across 274 unit tests:
 
-| Module                  | Statements | Coverage |
-|-------------------------|------------|----------|
-| `src/mars_hirise.py`    | 828        | 100%     |
-| `src/hirise_sampler.py` | 80         | 100%     |
-| `src/preprocessing.py`  | 161        | 100%     |
+| Module                                        | Statements | Coverage |
+|-----------------------------------------------|------------|----------|
+| `src/dataset/core/rdr.py`                     | 828        | 100%     |
+| `src/dataset/sampling/sampler.py`             | 80         | 100%     |
+| `src/dataset/preprocessing/cog_conversion.py` | 161        | 100%     |
 
 ### Test suite overview
 
 | Test file                  | Tests | What it covers                                                                                  |
 |----------------------------|-------|-------------------------------------------------------------------------------------------------|
 | `test_mars_hirise_unit.py` | 100   | `MarsHiRISE` — dataset init, spatial index, tile loading, plotting, download pipeline, `main()` |
-| `test_preprocessing.py`    | 73    | All of `src/dataset/preprocessing.py` — JP2→COG conversion, geographic split, CLI               |
+| `test_preprocessing.py`    | 73    | All of `src/dataset/preprocessing/cog_conversion.py` — JP2→COG conversion, geographic split, CLI |
 | `test_download.py`         | 22    | Async download helpers, retry logic, disk-space guard, stop-event handling                      |
 | `test_sampler.py`          | 23    | `HiRISEGeoSampler` grid pre-computation, stride, pixel units, reproducibility                   |
 | `test_coordinates.py`      | 16    | Longitude normalisation and CRS helpers                                                         |
@@ -216,14 +215,17 @@ The file uses **synthetic data only** — no real HiRISE files are required.
 
 ## Architecture
 
-| File                       | Purpose                                                                                                        |
-|----------------------------|----------------------------------------------------------------------------------------------------------------|
-| `src/mars_hirise.py`       | `MarsHiRISE` — main `GeoDataset` subclass; index loading, spatial index, tile loading, radiometric calibration |
-| `src/hirise_sampler.py`    | `HiRISEGeoSampler` — strip-polygon-aware geospatial sampler                                                    |
-| `src/preprocessing.py`     | JP2 → COG conversion pipeline; geographic train/test split                                                     |
-| `src/validate_sampling.py` | Diagnostic script for visualising sampler hit-rate (not a library module)                                      |
-| `tests/conftest.py`        | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row`                          |
-| `tests/helpers.py`         | `make_mock_dataset()` — minimal GeoSampler-compatible mock                                                     |
+| File                                       | Purpose                                                                                                        |
+|--------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| `src/dataset/core/rdr.py`                  | `MarsHiRISE` — RDR `GeoDataset` subclass; index loading, tile loading, radiometric calibration                 |
+| `src/dataset/core/dtm.py`                  | `MarsHiRISEDTM` — stereo DTM + orthoimage `GeoDataset`                                                          |
+| `src/dataset/core/base.py`                 | `MarsHiRISEBase` — shared download, spatial index, footprint, viz infra                                         |
+| `src/dataset/sampling/sampler.py`          | `HiRISEGeoSampler` — strip-polygon-aware geospatial sampler                                                    |
+| `src/dataset/preprocessing/cog_conversion.py` | JP2 → COG conversion pipeline                                                                                |
+| `src/dataset/sampling/geometry.py`         | Geographic train/test split + valid-center patch packing                                                       |
+| `src/dataset/validation/sampling_diagnostics.py` | Diagnostic script for visualising sampler hit-rate (not a library module)                                |
+| `tests/conftest.py`                        | Shared fixtures: `mars_crs`, `strip_polygon`, `synthetic_lbl`, `synthetic_corner_row`                          |
+| `tests/helpers.py`                         | `make_mock_dataset()` — minimal GeoSampler-compatible mock                                                     |
 
 ### CRS design
 
@@ -257,20 +259,19 @@ mmdc -i reports/preprocessing.mmd -o preprocessing.pdf -b transparent -f
 To generate the overview of the MarsRecond architecutre overview:
 
 ```bash
-uv sync --optional viz
-uv run scripts/marsrecon_architecture.py
+uv run --extra docs python scripts/architecture/project_graph.py
 ```
 
 To generate the LaTeX tables for the dataset statistics
 
 ```bash
-uv run scripts/generate_dataset_stats_table.py dataset_stats/image/dataset_stats.json
+uv run python scripts/visualization/dataset_statistics.py dataset_stats/image/dataset_stats.json
 ```
 
 To generate the validations for the sampling:
 
 ```bash
-PYTHONPATH=src uv run python src/dataset/validate_sampling.py --root /scratch/mars_hirise --bbox -136 12 -124 24 --patch-size 0.005 --n-thumbnails 16 --n-hist-patches 30 --out validation/
+PYTHONPATH=src uv run python -m dataset.validation.sampling_diagnostics --root /scratch/mars_hirise --bbox -136 12 -124 24 --patch-size 0.005 --n-thumbnails 16 --n-hist-patches 30 --out validation/
 2026
 ```
 

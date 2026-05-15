@@ -124,6 +124,7 @@ scripts/                         — Entry-point scripts (not part of the import
   architecture/
     marsclip_diagram.py          — MarsCLIP architecture graphviz
     depthfm_pipeline_diagram.py  — DepthFM pipeline graphviz with embedded image nodes
+    project_graph.py             — Full-project pydeps import-graph SVGs (per top-level package)
   reconstruction/
     surface_blend.py             — Huber-IRLS overlap + cosine-taper blending of patch predictions
   common/
