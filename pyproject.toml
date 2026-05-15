@@ -73,6 +73,7 @@ docs = [
     "mkdocs-mermaid2-plugin>=1.2",
     "mkdocs-glightbox>=0.4",
     "pymdown-extensions>=10.11",
+    "pydeps>=3.0",
 ]
 
 [build-system]
