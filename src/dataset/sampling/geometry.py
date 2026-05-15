@@ -199,7 +199,7 @@ def pack_patches_independent_strips(
     size_h, size_w = as_patch_size(patch_size)
     stride_x = size_w * (1.0 - patch_overlap)
     stride_y = size_h * (1.0 - patch_overlap)
-    if stride_x <= 0 or stride_y <= 0:
+    if stride_x <= 0 or stride_y <= 0:  # pragma: no cover - defensive; size>0 and overlap in [0,1) guarantee stride>0
         raise ValueError("patch_overlap produces non-positive stride")
 
     minx, miny, maxx, maxy = valid_region.bounds
@@ -223,7 +223,7 @@ def pack_patches_independent_strips(
                         continue
                     ix_min, _, ix_max, _ = seg.bounds
                     width = ix_max - ix_min
-                    if width < 0:
+                    if width < 0:  # pragma: no cover - defensive; .bounds width is never negative
                         continue
                     count = int(width // stride_x) + 1
                     used = (count - 1) * stride_x
@@ -251,7 +251,7 @@ def pack_patches_independent_strips(
                         continue
                     _, iy_min, _, iy_max = seg.bounds
                     height = iy_max - iy_min
-                    if height < 0:
+                    if height < 0:  # pragma: no cover - defensive; .bounds height is never negative
                         continue
                     count = int(height // stride_y) + 1
                     used = (count - 1) * stride_y

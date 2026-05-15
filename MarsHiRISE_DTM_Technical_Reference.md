@@ -52,7 +52,7 @@ into the TorchGeo base class is derived from this value:
 super().__init__(..., res=1.0 / 59_251.13)
 ```
 
-*Reference: [MarsHiRISEDTM.__init__](mars_hirise_dtm.py) — "DTM typical resolution ≈ 1 m/pix → ~1/(59 251) deg/pix at
+*Reference: [MarsHiRISEDTM.__init__](src/dataset/core/dtm.py) — "DTM typical resolution ≈ 1 m/pix → ~1/(59 251) deg/pix at
 equator."*
 
 **Important caveat.** Individual DTMs can actually be produced at any of four canonical post spacings (see §5.3). The
@@ -533,7 +533,7 @@ data[~valid] = np.nan
 
 Mars surface elevations span roughly `−8 500 m` (Hellas Basin floor) to `+21 230 m` (Olympus Mons summit), a 30-km total
 range. Per-DTM ranges are tighter — a typical 10 × 10 km DTM covers 100–500 m of relief. The dataset's hardcoded
-fallback quantiles (from `depthfm_adapter.py`) for a 52k-patch Olympus-region sample are:
+fallback quantiles (from `src/depth_fm/data/adapter.py`) for a 52k-patch Olympus-region sample are:
 
 ```
 _DEFAULT_ELEV_P02 = −4 396.57 m

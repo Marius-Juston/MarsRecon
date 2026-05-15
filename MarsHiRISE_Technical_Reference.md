@@ -286,7 +286,7 @@ A Cloud-Optimised GeoTIFF stores pixel data in internal 512×512 tiles with buil
 only the tiles that overlap a query window, enabling O(patch_area) random-access reads instead of O(image_area)
 full-codeblock decodes.
 
-### 6.2  Conversion pipeline (`preprocessing.py`)
+### 6.2  Conversion pipeline (`src/dataset/preprocessing/cog_conversion.py`)
 
 The conversion proceeds in two passes:
 

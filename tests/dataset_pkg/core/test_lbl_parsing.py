@@ -114,6 +114,98 @@ class TestRadiometricCalibration:
 # ---------------------------------------------------------------------------
 
 
+class TestProductMetaRichLbl:
+    """Exercise every optional-field parsing branch (base.py:184-249)."""
+
+    @pytest.fixture
+    def rich_lbl(self, tmp_path: pathlib.Path) -> pathlib.Path:
+        content = (
+            'PDS_VERSION_ID = PDS3\n'
+            'INCIDENCE_ANGLE = 45.5\n'
+            'SOLAR_AZIMUTH = 120.25\n'
+            'EMISSION_ANGLE = 3.2\n'
+            'PHASE_ANGLE = 48.7\n'
+            'LOCAL_TIME = 15.5\n'
+            'SOLAR_LONGITUDE = 251.3\n'
+            'SUB_SOLAR_AZIMUTH = 99.9\n'
+            'NORTH_AZIMUTH = 270.0\n'
+            'OBSERVATION_ID = "PSP_001430_1780"\n'
+            'PRODUCT_ID = "PSP_001430_1780_COLOR"\n'
+            'PRODUCT_VERSION_ID = "1"\n'
+            'TARGET_NAME = "MARS"\n'
+            'MISSION_PHASE_NAME = "PRIMARY SCIENCE PHASE"\n'
+            'RATIONALE_DESC = "Layered deposits in crater"\n'
+            'START_TIME = 2007-01-01T00:00:00.000\n'
+            'STOP_TIME = 2007-01-01T00:01:00.000\n'
+            'PRODUCT_CREATION_TIME = 2007-06-01T12:00:00.000\n'
+            'ORBIT_NUMBER = 1430\n'
+            'MAP_SCALE = 0.25\n'
+            'MAP_RESOLUTION = 100000.0\n'
+            'MAP_PROJECTION_TYPE = "EQUIRECTANGULAR"\n'
+            'CENTER_LATITUDE = -5.0\n'
+            'CENTER_LONGITUDE = 224.0\n'
+            'CENTER_FILTER_WAVELENGTH = 700.0\n'
+            'SCALING_FACTOR = 2.5e-04\n'
+            'OFFSET = 0.04\n'
+            'SAMPLE_BITS = 16\n'
+            'BANDS = 3\n'
+            'END\n'
+        )
+        p = tmp_path / "RICH.LBL"
+        p.write_text(content)
+        return p
+
+    def test_all_optional_fields_parsed(self, rich_lbl):
+        m = ProductMeta.from_lbl(rich_lbl)
+        assert m.incidence_angle == pytest.approx(45.5)
+        assert m.solar_azimuth == pytest.approx(120.25)
+        assert m.emission_angle == pytest.approx(3.2)
+        assert m.phase_angle == pytest.approx(48.7)
+        assert m.local_time == pytest.approx(15.5)
+        assert m.solar_longitude == pytest.approx(251.3)
+        assert m.sub_solar_azimuth == pytest.approx(99.9)
+        assert m.north_azimuth == pytest.approx(270.0)
+        assert m.observation_id == "PSP_001430_1780"
+        assert m.product_id == "PSP_001430_1780_COLOR"
+        assert m.product_version_id == "1"
+        assert m.target_name == "MARS"
+        assert m.mission_phase_name == "PRIMARY SCIENCE PHASE"
+        assert m.rationale_desc == "Layered deposits in crater"
+        assert m.start_time.startswith("2007-01-01T00:00:00")
+        assert m.stop_time.startswith("2007-01-01T00:01:00")
+        assert m.product_creation_time.startswith("2007-06-01T12:00:00")
+        assert m.orbit_number == 1430
+        assert m.map_scale == pytest.approx(0.25)
+        assert m.map_resolution == pytest.approx(100000.0)
+        assert m.map_projection_type == "EQUIRECTANGULAR"
+        assert m.center_latitude == pytest.approx(-5.0)
+        assert m.center_longitude == pytest.approx(224.0)
+        assert m.center_filter_wavelength == pytest.approx(700.0)
+
+    def test_solar_azimuth_not_confused_with_sub_solar(self, rich_lbl):
+        """SOLAR_AZIMUTH must win over SUB_SOLAR_AZIMUTH when both present."""
+        m = ProductMeta.from_lbl(rich_lbl)
+        assert m.solar_azimuth == pytest.approx(120.25)
+        assert m.sub_solar_azimuth == pytest.approx(99.9)
+
+    def test_sub_solar_azimuth_only_falls_back(self, tmp_path):
+        """SUB_SOLAR_AZIMUTH-only label → solar_azimuth falls back (base.py:199-200)."""
+        p = tmp_path / "SUBONLY.LBL"
+        p.write_text(
+            "PDS_VERSION_ID = PDS3\nSUB_SOLAR_AZIMUTH = 88.8\nEND\n"
+        )
+        m = ProductMeta.from_lbl(p)
+        assert m.sub_solar_azimuth == pytest.approx(88.8)
+        assert m.solar_azimuth == pytest.approx(88.8)
+
+    def test_single_filter_name_branch(self, tmp_path):
+        """Non-tuple FILTER_NAME → single-element list (base.py:248-249)."""
+        p = tmp_path / "ONEFILTER.LBL"
+        p.write_text('PDS_VERSION_ID = PDS3\nFILTER_NAME = "RED"\nEND\n')
+        m = ProductMeta.from_lbl(p)
+        assert m.filter_names == ["RED"]
+
+
 class TestProductMetaOsError:
     def test_oserror_during_read_text_returns_defaults(self, tmp_path: pathlib.Path):
         """OSError raised by read_text → warning logged, returns defaults (lines 131-133)."""

@@ -222,21 +222,33 @@ class TestCornersToPolygonBuffer:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="extract_footprint signature/return changed post-refactor; needs rewrite")
 class TestExtractFootprintStandalone:
-    """Tests for the top-level extract_footprint() helper."""
+    """Tests for the top-level extract_footprint() helper.
+
+    Signature: extract_footprint(path, mars_crs, nodata_test) ->
+    (hull_coords | None, file_bounds | None).
+    """
 
     def test_none_path_returns_none_none(self):
+        # base.py:311-312
         result = extract_footprint(None, _MARS_RCRS)
         assert result == (None, None)
 
     def test_nonexistent_file_returns_none_none(self, tmp_path):
+        # base.py:321-322
         result = extract_footprint(str(tmp_path / "ghost.tif"), _MARS_RCRS)
         assert result == (None, None)
 
+    def test_pathlib_input_accepted(self, mars_geotiff):
+        # base.py:316-317 (non-str branch)
+        hull, bounds = extract_footprint(mars_geotiff, _MARS_RCRS)
+        assert hull is not None and bounds is not None
+
     def test_no_crs_returns_none_none(self, no_crs_geotiff):
+        # base.py:327-328
         hull, bounds = extract_footprint(str(no_crs_geotiff), _MARS_RCRS)
         assert hull is None
+        assert bounds is None
 
     def test_valid_file_returns_hull_and_bounds(self, mars_geotiff):
         hull, bounds = extract_footprint(str(mars_geotiff), _MARS_RCRS)
@@ -245,12 +257,13 @@ class TestExtractFootprintStandalone:
         assert len(hull) >= 3
 
     def test_fewer_than_3_nonzero_pixels_returns_none_with_bounds(self, tmp_path):
-        """< 3 non-zero pixels: hull is None but file_bounds may still be returned."""
-        # Create a file with only 2 non-zero pixels
-        p = tmp_path / "sparse.tif"
-        bounds = (-131.0, 18.0, -130.0, 19.0)
+        """< 3 non-zero pixels: hull is None but file_bounds still returned.
 
-        transform = rasterio.transform.from_bounds(*bounds, 16, 16)
+        Covers base.py:355-356.
+        """
+        p = tmp_path / "sparse.tif"
+        file_extent = (-131.0, 18.0, -130.0, 19.0)
+        transform = rasterio.transform.from_bounds(*file_extent, 16, 16)
         data = np.zeros((1, 16, 16), dtype=np.uint16)
         data[0, 0, 0] = 1
         data[0, 0, 1] = 1  # only 2 non-zero → len(xs) < 3
@@ -260,29 +273,92 @@ class TestExtractFootprintStandalone:
         ) as dst:
             dst.write(data)
         hull, bounds = extract_footprint(str(p), _MARS_RCRS)
-        assert hull == (None, bounds)
+        assert hull is None
+        assert bounds is not None
+
+    def test_out_of_range_bounds_yields_none_file_bounds(self, tmp_path):
+        """Reprojected bounds failing the validity check → file_bounds None.
+
+        Covers base.py:336 (the `file_bounds = None` branch). We place the
+        raster outside the valid lat range so the bounds check fails but the
+        pixel hull still resolves.
+        """
+        p = tmp_path / "bad_bounds.tif"
+        # north > 90 after transform → invalid → file_bounds None
+        transform = rasterio.transform.from_bounds(-10.0, 80.0, 10.0, 100.0, 16, 16)
+        data = np.ones((1, 16, 16), dtype=np.uint16) * 500
+        with rasterio.open(
+                p, "w", driver="GTiff", count=1, dtype="uint16",
+                width=16, height=16, crs=_MARS_RCRS, transform=transform,
+        ) as dst:
+            dst.write(data)
+        hull, bounds = extract_footprint(str(p), _MARS_RCRS)
+        assert bounds is None
+
+    def test_transform_bounds_exception_sets_file_bounds_none(self, mars_geotiff):
+        """Exception in transform_bounds caught → file_bounds None.
+
+        Covers base.py:339-340.
+        """
+        with patch(
+            "dataset.core.base.transform_bounds",
+            side_effect=RuntimeError("boom"),
+        ):
+            hull, bounds = extract_footprint(str(mars_geotiff), _MARS_RCRS)
+        assert bounds is None
+        assert hull is not None  # hull path still runs
 
     def test_exception_during_open_returns_none_none(self, tmp_path):
-        """Exception inside rasterio.open caught → (None, None)."""
+        """Exception inside rasterio.open caught → (None, None).
+
+        Covers base.py:377-378.
+        """
         p = tmp_path / "bad.tif"
         p.write_bytes(b"not a valid rasterio file at all")
         result = extract_footprint(str(p), _MARS_RCRS)
         assert result == (None, None)
 
     def test_empty_hull_path(self, mars_geotiff):
-        """hull.is_empty path: mock MultiPoint.convex_hull to be empty."""
+        """hull.is_empty path → returns (None, file_bounds).
+
+        Covers base.py:362-363.
+        """
         empty_geom = MagicMock()
         empty_geom.is_empty = True
-
         mock_mp_instance = MagicMock()
         mock_mp_instance.convex_hull = empty_geom
 
-        with patch("shapely.geometry.MultiPoint", return_value=mock_mp_instance):
+        with patch("dataset.core.base.MultiPoint", return_value=mock_mp_instance):
             hull, bounds = extract_footprint(str(mars_geotiff), _MARS_RCRS)
 
         assert hull is None
-        # file_bounds may or may not be set depending on how far we get
-        # The key assertion is that hull is None (is_empty path returned early)
+        assert bounds is not None
+
+    def test_custom_nodata_test_used(self, mars_geotiff):
+        """nodata_test callable path covered (base.py:350)."""
+        hull, bounds = extract_footprint(
+            str(mars_geotiff), _MARS_RCRS,
+            nodata_test=lambda d: d > 100,
+        )
+        assert hull is not None
+
+    def test_overviews_branch(self, tmp_path):
+        """File with internal overviews uses max overview factor.
+
+        Covers the `factor = max(ovrs)` branch (base.py:344).
+        """
+        p = tmp_path / "ovr.tif"
+        transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 256, 256)
+        data = (np.ones((1, 256, 256), dtype=np.uint16) * 500)
+        with rasterio.open(
+                p, "w", driver="GTiff", count=1, dtype="uint16",
+                width=256, height=256, crs=_MARS_RCRS, transform=transform,
+        ) as dst:
+            dst.write(data)
+        with rasterio.open(p, "r+") as dst:
+            dst.build_overviews([2, 4], rasterio.enums.Resampling.nearest)
+        hull, bounds = extract_footprint(str(p), _MARS_RCRS)
+        assert hull is not None
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +882,144 @@ class TestGetItemTransforms:
 # ---------------------------------------------------------------------------
 # N. merge_tiles channel-mismatch warning
 # ---------------------------------------------------------------------------
+
+
+class TestNormalization:
+    """Constructor normalize=True path (rdr.py:184-205)."""
+
+    def _stats(self, tmp_path, channels, mean, std):
+        p = tmp_path / "dataset_stats.json"
+        p.write_text(json.dumps(
+            {"channels": channels, "mean": mean, "std": std}
+        ))
+        return p
+
+    def test_normalize_requires_valid_path(self, tmp_path):
+        with patch.object(MarsHiRISE, "_verify", return_value=None):
+            with pytest.raises(ValueError, match="must be a valid path"):
+                MarsHiRISE(root=tmp_path, normalize=True,
+                           normalization_path=str(tmp_path / "ghost.json"))
+
+    def test_normalize_missing_path_raises(self, tmp_path):
+        with patch.object(MarsHiRISE, "_verify", return_value=None):
+            with pytest.raises(ValueError, match="must be a valid path"):
+                MarsHiRISE(root=tmp_path, normalize=True,
+                           normalization_path=None)
+
+    def test_normalize_unknown_channel_raises(self, tmp_path):
+        stats = self._stats(tmp_path, ["FOO"], [0.1], [0.2])
+        with patch.object(MarsHiRISE, "_verify", return_value=None):
+            with pytest.raises(ValueError, match="not found in normalization"):
+                MarsHiRISE(
+                    root=tmp_path, normalize=True,
+                    normalization_path=str(stats),
+                    channels=["RED"],
+                )
+
+    def test_normalize_builds_normalizer(self, tmp_path):
+        stats = self._stats(
+            tmp_path,
+            ["NEAR-INFRARED", "RED", "BLUE-GREEN"],
+            [0.1, 0.2, 0.3], [0.4, 0.5, 0.6],
+        )
+        with patch.object(MarsHiRISE, "_verify", return_value=None):
+            ds = MarsHiRISE(
+                root=tmp_path, normalize=True,
+                normalization_path=str(stats),
+            )
+        assert ds._normalizer is not None
+
+    def test_getitem_applies_normalizer_and_meta(self, tmp_path, mars_crs):
+        stats = self._stats(
+            tmp_path,
+            ["NEAR-INFRARED", "RED", "BLUE-GREEN"],
+            [0.1, 0.2, 0.3], [0.4, 0.5, 0.6],
+        )
+        with patch.object(MarsHiRISE, "_verify", return_value=None):
+            ds = MarsHiRISE(
+                root=tmp_path, normalize=True,
+                normalization_path=str(stats),
+                return_meta=True,
+            )
+        ds.index = gpd.GeoDataFrame(
+            {"obs_id": ["PSP_001430_1780"],
+             "color_path": [None], "red_path": [None]},
+            index=pd.IntervalIndex.from_tuples(
+                [(_T0, _T1)], closed="both", name="datetime"),
+            geometry=[box(-131.0, 18.0, -130.0, 19.0)],
+            crs=mars_crs,
+        )
+        x = slice(-131.0, -130.96)
+        y = slice(18.0, 18.04)
+        t = slice(_T0, _T1)
+        # Tile with a 0.0 nodata pixel to exercise the mask-preserve branch.
+        tile = torch.ones(3, 4, 4)
+        tile[:, 0, 0] = 0.0
+        with (
+            patch.object(ds, "_disambiguate_slice", return_value=(x, y, t)),
+            patch.object(ds, "_load_tile", return_value=tile),
+            patch.object(ds, "_slice_to_tensor", return_value=torch.zeros(6)),
+            patch.object(ds, "_collect_meta",
+                         return_value={"obs_id": "PSP_001430_1780"}),
+        ):
+            result = ds[x, y, t]
+        assert "meta" in result
+        assert result["meta"] == [{"obs_id": "PSP_001430_1780"}]
+        # nodata pixel preserved as 0.0 after normalization
+        assert torch.all(result["image"][:, 0, 0] == 0.0)
+
+    def test_getitem_no_tiles_raises_indexerror(self, tmp_path, mars_crs):
+        with patch.object(MarsHiRISE, "_verify", return_value=None):
+            ds = MarsHiRISE(root=tmp_path)
+        ds.index = gpd.GeoDataFrame(
+            {"obs_id": ["PSP_001430_1780"],
+             "color_path": [None], "red_path": [None]},
+            index=pd.IntervalIndex.from_tuples(
+                [(_T0, _T1)], closed="both", name="datetime"),
+            geometry=[box(-131.0, 18.0, -130.0, 19.0)],
+            crs=mars_crs,
+        )
+        x = slice(-131.0, -130.96)
+        y = slice(18.0, 18.04)
+        t = slice(_T0, _T1)
+        with (
+            patch.object(ds, "_disambiguate_slice", return_value=(x, y, t)),
+            patch.object(ds, "_load_tile", return_value=None),
+        ):
+            with pytest.raises(IndexError, match="no image data could be loaded"):
+                _ = ds[x, y, t]
+
+
+class TestMetaHelpers:
+    """_meta_to_dict (rdr.py:577) and _collect_meta (rdr.py:621-630)."""
+
+    def test_meta_to_dict_flattens_all_fields(self):
+        m = ProductMeta()
+        m.observation_id = "PSP_X"
+        m.scaling_factor = 1.5e-4
+        m.filter_names = ["RED"]
+        d = MarsHiRISE._meta_to_dict(m)
+        assert d["observation_id"] == "PSP_X"
+        assert d["scaling_factor"] == 1.5e-4
+        assert d["filter_names"] == ["RED"]
+        assert "north_azimuth" in d
+
+    def test_collect_meta_reads_lbl_sidecars(self, mock_dataset, tmp_path):
+        color = tmp_path / "PSP_001430_1780_COLOR.JP2"
+        color.write_bytes(b"x")
+        lbl = tmp_path / "PSP_001430_1780_COLOR.LBL"
+        lbl.write_text(
+            'PDS_VERSION_ID = PDS3\nOBSERVATION_ID = "PSP_001430_1780"\nEND\n'
+        )
+        entry = mock_dataset._collect_meta("PSP_001430_1780", color, None)
+        assert entry["obs_id"] == "PSP_001430_1780"
+        assert entry["color"]["observation_id"] == "PSP_001430_1780"
+
+    def test_collect_meta_skips_none_and_missing_lbl(self, mock_dataset, tmp_path):
+        red = tmp_path / "PSP_001430_1780_RED.JP2"
+        red.write_bytes(b"x")  # no .LBL beside it
+        entry = mock_dataset._collect_meta("PSP_001430_1780", None, red)
+        assert entry == {"obs_id": "PSP_001430_1780"}
 
 
 class TestMergeTilesWarning:
@@ -1462,15 +1676,12 @@ def dataset_with_sparse_file(tmp_path, mars_crs):
     return ds
 
 
-@pytest.mark.skip(reason="logger names/messages changed; assertions need rewrite")
 class TestBuildSpatialIndexWithFiles:
-    def test_case_a_hull_from_dense_file(self, dataset_with_dense_file, caplog):
-        """Dense file → hull extracted → Case A geometry set (lines 1027-1028, 1054-1059,
-        1077, 1092-1097)."""
-        with caplog.at_level(logging.INFO, logger="dataset.core.base"):
-            dataset_with_dense_file._build_spatial_index(force_rebuild=True)
+    def test_case_a_hull_from_dense_file(self, dataset_with_dense_file):
+        """Dense file on disk → footprint file picked (rdr.py:485-487) →
+        hull extracted → Case A geometry set."""
+        dataset_with_dense_file._build_spatial_index(force_rebuild=True)
         assert len(dataset_with_dense_file.index) == 1
-        assert "footprint extraction" in caplog.text
         geom = dataset_with_dense_file.index.geometry.iloc[0]
         assert geom is not None and not geom.is_empty
 

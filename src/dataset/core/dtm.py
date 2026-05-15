@@ -650,7 +650,7 @@ class MarsHiRISEDTM(MarsHiRISEBase):
         for pair_key, grp in df.groupby("_pair_key", sort=False):
 
             dtm_rows = grp[grp["_data_type"].isin(DTM_DATA_TYPES)]
-            if dtm_rows.empty:
+            if dtm_rows.empty:  # pragma: no cover - defensive; every _pair_key is derived from a DTM row
                 continue
 
             dr = dtm_rows.iloc[0]

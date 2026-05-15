@@ -650,11 +650,11 @@ class MarsHiRISEBase(GeoDataset):
 
     @abstractmethod
     def __getitem__(self, index: GeoSlice) -> Sample:
-        ...
+        ...  # pragma: no cover - abstract; concrete impls live in subclasses
 
     @abstractmethod
     def plot(self, sample: Sample, **kwargs) -> Figure:
-        ...
+        ...  # pragma: no cover - abstract; concrete impls live in subclasses
 
     # ------------------------------------------------------------------
     # Verify / index loading
@@ -967,7 +967,7 @@ class MarsHiRISEBase(GeoDataset):
 
     @abstractmethod
     def _build_spatial_index(self, force_rebuild: bool = False) -> None:
-        ...
+        ...  # pragma: no cover - abstract; concrete impls live in subclasses
 
     # ------------------------------------------------------------------
     # Download orchestration
@@ -975,7 +975,7 @@ class MarsHiRISEBase(GeoDataset):
 
     @abstractmethod
     def _build_download_tasks(self) -> list[tuple[str, pathlib.Path]]:
-        ...
+        ...  # pragma: no cover - abstract; concrete impls live in subclasses
 
     def _download_images(self) -> bool:
         tasks = self._build_download_tasks()
@@ -1240,7 +1240,7 @@ class MarsHiRISEBase(GeoDataset):
 
         return coverage, lon_edges, lat_edges
 
-    def plot_global_coverage(self,
+    def plot_global_coverage(self,  # pragma: no cover
                              output_pdf: str | pathlib.Path,
                              input_svg: str | pathlib.Path = "MarsTopography.svg",
                              lat_bounds: tuple[float, float] = (-57.0, 57.0),

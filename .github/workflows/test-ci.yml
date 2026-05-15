@@ -1,0 +1,58 @@
+name: tests
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - ".github/workflows/test-ci.yml"
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: test-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install system deps (GDAL)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin libgdal-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dev dependencies
+        run: uv sync --extra dev
+
+      - name: Run unit tests with coverage gate (src/dataset)
+        run: >
+          uv run pytest tests/dataset_pkg
+          -m "not integration"
+          --cov=src/dataset
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=100
+          -n auto
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore

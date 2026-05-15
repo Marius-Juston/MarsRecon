@@ -33,6 +33,6 @@ common entries:
 ## Commits & PRs
 
 - Branch from `master`. Open PRs into `master`.
-- CI runs the docs build on every PR that touches `src/`, `docs/`, `mkdocs.yml`, or
+- CI runs the docs build on every PR that touches `src/`, `docs/`, `properdocs.yml`, or
   `scripts/architecture/`. A failing build blocks merge.
 - Tests run under `uv run pytest tests/ -m "not integration" -n auto`.

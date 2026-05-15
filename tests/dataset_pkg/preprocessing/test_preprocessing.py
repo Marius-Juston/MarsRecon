@@ -31,8 +31,10 @@ from dataset.preprocessing.cog_conversion import (
     _is_corrupt_jp2_error,
     _safe_worker_count,
     _worker_init,
+    _iter_img_files,
     convert_all,
     filter_maker,
+    img_to_cog,
     jp2_to_cog,
 )
 
@@ -440,6 +442,112 @@ class TestConvertAll:
     def test_empty_directory_returns_zero_counts(self, tmp_path):
         counts = convert_all(tmp_path, workers=1)
         assert counts == {"converted": 0, "skipped": 0, "failed": 0}
+
+    def test_skip_jp2_only_processes_img(self, valid_jp2, dtm_img):
+        # skip_jp2=True → JP2 list short-circuited; only the .IMG converts
+        counts = convert_all(valid_jp2.parent, workers=1, skip_jp2=True)
+        assert counts["converted"] >= 1
+        assert dtm_img.with_suffix(".tif").exists()
+        assert not valid_jp2.with_suffix(".tif").exists()
+
+    def test_skip_dtm_only_processes_jp2(self, valid_jp2, dtm_img):
+        counts = convert_all(valid_jp2.parent, workers=1, skip_dtm=True)
+        assert counts["converted"] >= 1
+        assert valid_jp2.with_suffix(".tif").exists()
+        assert not dtm_img.with_suffix(".tif").exists()
+
+
+# ---------------------------------------------------------------------------
+# img_to_cog
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dtm_img(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A tiny float32 GeoTIFF saved with a DTM-style .IMG name."""
+    p = tmp_path / "DTEEC_001234_1780_005678_1780_A01.IMG"
+    transform = from_bounds(-130.0, 18.0, -129.9, 18.1, 32, 32)
+    mars_crs = CRS.from_proj4("+proj=longlat +a=3396190 +b=3376200 +no_defs")
+    with rasterio.open(
+        p, "w", driver="GTiff", dtype="float32", width=32, height=32,
+        count=1, crs=rasterio.crs.CRS.from_user_input(mars_crs),
+        transform=transform, nodata=-3.4028226550889045e+38,
+    ) as dst:
+        dst.write(np.full((32, 32), 1500.0, dtype=np.float32), 1)
+    return p
+
+
+class TestImgToCog:
+    def test_success_creates_cog(self, dtm_img):
+        out = img_to_cog(dtm_img)
+        assert out is not None
+        assert out.exists()
+        assert out.suffix == ".tif"
+
+    def test_cog_is_readable_geotiff(self, dtm_img):
+        out = img_to_cog(dtm_img)
+        with rasterio.open(out) as src:
+            assert src.count == 1
+            assert src.dtypes[0] == "float32"
+
+    def test_skip_existing_cog(self, dtm_img):
+        cog = dtm_img.with_suffix(".tif")
+        cog.write_bytes(b"placeholder")
+        out = img_to_cog(dtm_img, overwrite=False)
+        assert out == cog
+        # untouched placeholder
+        assert cog.read_bytes() == b"placeholder"
+
+    def test_overwrite_reconverts(self, dtm_img):
+        cog = dtm_img.with_suffix(".tif")
+        cog.write_bytes(b"placeholder")
+        out = img_to_cog(dtm_img, overwrite=True)
+        assert out is not None
+        with rasterio.open(out) as src:
+            assert src.count == 1
+
+    def test_corrupt_img_returns_none(self, tmp_path):
+        bad = tmp_path / "DTEEC_bad.IMG"
+        bad.write_bytes(b"not a raster at all")
+        out = img_to_cog(bad)
+        assert out is None
+        assert not bad.with_suffix(".tif").exists()
+
+    def test_img_without_nodata_uses_dtm_sentinel(self, tmp_path):
+        """src.nodata is None → falls back to the HiRISE float32 sentinel."""
+        p = tmp_path / "DTEEC_nonodata.IMG"
+        transform = from_bounds(-130.0, 18.0, -129.9, 18.1, 16, 16)
+        mars_crs = CRS.from_proj4("+proj=longlat +a=3396190 +b=3376200 +no_defs")
+        with rasterio.open(
+            p, "w", driver="GTiff", dtype="float32", width=16, height=16,
+            count=1, crs=rasterio.crs.CRS.from_user_input(mars_crs),
+            transform=transform,  # no nodata=
+        ) as dst:
+            dst.write(np.full((16, 16), 1500.0, dtype=np.float32), 1)
+        out = img_to_cog(p)
+        assert out is not None
+        with rasterio.open(out) as src:
+            assert src.nodata == pytest.approx(-3.4028226550889045e+38)
+
+    def test_generic_exception_returns_none(self, dtm_img):
+        """A non-RasterioIOError during conversion is caught → None."""
+        with mock.patch(
+            "dataset.preprocessing.cog_conversion.rasterio.open",
+            side_effect=RuntimeError("boom"),
+        ):
+            out = img_to_cog(dtm_img)
+        assert out is None
+
+
+class TestIterImgFiles:
+    def test_only_dte_prefixed_files_yielded(self, tmp_path):
+        (tmp_path / "DTEEC_001.IMG").write_bytes(b"x")
+        (tmp_path / "RDR_other.IMG").write_bytes(b"x")
+        (tmp_path / "dteec_lower.img").write_bytes(b"x")
+        found = {p.name for p in _iter_img_files(tmp_path)}
+        assert "DTEEC_001.IMG" in found
+        assert "dteec_lower.img" in found
+        assert "RDR_other.IMG" not in found
 
 
 # ---------------------------------------------------------------------------

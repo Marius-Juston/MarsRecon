@@ -9,7 +9,7 @@
 
 study_name: loss_dropone_v1
 base_config: configs/train_hirise_large.yaml
-output_root: /home/mjuston2/Documents/MarsRecon/outputs/ablation
+output_root: outputs/ablation
 project_name: mars-depthfm-ablation
 group: loss_dropone_v1
 
@@ -75,6 +75,13 @@ watchdog:
   # lane disable, or watchdog kill). Lightning needs real time under DDP to
   # flush a multi-GB `last.ckpt`; set generously.
   shutdown_grace_seconds: 300
+  # Pre-launch GPU-free barrier. Before binding a queued job to a lane the
+  # orchestrator polls nvidia-smi until every GPU in that lane reports used
+  # memory below gpu_free_threshold_mib (a clean A6000 idles well under this).
+  # If the lane is still busy after gpu_free_timeout_seconds the orchestrator
+  # reaps any lingering compute PIDs on the lane and launches anyway.
+  gpu_free_threshold_mib: 2048
+  gpu_free_timeout_seconds: 180
 
 # Dynamic lane control: while the orchestrator is running you can release GPUs
 # without losing W&B continuity or burning retry budget.

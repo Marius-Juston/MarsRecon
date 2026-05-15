@@ -1532,7 +1532,7 @@ class DepthFMLightningModule(L.LightningModule):
 
         Each DDP rank writes a per-rank `.npz` so we avoid cross-rank gather
         collectives during the noisy test-epoch-end window. The downstream
-        aggregator (scripts/run_ablation.py) concatenates these.
+        aggregator (scripts/training/run_ablation.py) concatenates these.
         """
         if not self._test_aggregator.records:
             return
