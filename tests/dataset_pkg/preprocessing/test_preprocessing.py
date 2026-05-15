@@ -637,7 +637,7 @@ class TestConvertAllExtra:
 # CLI __main__ block
 # ---------------------------------------------------------------------------
 
-_PREPROCESSING_SCRIPT = pathlib.Path(__file__).parent.parent / "src" / 'dataset' / "preprocessing" / "cog_conversion.py"
+_PREPROCESSING_SCRIPT = pathlib.Path(__file__).resolve().parents[3] / "src" / "dataset" / "preprocessing" / "cog_conversion.py"
 
 
 class TestCLI:
