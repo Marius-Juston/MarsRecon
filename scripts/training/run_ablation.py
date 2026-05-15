@@ -45,9 +45,18 @@ Fault tolerance:
       * drain    → finish current job, don't launch new ones on that lane.
     Editable atomically via the --disable-lane / --enable-lane / --drain-lane
     subcommands.
+  - Pre-launch GPU-free barrier: before binding a queued job to a lane the
+    orchestrator polls nvidia-smi until that lane's GPUs are below
+    watchdog.gpu_free_threshold_mib, and kill_running reaps any lingering
+    compute PIDs on the (exclusive) lane GPUs. Prevents OOM from a
+    just-killed run's surviving DDP workers / unreclaimed CUDA contexts.
   - <output_root>/orchestrator.lock (fcntl) prevents double-orchestrator.
   - <output_root>/orchestrator.heartbeat.json is rewritten each poll tick
     with pid, hostname, running jobs, queued count — `watch cat` to monitor.
+  - <output_root>/orchestrator.log is a rotating (10 MiB x 5) DEBUG-level
+    log capturing full tracebacks for every failure path — the console
+    only shows INFO+. `tail -F <output_root>/orchestrator.log` to triage a
+    crash; nvidia-smi / heartbeat / stats errors land here at DEBUG.
 """
 from __future__ import annotations
 
@@ -70,13 +79,77 @@ import numpy as np
 import pandas as pd
 import yaml
 
+logger = logging.getLogger("ablation")
+
+# Console-only until setup_logging() attaches the persistent file handler
+# (output_root is not known until the spec is parsed in main()).
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("ablation")
+
+# Concise on the console; verbose + traceback-friendly in the file log so a
+# crashed campaign can be triaged after the fact without re-running anything.
+_CONSOLE_FMT = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+_FILE_FMT = logging.Formatter(
+    "%(asctime)s %(levelname)-8s %(name)s %(filename)s:%(lineno)d "
+    "%(funcName)s() | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
+
+
+def setup_logging(output_root: Path) -> Path:
+    """Attach a rotating file handler under output_root.
+
+    Console stays at INFO; the file captures DEBUG (including full
+    tracebacks) and rotates at 10 MiB x 5 backups so it can't grow
+    unbounded across a multi-day campaign. Idempotent — safe to call
+    once per process; replaces any prior file handler.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Tag the existing basicConfig console handler with our formatter and
+    # keep it at INFO so the terminal stays readable.
+    for h in root.handlers:
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler):
+            h.setLevel(logging.INFO)
+            h.setFormatter(_CONSOLE_FMT)
+
+    # Drop any file handler from a previous setup_logging() call.
+    for h in list(root.handlers):
+        if isinstance(h, RotatingFileHandler):
+            root.removeHandler(h)
+            h.close()
+
+    log_path = output_root / "orchestrator.log"
+    output_root.mkdir(parents=True, exist_ok=True)
+    fh = RotatingFileHandler(
+        log_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(_FILE_FMT)
+    root.addHandler(fh)
+
+    logger.info("Logging to %s (console=INFO, file=DEBUG, rotate 10MiB x5)", log_path)
+    return log_path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Absolute path to the training launcher. Resolved from this file's location
+# (not cwd) so launches are robust no matter where the orchestrator is invoked.
+LAUNCH_SCRIPT = REPO_ROOT / "scripts" / "training" / "launch_train.sh"
+
+
+def _abs_config(spec: dict) -> str:
+    """Resolve spec['base_config'] to an absolute path under the repo root."""
+    p = Path(spec["base_config"])
+    return str(p if p.is_absolute() else REPO_ROOT / p)
 
 # Status enum (strings to keep state.json human-readable)
 STATUS_QUEUED = "queued"
@@ -180,7 +253,7 @@ class StateStore:
             os.fsync(fd)
             os.close(fd)
         except OSError:
-            pass
+            logger.debug("state.json dir fsync skipped", exc_info=True)
 
     def get(self, job_id: str) -> JobState:
         return self._states.setdefault(job_id, JobState())
@@ -356,7 +429,9 @@ def write_heartbeat(output_root: Path, running: dict, queued: int, shutting_down
             "shutting_down": shutting_down,
         })
     except OSError:
-        pass  # never let heartbeat I/O take down the orchestrator
+        # Never let heartbeat I/O take down the orchestrator, but keep a
+        # breadcrumb in the file log in case the disk is full / read-only.
+        logger.debug("Heartbeat write failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------
@@ -385,7 +460,6 @@ class RunningJob:
     proc: subprocess.Popen
     lane: str
     run_dir: Path
-    csv_path: Path
     log_file: object  # open file handle
     last_val_seen_at: float  # monotonic time of last new val/* row
     last_val_row_count: int = 0
@@ -398,8 +472,138 @@ def _last_ckpt(run_dir: Path) -> Optional[Path]:
     return hits[0] if hits else None
 
 
+def _find_metrics_csv(run_dir: Path) -> Optional[Path]:
+    """Locate Lightning's CSV-logger metrics.csv anywhere under run_dir.
+
+    train_lightning.py nests it under <model_type>/<config_hash>/run_0/, so
+    the fixed run_dir/csv/version_0/metrics.csv path never exists — glob for
+    it the same way find_best_checkpoint does for checkpoints.
+    """
+    hits = list(run_dir.rglob("csv/version_0/metrics.csv"))
+    return hits[0] if hits else None
+
+
+# --------------------------------------------------------------------------
+# GPU-free barrier (nvidia-smi)
+#
+# Lane strings are CUDA_VISIBLE_DEVICES values that map 1:1 to physical GPU
+# indices usable with `nvidia-smi -i`. Lanes partition the box into disjoint
+# physical-GPU sets, so inspecting/reaping a lane only ever touches that
+# lane's own job — never the other lane's healthy run.
+# --------------------------------------------------------------------------
+
+_NVSMI_WARNED = {"done": False}
+
+
+def _lane_gpu_ids(lane: str) -> list[str]:
+    """'0,1' -> ['0', '1']."""
+    return [g.strip() for g in lane.split(",") if g.strip()]
+
+
+def _nvidia_smi(query_flag: str, gpu_ids: list[str]) -> Optional[list[str]]:
+    """Run an nvidia-smi CSV query for `gpu_ids`; None on any failure."""
+    if not gpu_ids:
+        return None
+    cmd = [
+        "nvidia-smi", query_flag,
+        "--format=csv,noheader,nounits",
+        "-i", ",".join(gpu_ids),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        logger.debug("nvidia-smi (%s) failed to run: %r", " ".join(cmd), e)
+        return None
+    if out.returncode != 0:
+        logger.debug("nvidia-smi (%s) rc=%d stderr=%s",
+                      " ".join(cmd), out.returncode, out.stderr.strip())
+        return None
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def _gpu_used_mib(gpu_ids: list[str]) -> dict[str, int]:
+    """Per-GPU used memory in MiB. {} if nvidia-smi is unavailable/failing."""
+    lines = _nvidia_smi("--query-gpu=memory.used", gpu_ids)
+    if lines is None:
+        if not _NVSMI_WARNED["done"]:
+            logger.warning("nvidia-smi unavailable; GPU-free barrier is a no-op.")
+            _NVSMI_WARNED["done"] = True
+        return {}
+    result: dict[str, int] = {}
+    for gid, ln in zip(gpu_ids, lines):
+        try:
+            result[gid] = int(float(ln))
+        except ValueError:
+            logger.debug("Unparseable nvidia-smi memory line for gpu %s: %r", gid, ln)
+    return result
+
+
+def _gpu_compute_pids(gpu_ids: list[str]) -> set[int]:
+    """PIDs of compute apps currently on `gpu_ids`. Empty set on failure."""
+    lines = _nvidia_smi("--query-compute-apps=pid", gpu_ids)
+    if not lines:
+        return set()
+    pids: set[int] = set()
+    for ln in lines:
+        try:
+            pids.add(int(ln.split(",")[0]))
+        except ValueError:
+            logger.debug("Unparseable nvidia-smi compute-apps line: %r", ln)
+    return pids
+
+
+def _reap_lane_gpu_pids(lane: str) -> None:
+    """SIGKILL any lingering compute processes on this lane's GPUs.
+
+    Safe because lanes own disjoint physical GPUs — this can't touch the
+    other lane's job.
+    """
+    gpu_ids = _lane_gpu_ids(lane)
+    pids = _gpu_compute_pids(gpu_ids)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            logger.warning("Reaped orphan GPU process pid=%d on lane %s", pid, lane)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def wait_for_lane_free(lane: str, threshold_mib: int, timeout: float,
+                       poll: float = 5.0) -> bool:
+    """Block until every GPU in `lane` reports used memory < threshold_mib.
+
+    On timeout, do a last-resort orphan reap and proceed anyway (never wedge
+    the whole campaign). No-op when nvidia-smi is unavailable.
+    """
+    gpu_ids = _lane_gpu_ids(lane)
+    used = _gpu_used_mib(gpu_ids)
+    if not used:
+        return True  # nvidia-smi unavailable → preserve prior behavior
+    start = time.monotonic()
+    while True:
+        used = _gpu_used_mib(gpu_ids)
+        if used and all(v < threshold_mib for v in used.values()):
+            waited = time.monotonic() - start
+            if waited > poll:
+                logger.info("Lane %s free after %.0fs (used=%s MiB)",
+                            lane, waited, used)
+            return True
+        elapsed = time.monotonic() - start
+        if elapsed > timeout:
+            logger.warning(
+                "Lane %s still busy after %.0fs (used=%s MiB, threshold=%d); "
+                "reaping orphans and launching anyway.",
+                lane, elapsed, used, threshold_mib)
+            _reap_lane_gpu_pids(lane)
+            time.sleep(poll)
+            return False
+        logger.info("Waiting for lane %s to free (used=%s MiB, threshold=%d)…",
+                    lane, used, threshold_mib)
+        time.sleep(poll)
+
+
 def launch_train(job: Job, lane: str, spec: dict, store: "StateStore") -> "RunningJob":
-    base_config = spec["base_config"]
+    base_config = _abs_config(spec)
     output_root = REPO_ROOT / spec["output_root"]
     run_dir = output_root / job.job_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -411,7 +615,7 @@ def launch_train(job: Job, lane: str, spec: dict, store: "StateStore") -> "Runni
     ]
 
     cmd = [
-        "bash", "scripts/training/launch_train.sh",
+        "bash", str(LAUNCH_SCRIPT),
         "--config", base_config,
         "--n_runs", "1",
         "--seed", str(job.seed),
@@ -446,10 +650,12 @@ def launch_train(job: Job, lane: str, spec: dict, store: "StateStore") -> "Runni
     )
     (run_dir / "pid").write_text(str(proc.pid))
 
-    csv_path = run_dir / "csv" / "version_0" / "metrics.csv"
+    # The metrics.csv lives under a nested <model_type>/<config_hash>/run_0/
+    # dir that doesn't exist yet at launch; watchdog_check resolves it
+    # lazily each tick via _find_metrics_csv.
     return RunningJob(
         job=job, proc=proc, lane=lane, run_dir=run_dir,
-        csv_path=csv_path, log_file=log_file,
+        log_file=log_file,
         last_val_seen_at=time.monotonic(), last_val_row_count=0,
         started_at=time.monotonic(),
     )
@@ -476,6 +682,9 @@ def kill_running(rj: RunningJob, reason: str, grace_seconds: float = 300.0) -> N
             rj.proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             pass
+    # bash/torchrun exit does not imply the DDP workers released the GPU.
+    # Reap any lingering compute processes on this lane's (exclusive) GPUs.
+    _reap_lane_gpu_pids(rj.lane)
 
 
 def watchdog_check(rj: RunningJob, watchdog_cfg: dict) -> Optional[str]:
@@ -483,10 +692,13 @@ def watchdog_check(rj: RunningJob, watchdog_cfg: dict) -> Optional[str]:
 
     Crash detection only — never performance pruning.
     """
-    # Read CSV if available
-    csv_path = rj.csv_path
+    # Read CSV if available. The CSV logger writes under a nested
+    # <model_type>/<config_hash>/run_0/ dir that doesn't exist at launch
+    # time, so resolve it lazily each tick rather than trusting the fixed
+    # path set in launch_train.
+    csv_path = _find_metrics_csv(rj.run_dir)
     val_rmse_seen, val_photo_seen = [], []
-    if csv_path.exists():
+    if csv_path is not None and csv_path.exists():
         try:
             df = pd.read_csv(csv_path)
             if "val/rmse_mean" in df.columns:
@@ -503,8 +715,10 @@ def watchdog_check(rj: RunningJob, watchdog_cfg: dict) -> Optional[str]:
             if new_count > rj.last_val_row_count:
                 rj.last_val_row_count = new_count
                 rj.last_val_seen_at = time.monotonic()
-        except (pd.errors.EmptyDataError, pd.errors.ParserError):
-            pass  # CSV being written; try again next tick
+        except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+            # Benign: CSV mid-write. Logged at DEBUG so a *persistent*
+            # parse failure (vs. a one-tick race) is visible in the log.
+            logger.debug("metrics.csv (%s) not yet parseable: %r", csv_path, e)
 
     # Stall detection (only after we've seen at least one val row, or after a grace period)
     grace = 1800.0  # 30 min grace for first val tick
@@ -548,7 +762,7 @@ def find_best_checkpoint(run_dir: Path, kind: str) -> Optional[Path]:
 
 def run_test_only(job: Job, lane: str, spec: dict, ckpt: Path, tag: str) -> int:
     """Synchronously run the test-only entry point on `ckpt` with the given tag."""
-    base_config = spec["base_config"]
+    base_config = _abs_config(spec)
     run_dir = REPO_ROOT / spec["output_root"] / job.job_id
     overrides = list(job.overrides) + [
         f"training.run_name=ablation_{job.job_id}",
@@ -558,7 +772,7 @@ def run_test_only(job: Job, lane: str, spec: dict, ckpt: Path, tag: str) -> int:
     ]
     # Direct invocation of the python module via torchrun so DDP test loop is sharded.
     cmd = [
-        "bash", "scripts/launch_train.sh",
+        "bash", str(LAUNCH_SCRIPT),
         "--config", base_config,
         "--seed", str(job.seed),
         *overrides,
@@ -595,6 +809,8 @@ def schedule(spec: dict, store: StateStore, jobs: list[Job], only: Optional[set[
     watchdog_cfg = spec.get("watchdog", {})
     max_attempts = int(watchdog_cfg.get("max_attempts", 3))
     shutdown_grace = float(watchdog_cfg.get("shutdown_grace_seconds", 300.0))
+    gpu_free_threshold_mib = int(watchdog_cfg.get("gpu_free_threshold_mib", 2048))
+    gpu_free_timeout = float(watchdog_cfg.get("gpu_free_timeout_seconds", 180.0))
     output_root = REPO_ROOT / spec["output_root"]
 
     # Build the work queue from state (skip done; re-queue failed/crashed under retry budget).
@@ -632,6 +848,10 @@ def schedule(spec: dict, store: StateStore, jobs: list[Job], only: Optional[set[
 
     def launch_one(j: Job, lane: str) -> None:
         """Launch a queued job onto `lane`, accounting attempts vs resumes correctly."""
+        # Ensure the lane's GPUs are actually released before binding a new
+        # job to them — prevents OOM from a just-killed run's lingering DDP
+        # workers / unreclaimed CUDA contexts.
+        wait_for_lane_free(lane, gpu_free_threshold_mib, gpu_free_timeout)
         run_dir = output_root / j.job_id
         is_resume = _last_ckpt(run_dir) is not None
         st = store.get(j.job_id)
@@ -799,9 +1019,17 @@ def _load_per_patch(run_dir: Path, tag: str) -> Optional[pd.DataFrame]:
         return None
     frames = []
     for f in files:
-        with np.load(f, allow_pickle=True) as z:
-            d = {k: z[k] for k in z.files}
-        frames.append(pd.DataFrame(d))
+        try:
+            with np.load(f, allow_pickle=True) as z:
+                d = {k: z[k] for k in z.files}
+            frames.append(pd.DataFrame(d))
+        except (OSError, ValueError, EOFError):
+            # Truncated/corrupt npz (e.g. job killed mid-write) — skip it
+            # rather than aborting the whole aggregation.
+            logger.exception("Skipping unreadable per-patch file %s", f)
+    if not frames:
+        logger.warning("No readable per-patch files for tag=%s under %s", tag, run_dir)
+        return None
     df = pd.concat(frames, ignore_index=True)
     # Deduplicate on tile_id across ranks (DDP may double-count last batch with samplers)
     if "tile_id" in df.columns:
@@ -894,7 +1122,8 @@ def aggregate(spec: dict, store: StateStore, jobs: list[Job]) -> None:
                             stat, p = sps.wilcoxon(merged[f"{m}_v"], merged[f"{m}_b"])
                             paired_deltas_patch_pvals.append(float(p))
                     except Exception:
-                        pass
+                        logger.debug("Patch Wilcoxon failed for variant=%s metric=%s "
+                                     "ckpt=%s", vid, m, ckpt_tag, exc_info=True)
 
                 if not v_means:
                     continue
@@ -919,6 +1148,8 @@ def aggregate(spec: dict, store: StateStore, jobs: list[Job]) -> None:
                     try:
                         t_stat, t_p = sps.ttest_1samp(paired_deltas_run, popmean=0.0)
                     except Exception:
+                        logger.debug("Run-level t-test failed for variant=%s "
+                                     "metric=%s ckpt=%s", vid, m, ckpt_tag, exc_info=True)
                         t_stat, t_p = float("nan"), float("nan")
                     # Combine patch-level Wilcoxon p-values via Fisher's method
                     if paired_deltas_patch_pvals:
@@ -1046,6 +1277,7 @@ def main() -> int:
     jobs = build_jobs(spec)
     output_root = REPO_ROOT / spec["output_root"]
     output_root.mkdir(parents=True, exist_ok=True)
+    setup_logging(output_root)
 
     # ----- Lane-control subcommands run without acquiring the orchestrator lock.
     if args.show_control or args.disable_lane or args.enable_lane or args.drain_lane:
@@ -1082,7 +1314,7 @@ def main() -> int:
 
     if not args.aggregate_only:
         if not args.skip_cache_check:
-            cache_preflight(Path(spec["base_config"]), force_rebuild=args.rebuild_cache)
+            cache_preflight(Path(_abs_config(spec)), force_rebuild=args.rebuild_cache)
         _install_shutdown_handlers()
         with OrchestratorLock(output_root / "orchestrator.lock"):
             try:
@@ -1092,6 +1324,11 @@ def main() -> int:
                 # should have drained cleanly; this is the last-resort path.
                 logger.warning("Interrupted; state is persisted. Restart to resume.")
                 return 130
+            except Exception:
+                logger.exception(
+                    "Scheduler crashed — state.json is persisted, restart to "
+                    "resume. See orchestrator.log for the full traceback.")
+                return 1
 
     try:
         aggregate(spec, store, jobs)
@@ -1102,4 +1339,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("Fatal: orchestrator aborted with an unhandled exception")
+        sys.exit(1)
