@@ -337,7 +337,7 @@ def img_to_cog(img_path: pathlib.Path, overwrite: bool = False) -> pathlib.Path 
                     profile.pop(key, None)
 
                 # Ensure float32 dtype for elevation data
-                if profile.get("dtype") is None:
+                if profile.get("dtype") is None:  # pragma: no cover - rasterio always reports a dtype
                     profile["dtype"] = "float32"
 
                 # Preserve nodata

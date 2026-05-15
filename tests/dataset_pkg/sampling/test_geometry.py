@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 
 import pytest
-from shapely.geometry import Polygon, box
+from shapely.geometry import Point, Polygon, box
 
 from dataset.sampling.geometry import (
     as_patch_size,
@@ -106,6 +106,96 @@ class TestPackIndependentStrips:
         pts = pack_patches_independent_strips(sliver, 1.0, phase_steps=3)
         assert isinstance(pts, list)
 
+    def test_tall_region_vertical_sweep_wins(self):
+        """A tall narrow region → vertical sweep yields the best packing.
+
+        Exercises the vertical-sweep `best_points` update (geometry.py:263-264).
+        """
+        tall = box(0.0, 0.0, 2.0, 60.0)
+        pts = pack_patches_independent_strips(
+            tall, patch_size=1.0, patch_overlap=0.0, phase_steps=4
+        )
+        assert len(pts) > 10
+        for x, y in pts:
+            assert 0.0 <= x <= 2.0 and 0.0 <= y <= 60.0
+
+
+class TestGenerateValidCenterRegionRayEdges:
+    """brentq / buffer(0) / degenerate-boundary branches (152-163)."""
+
+    _SQ = staticmethod(lambda: box(0.0, 0.0, 20.0, 20.0))
+
+    def test_brentq_value_error_rays_skipped(self, monkeypatch):
+        """Rays with no sign change raise ValueError → skipped (152-154)."""
+        import scipy.optimize as so
+        from dataset.sampling import geometry as G
+
+        orig = so.brentq
+        state = {"n": 0}
+
+        def flaky(*a, **k):
+            state["n"] += 1
+            if state["n"] % 3 == 0:
+                raise ValueError("no sign change on this ray")
+            return orig(*a, **k)
+
+        monkeypatch.setattr(G, "brentq", flaky)
+        region = generate_valid_center_region(
+            self._SQ(), patch_size=1.0, overlap_percentage=0.3,
+            extra_rays_per_edge=6,
+        )
+        assert region.geom_type == "Polygon"
+        assert not region.is_empty
+
+    def test_self_intersecting_boundary_repaired_with_buffer0(self, monkeypatch):
+        """Bowtie boundary → invalid → buffer(0) repair (geometry.py:161)."""
+        import numpy as np
+        from dataset.sampling import geometry as G
+
+        # 4 angles ordered so the resulting ring self-intersects (bowtie).
+        monkeypatch.setattr(
+            G, "_get_optimized_angles",
+            lambda *a, **k: np.array([0.0, np.pi, np.pi / 2, 3 * np.pi / 2]),
+        )
+        rs = iter([2.0, 2.0, 2.0, 2.0])
+        monkeypatch.setattr(G, "brentq", lambda *a, **k: next(rs))
+        region = generate_valid_center_region(
+            self._SQ(), patch_size=1.0, overlap_percentage=0.3,
+        )
+        assert region.geom_type == "Polygon"
+        assert region.is_valid
+        assert not region.is_empty
+
+    def test_degenerate_collinear_boundary_returns_empty(self, monkeypatch):
+        """Collinear boundary → buffer(0) empty → Polygon() (geometry.py:163)."""
+        import numpy as np
+        from dataset.sampling import geometry as G
+
+        monkeypatch.setattr(
+            G, "_get_optimized_angles",
+            lambda *a, **k: np.array([0.0, 0.0, 0.0]),
+        )
+        rs = iter([1.0, 2.0, 3.0])
+        monkeypatch.setattr(G, "brentq", lambda *a, **k: next(rs))
+        region = generate_valid_center_region(
+            self._SQ(), patch_size=1.0, overlap_percentage=0.3,
+        )
+        assert region.is_empty
+
+    def test_fewer_than_three_boundary_points_returns_empty(self, monkeypatch):
+        """All rays skipped → <3 points → Polygon() (geometry.py:156-157)."""
+        from dataset.sampling import geometry as G
+
+        def always_fail(*a, **k):
+            raise ValueError("no root")
+
+        monkeypatch.setattr(G, "brentq", always_fail)
+        region = generate_valid_center_region(
+            box(0.0, 0.0, 20.0, 20.0), patch_size=1.0,
+            overlap_percentage=0.3,
+        )
+        assert region.is_empty
+
 
 # ---------------------------------------------------------------------------
 # pack_patches_grid
@@ -125,11 +215,7 @@ class TestPackGrid:
         pts = pack_patches_grid(region, 2.0, phase_steps=3)
         assert len(pts) > 0
         for x, y in pts:
-            assert region.contains_properly(
-                __import__("shapely").geometry.Point(x, y)
-            ) or region.touches(__import__("shapely").geometry.Point(x, y)) or region.contains(
-                __import__("shapely").geometry.Point(x, y)
-            )
+            assert region.intersects(Point(x, y))
 
     def test_grid_on_rotated_strip(self, strip_polygon):
         region = generate_valid_center_region(strip_polygon, 0.01, 0.4)

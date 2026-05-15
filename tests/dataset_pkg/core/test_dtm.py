@@ -275,6 +275,24 @@ class TestGetOrthoOverlapSuccess:
         ratio = dtm_dataset._get_ortho_overlap(dtm_geom, str(p))
         assert 0.4 < ratio < 0.6
 
+    def test_zero_area_dtm_with_real_file_returns_zero(self, dtm_dataset, tmp_path):
+        """Real ortho file but zero-area DTM geom → 0.0 (dtm.py:546-547)."""
+        from shapely.geometry import Point
+
+        p = tmp_path / "ortho.tif"
+        _write_ortho_tif(p, bands=1, bounds=(-131.0, 18.0, -130.0, 19.0))
+        ratio = dtm_dataset._get_ortho_overlap(Point(-130.5, 18.5), str(p))
+        assert ratio == 0.0
+
+    def test_antimeridian_ortho_split_into_two_boxes(self, dtm_dataset, tmp_path):
+        """Ortho straddling the antimeridian → unary_union branch (dtm.py:537-542)."""
+        p = tmp_path / "ortho_am.tif"
+        # Footprint spanning 179°E → -179°E (i.e. fl_norm > fr_norm after wrap).
+        _write_ortho_tif(p, bands=1, bounds=(179.0, -1.0, 181.0, 1.0))
+        dtm_geom = box(179.5, -1.0, 180.0, 1.0)
+        ratio = dtm_dataset._get_ortho_overlap(dtm_geom, str(p))
+        assert ratio > 0.0
+
     def test_no_crs_returns_one(self, dtm_dataset, tmp_path):
         p = tmp_path / "nocrs.tif"
         transform = rasterio.transform.from_bounds(-131.0, 18.0, -130.0, 19.0, 8, 8)
@@ -376,6 +394,19 @@ class TestGetItem:
         assert sample["meta"][0]["dtm_product_id"] == "DTEEC_test"
         assert "left_red_meta" in sample["meta"][0]
 
+    def test_none_ortho_path_column_is_skipped(self, dtm_dataset, dtm_files, mars_crs):
+        """An ortho path column that is None (not str) → continue (dtm.py:285-286)."""
+        gdf = _make_index_row(
+            dtm_files["dtm"], dtm_files["left_red"], dtm_files["right_red"], mars_crs
+        )
+        gdf["left_red_path"] = [None]  # not a str → skipped
+        dtm_dataset.index = gdf
+        sample = dtm_dataset[slice(-130.6, -130.4), slice(18.4, 18.6), slice(None)]
+        assert "elevation" in sample
+        # left_red was skipped; right_red still loads.
+        assert "right_red" in sample
+        assert "left_red" not in sample
+
     def test_no_ortho_returns_only_elevation(self, tmp_path, dtm_files, mars_crs):
         with patch.object(MarsHiRISEDTM, "_verify", return_value=None):
             ds = MarsHiRISEDTM(
@@ -425,6 +456,14 @@ class TestPlot:
     def test_plot_handles_4d_elevation(self, dtm_dataset):
         s = self._sample()
         s["elevation"] = s["elevation"].unsqueeze(0)  # (1, 1, 16, 16)
+        fig = dtm_dataset.plot(s)
+        plt.close(fig)
+
+    def test_plot_handles_4d_ortho(self, dtm_dataset):
+        """4D ortho tensor → squeezed batch dim (dtm.py:392-393)."""
+        s = self._sample()
+        s["left_red"] = s["left_red"].unsqueeze(0)    # (1, 1, 16, 16)
+        s["right_irb"] = s["right_irb"].unsqueeze(0)  # (1, 3, 16, 16)
         fig = dtm_dataset.plot(s)
         plt.close(fig)
 
@@ -574,10 +613,118 @@ class TestBuildSpatialIndex:
         with pytest.raises(DatasetNotFoundError):
             ds._build_spatial_index(force_rebuild=True)
 
+    def test_ortho_overlap_below_threshold_drops_pair(self, tmp_path, caplog):
+        """Ortho footprint barely overlapping DTM (<75%) → pair dropped.
+
+        Covers dtm.py:767-776 (Misalignment-detected drop).
+        """
+        images = tmp_path / "images"
+        images.mkdir()
+        _write_dtm_tif(images / "DTEEC_001.IMG",
+                       bounds=(-131.0, 18.0, -130.0, 19.0))
+        # Orthos shifted far east so intersection with the DTM is tiny.
+        _write_ortho_tif(images / "PSP_001234_1780_RED_A_01_ORTHO.JP2",
+                         bands=1, bounds=(-130.05, 18.0, -129.0, 19.0))
+        _write_ortho_tif(images / "PSP_005678_1780_RED_A_01_ORTHO.JP2",
+                         bands=1, bounds=(-130.05, 18.0, -129.0, 19.0))
+        _write_lbl(images / "PSP_001234_1780_RED_A_01_ORTHO.LBL")
+        _write_lbl(images / "PSP_005678_1780_RED_A_01_ORTHO.LBL")
+
+        with patch.object(MarsHiRISEDTM, "_verify", return_value=None):
+            ds = MarsHiRISEDTM(
+                root=str(tmp_path), include_ortho=True, ortho_type="RED",
+                reuse_cache=False,
+            )
+        ds._raw_index = _raw_index_for_pair(images)
+        from torchgeo.datasets.errors import DatasetNotFoundError
+        import logging
+        with caplog.at_level(logging.ERROR, logger="dataset.core.dtm"):
+            with pytest.raises(DatasetNotFoundError):
+                ds._build_spatial_index(force_rebuild=True)
+        assert "Misalignment detected" in caplog.text
+
+    def test_invalid_scaling_factor_drops_pair(self, tmp_path, caplog):
+        """Ortho overlaps DTM but LBL scaling=1/offset=0 → pair dropped.
+
+        Covers dtm.py:781-791 (Incorrect scaling_factor drop).
+        """
+        images = tmp_path / "images"
+        images.mkdir()
+        _write_dtm_tif(images / "DTEEC_001.IMG")
+        _write_ortho_tif(images / "PSP_001234_1780_RED_A_01_ORTHO.JP2", bands=1)
+        _write_ortho_tif(images / "PSP_005678_1780_RED_A_01_ORTHO.JP2", bands=1)
+        # Invalid radiometric calibration: scaling=1, offset=0.
+        _write_lbl(images / "PSP_001234_1780_RED_A_01_ORTHO.LBL",
+                   scaling=1.0, offset=0.0)
+        _write_lbl(images / "PSP_005678_1780_RED_A_01_ORTHO.LBL",
+                   scaling=1.0, offset=0.0)
+
+        with patch.object(MarsHiRISEDTM, "_verify", return_value=None):
+            ds = MarsHiRISEDTM(
+                root=str(tmp_path), include_ortho=True, ortho_type="RED",
+                reuse_cache=False,
+            )
+        ds._raw_index = _raw_index_for_pair(images)
+        from torchgeo.datasets.errors import DatasetNotFoundError
+        import logging
+        with caplog.at_level(logging.ERROR, logger="dataset.core.dtm"):
+            with pytest.raises(DatasetNotFoundError):
+                ds._build_spatial_index(force_rebuild=True)
+        assert "Incorrect scaling_factor" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Cache reuse short-circuit
 # ---------------------------------------------------------------------------
+
+
+class TestBuildSpatialIndexBranches:
+    """Cover the scattered _build_spatial_index branches.
+
+    * non-numeric MAP_SCALE → except pass (dtm.py:678-680)
+    * DTM file absent → empty footprint path list (dtm.py:705-709)
+    * geometry unresolvable (antimeridian, no corners) → drop (dtm.py:752-754)
+    """
+
+    def test_bad_map_scale_and_missing_dtm_file(self, tmp_path):
+        with patch.object(MarsHiRISEDTM, "_verify", return_value=None):
+            ds = MarsHiRISEDTM(
+                root=str(tmp_path), include_ortho=False, reuse_cache=False,
+            )
+        df = _raw_index_for_pair(tmp_path / "images")
+        # DTM .IMG is never materialised → dtm_path won't exist (709 branch).
+        df["MAP_SCALE"] = df["MAP_SCALE"].astype(object)
+        df.loc[df["DATA_TYPE"] == "DTM", "MAP_SCALE"] = "not-a-number"
+        ds._raw_index = df
+        ds._build_spatial_index(force_rebuild=True)
+        # Pair still resolves geometry from CORNER columns.
+        assert ds.index is not None
+        assert len(ds.index) == 1
+        # map_scale stayed at its default (float() raised → except pass).
+        assert "map_scale" in ds.index.columns
+
+    def test_unresolvable_geometry_drops_pair(self, tmp_path, caplog):
+        import logging
+        from torchgeo.datasets.errors import DatasetNotFoundError
+
+        with patch.object(MarsHiRISEDTM, "_verify", return_value=None):
+            ds = MarsHiRISEDTM(
+                root=str(tmp_path), include_ortho=False, reuse_cache=False,
+            )
+        df = _raw_index_for_pair(tmp_path / "images")
+        # Remove CORNER columns and make min/max longitude straddle the
+        # antimeridian so corners_to_polygon and the min/max bbox both fail
+        # → _geometry_from_footprint_result returns None.
+        corner_cols = [c for c in df.columns if c.startswith("CORNER")]
+        df = df.drop(columns=corner_cols)
+        # 170 → 170, 190 → -170 ⇒ lon_min (170) > lon_max (-170) ⇒ antimeridian
+        df["MINIMUM_LONGITUDE"] = 170.0
+        df["MAXIMUM_LONGITUDE"] = 190.0
+        ds._raw_index = df
+        with caplog.at_level(logging.WARNING, logger="dataset.core.dtm"):
+            with pytest.raises(DatasetNotFoundError):
+                ds._build_spatial_index(force_rebuild=True)
+        assert "Could not generate valid geometry" in caplog.text
 
 
 class TestBuildSpatialIndexCacheShortCircuit:

@@ -88,6 +88,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: marks tests that require real HiRISE data on disk",
+    "slow: marks tests that take more than a few seconds (excluded by default in CI)",
 ]
 
 [tool.coverage.run]
