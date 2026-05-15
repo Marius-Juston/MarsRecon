@@ -1023,9 +1023,12 @@ def _load_per_patch(run_dir: Path, tag: str) -> Optional[pd.DataFrame]:
             with np.load(f, allow_pickle=True) as z:
                 d = {k: z[k] for k in z.files}
             frames.append(pd.DataFrame(d))
-        except (OSError, ValueError, EOFError):
-            # Truncated/corrupt npz (e.g. job killed mid-write) — skip it
-            # rather than aborting the whole aggregation.
+        except Exception:
+            # Any unreadable per-patch file — truncated/corrupt npz from a
+            # job killed mid-write surfaces as zipfile.BadZipFile,
+            # pickle.UnpicklingError, OSError, ValueError or EOFError
+            # depending on where the write was severed. Skip it rather than
+            # aborting the entire post-hoc aggregation.
             logger.exception("Skipping unreadable per-patch file %s", f)
     if not frames:
         logger.warning("No readable per-patch files for tag=%s under %s", tag, run_dir)
