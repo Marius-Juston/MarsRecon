@@ -6,7 +6,7 @@ on:
     paths:
       - "docs/**"
       - "src/**"
-      - "mkdocs.yml"
+      - "properdocs.yml"
       - "scripts/architecture/**"
       - "README.md"
       - "MarsHiRISE_Technical_Reference.md"
