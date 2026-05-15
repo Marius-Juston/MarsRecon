@@ -9,7 +9,7 @@
 
 study_name: loss_dropone_v1
 base_config: configs/train_hirise_large.yaml
-output_root: /home/mjuston2/Documents/MarsRecon/outputs/ablation
+output_root: outputs/ablation
 project_name: mars-depthfm-ablation
 group: loss_dropone_v1
 

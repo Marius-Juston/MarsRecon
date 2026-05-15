@@ -76,7 +76,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ablation")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # Status enum (strings to keep state.json human-readable)
 STATUS_QUEUED = "queued"
@@ -411,7 +411,7 @@ def launch_train(job: Job, lane: str, spec: dict, store: "StateStore") -> "Runni
     ]
 
     cmd = [
-        "bash", "scripts/launch_train.sh",
+        "bash", "scripts/training/launch_train.sh",
         "--config", base_config,
         "--n_runs", "1",
         "--seed", str(job.seed),
