@@ -9,31 +9,60 @@ hierarchical bootstrap CIs) for both headline metrics (RMSE, photo).
 
 Usage:
     # End-to-end (preflight + queue + aggregate)
-    uv run python scripts/run_ablation.py --spec configs/ablation/loss_dropone.yaml
+    uv run python scripts/training/run_ablation.py --spec configs/ablation/loss_dropone.yaml
 
     # Plan only — no launches
-    uv run python scripts/run_ablation.py --spec ... --dry-run
+    uv run python scripts/training/run_ablation.py --spec ... --dry-run
 
     # Run only one specific job (smoke test)
-    uv run python scripts/run_ablation.py --spec ... --only L0_s42
+    uv run python scripts/training/run_ablation.py --spec ... --only L0_s42
 
     # Re-run the aggregator on existing results
-    uv run python scripts/run_ablation.py --spec ... --aggregate-only
+    uv run python scripts/training/run_ablation.py --spec ... --aggregate-only
 
-State lives in <output_root>/state.json (fsync'd on every transition).
-Restart the script after a crash; it picks up where it left off.
+    # Dynamic lane control while the orchestrator is running (separate shell)
+    uv run python scripts/training/run_ablation.py --spec ... --disable-lane "2,3"
+    uv run python scripts/training/run_ablation.py --spec ... --drain-lane "2,3"
+    uv run python scripts/training/run_ablation.py --spec ... --enable-lane "2,3"
+    uv run python scripts/training/run_ablation.py --spec ... --show-control
+
+Fault tolerance:
+  - State persists in <output_root>/state.json (atomic write + fsync per
+    transition). Restart after any crash or reboot to resume.
+  - Each job has a persistent W&B run id (state.wandb_run_id) exported to
+    children as WANDB_RUN_ID + WANDB_RESUME=allow so a single seed shows as
+    one continuous W&B run across any number of restarts.
+  - SIGINT/SIGTERM to the orchestrator triggers a graceful drain: children
+    receive SIGTERM with grace (default 300s, watchdog.shutdown_grace_seconds)
+    so Lightning can flush last.ckpt, then they're re-queued without burning
+    retry budget.
+  - JobState distinguishes `attempts` (fresh starts; counts against
+    watchdog.max_attempts) from `resumes` (relaunches that found last.ckpt;
+    capped at MAX_RESUMES=50). Operational restarts don't exhaust the budget.
+  - Lane control file <output_root>/control/lanes.json with shape
+    {"disabled": [...], "drain": [...]} is re-read each poll tick:
+      * disabled → preempt running job with SIGTERM+grace, re-queue (benign);
+      * drain    → finish current job, don't launch new ones on that lane.
+    Editable atomically via the --disable-lane / --enable-lane / --drain-lane
+    subcommands.
+  - <output_root>/orchestrator.lock (fcntl) prevents double-orchestrator.
+  - <output_root>/orchestrator.heartbeat.json is rewritten each poll tick
+    with pid, hostname, running jobs, queued count — `watch cat` to monitor.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
+import secrets
 import signal
+import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields as dc_fields
 from pathlib import Path
 from typing import Optional
 
@@ -79,7 +108,8 @@ class Job:
 @dataclass
 class JobState:
     status: str = STATUS_QUEUED
-    attempts: int = 0
+    attempts: int = 0           # fresh starts only (no last.ckpt at launch)
+    resumes: int = 0            # launches that found a last.ckpt
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
     run_dir: Optional[str] = None
@@ -92,6 +122,11 @@ class JobState:
     best_photo_ckpt: Optional[str] = None
     test_done_rmse_ckpt: bool = False
     test_done_photo_ckpt: bool = False
+    wandb_run_id: Optional[str] = None  # persistent across resumes
+
+
+# Sanity bound to catch infinite resume-then-die loops.
+MAX_RESUMES = 50
 
 
 def load_spec(path: Path) -> dict:
@@ -128,7 +163,11 @@ class StateStore:
 
     def _load(self) -> None:
         raw = json.loads(self.path.read_text())
-        self._states = {jid: JobState(**v) for jid, v in raw.items()}
+        known = {f.name for f in dc_fields(JobState)}
+        self._states = {
+            jid: JobState(**{k: v for k, v in d.items() if k in known})
+            for jid, d in raw.items()
+        }
         logger.info("Loaded state for %d jobs from %s", len(self._states), self.path)
 
     def _flush(self) -> None:
@@ -213,6 +252,130 @@ def cache_preflight(base_config_path: Path, force_rebuild: bool = False) -> None
 
 
 # --------------------------------------------------------------------------
+# Control file (dynamic lane disable/drain) + lock + heartbeat
+# --------------------------------------------------------------------------
+
+def _control_path(output_root: Path) -> Path:
+    return output_root / "control" / "lanes.json"
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def read_control(output_root: Path) -> dict:
+    """Return {"disabled": [...], "drain": [...]}. Missing/corrupt file → empty."""
+    p = _control_path(output_root)
+    if not p.exists():
+        return {"disabled": [], "drain": []}
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        logger.warning("control file %s is unreadable; ignoring this tick", p)
+        return {"disabled": [], "drain": []}
+    return {
+        "disabled": list(d.get("disabled", [])),
+        "drain": list(d.get("drain", [])),
+    }
+
+
+def write_control(output_root: Path, disabled: list[str], drain: list[str]) -> None:
+    _atomic_write_json(_control_path(output_root), {"disabled": disabled, "drain": drain})
+
+
+def mutate_control(output_root: Path, *, add_disabled: Optional[str] = None,
+                   remove_disabled: Optional[str] = None,
+                   add_drain: Optional[str] = None,
+                   remove_drain: Optional[str] = None) -> dict:
+    cur = read_control(output_root)
+    disabled = set(cur["disabled"])
+    drain = set(cur["drain"])
+    if add_disabled is not None:
+        disabled.add(add_disabled)
+        drain.discard(add_disabled)
+    if remove_disabled is not None:
+        disabled.discard(remove_disabled)
+    if add_drain is not None:
+        drain.add(add_drain)
+        disabled.discard(add_drain)
+    if remove_drain is not None:
+        drain.discard(remove_drain)
+    payload = {"disabled": sorted(disabled), "drain": sorted(drain)}
+    write_control(output_root, payload["disabled"], payload["drain"])
+    return payload
+
+
+class OrchestratorLock:
+    """Exclusive flock on a file in output_root — prevents double-orchestrators."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "OrchestratorLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                holder = Path(self.path).read_text().strip() or "unknown"
+            except OSError:
+                holder = "unknown"
+            os.close(self._fd)
+            self._fd = None
+            raise SystemExit(
+                f"Another orchestrator already holds {self.path} (pid={holder}). "
+                f"Refusing to start a second instance."
+            )
+        os.ftruncate(self._fd, 0)
+        os.write(self._fd, f"{os.getpid()}\n".encode())
+        os.fsync(self._fd)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
+
+
+def write_heartbeat(output_root: Path, running: dict, queued: int, shutting_down: bool) -> None:
+    try:
+        _atomic_write_json(output_root / "orchestrator.heartbeat.json", {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "running_jobs": {lane: rj.job.job_id for lane, rj in running.items()},
+            "queued_jobs": queued,
+            "shutting_down": shutting_down,
+        })
+    except OSError:
+        pass  # never let heartbeat I/O take down the orchestrator
+
+
+# --------------------------------------------------------------------------
+# Shutdown flag (set by SIGINT/SIGTERM handler installed in main)
+# --------------------------------------------------------------------------
+
+_SHUTDOWN = {"requested": False}
+
+
+def _install_shutdown_handlers() -> None:
+    def _handle(signum, frame):
+        if not _SHUTDOWN["requested"]:
+            logger.warning("Received signal %d — initiating graceful shutdown.", signum)
+        _SHUTDOWN["requested"] = True
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
+
+
+# --------------------------------------------------------------------------
 # Job launching + watchdog
 # --------------------------------------------------------------------------
 
@@ -229,7 +392,13 @@ class RunningJob:
     started_at: float = 0.0
 
 
-def launch_train(job: Job, lane: str, spec: dict) -> RunningJob:
+def _last_ckpt(run_dir: Path) -> Optional[Path]:
+    """Locate the Lightning recovery checkpoint anywhere under run_dir."""
+    hits = list(run_dir.rglob("checkpoints/last.ckpt"))
+    return hits[0] if hits else None
+
+
+def launch_train(job: Job, lane: str, spec: dict, store: "StateStore") -> "RunningJob":
     base_config = spec["base_config"]
     output_root = REPO_ROOT / spec["output_root"]
     run_dir = output_root / job.job_id
@@ -249,9 +418,17 @@ def launch_train(job: Job, lane: str, spec: dict) -> RunningJob:
         *overrides,
     ]
 
+    # Persist a stable W&B run id per job so resumes land in the same W&B run.
+    st = store.get(job.job_id)
+    if not st.wandb_run_id:
+        store.set(job.job_id, wandb_run_id=secrets.token_hex(4))
+        st = store.get(job.job_id)
+
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = lane
     env["WANDB_RUN_GROUP"] = spec.get("group", spec.get("study_name", "ablation"))
+    env["WANDB_RUN_ID"] = st.wandb_run_id
+    env["WANDB_RESUME"] = "allow"
 
     log_path = run_dir / "job.log"
     log_file = open(log_path, "ab")
@@ -278,18 +455,26 @@ def launch_train(job: Job, lane: str, spec: dict) -> RunningJob:
     )
 
 
-def kill_running(rj: RunningJob, reason: str) -> None:
-    logger.warning("Killing job %s: %s", rj.job.job_id, reason)
+def kill_running(rj: RunningJob, reason: str, grace_seconds: float = 300.0) -> None:
+    """Send SIGTERM, wait up to grace_seconds for Lightning to flush last.ckpt,
+    then SIGKILL if still alive. 300s is the default — large model checkpoints
+    take real wall-clock time to land on disk under DDP."""
+    logger.warning("Killing job %s (grace=%.0fs): %s", rj.job.job_id, grace_seconds, reason)
     try:
         os.killpg(rj.proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
-        rj.proc.wait(timeout=30)
+        rj.proc.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
+        logger.warning("Job %s did not exit within %.0fs of SIGTERM — SIGKILL", rj.job.job_id, grace_seconds)
         try:
             os.killpg(rj.proc.pid, signal.SIGKILL)
         except ProcessLookupError:
+            pass
+        try:
+            rj.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
             pass
 
 
@@ -383,6 +568,11 @@ def run_test_only(job: Job, lane: str, spec: dict, ckpt: Path, tag: str) -> int:
     ]
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = lane
+    # Test-only artifacts are the per-patch npz files; don't pollute the training
+    # run on W&B with a separate test-time run id.
+    env["WANDB_MODE"] = "disabled"
+    env.pop("WANDB_RUN_ID", None)
+    env.pop("WANDB_RESUME", None)
 
     log_path = run_dir / f"test_{tag}.log"
     with open(log_path, "ab") as log_file:
@@ -404,6 +594,8 @@ def schedule(spec: dict, store: StateStore, jobs: list[Job], only: Optional[set[
     lanes: list[str] = list(spec["lanes"])
     watchdog_cfg = spec.get("watchdog", {})
     max_attempts = int(watchdog_cfg.get("max_attempts", 3))
+    shutdown_grace = float(watchdog_cfg.get("shutdown_grace_seconds", 300.0))
+    output_root = REPO_ROOT / spec["output_root"]
 
     # Build the work queue from state (skip done; re-queue failed/crashed under retry budget).
     pending: list[Job] = []
@@ -425,78 +617,139 @@ def schedule(spec: dict, store: StateStore, jobs: list[Job], only: Optional[set[
     logger.info("Scheduling %d jobs across %d lanes", len(pending), len(lanes))
 
     running: dict[str, RunningJob] = {}  # lane -> RunningJob
-    queue_idx = 0
     poll_interval = 60.0
 
-    def free_lane() -> Optional[str]:
+    def control_snapshot() -> tuple[set[str], set[str]]:
+        c = read_control(output_root)
+        return set(c["disabled"]), set(c["drain"])
+
+    def free_lane(disabled: set[str], drain: set[str]) -> Optional[str]:
         for lane in lanes:
-            if lane not in running:
-                return lane
+            if lane in running or lane in disabled or lane in drain:
+                continue
+            return lane
         return None
 
-    while queue_idx < len(pending) or running:
-        # Launch into free lanes
-        while queue_idx < len(pending):
-            lane = free_lane()
-            if lane is None:
-                break
-            j = pending[queue_idx]
-            queue_idx += 1
-            st = store.get(j.job_id)
+    def launch_one(j: Job, lane: str) -> None:
+        """Launch a queued job onto `lane`, accounting attempts vs resumes correctly."""
+        run_dir = output_root / j.job_id
+        is_resume = _last_ckpt(run_dir) is not None
+        st = store.get(j.job_id)
+        if is_resume:
+            store.set(
+                j.job_id,
+                status=STATUS_RUNNING,
+                resumes=(st.resumes or 0) + 1,
+                started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                ended_at=None, lane=lane, exit_reason=None,
+            )
+        else:
             store.set(
                 j.job_id,
                 status=STATUS_RUNNING,
                 attempts=(st.attempts or 0) + 1,
                 started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-                ended_at=None,
-                lane=lane,
-                exit_reason=None,
+                ended_at=None, lane=lane, exit_reason=None,
             )
-            rj = launch_train(j, lane, spec)
-            running[lane] = rj
-            store.set(j.job_id, pid=rj.proc.pid, run_dir=str(rj.run_dir))
-            logger.info("Launched %s on lane=%s pid=%d", j.job_id, lane, rj.proc.pid)
+        rj = launch_train(j, lane, spec, store)
+        running[lane] = rj
+        store.set(j.job_id, pid=rj.proc.pid, run_dir=str(rj.run_dir))
+        logger.info("Launched %s on lane=%s pid=%d (%s)", j.job_id, lane, rj.proc.pid,
+                    "resume" if is_resume else "fresh")
 
-        # Poll running jobs
+    def requeue_benign(rj: RunningJob, reason: str) -> None:
+        """Re-queue a job after an operational stop (shutdown / lane disable).
+        Does NOT consume attempts; the next launch will resume from last.ckpt."""
+        store.set(rj.job.job_id, status=STATUS_QUEUED, exit_reason=reason,
+                  ended_at=time.strftime("%Y-%m-%dT%H:%M:%S"), pid=None, lane=None)
+        pending.append(rj.job)
+
+    def handle_crash(rj: RunningJob, reason: str) -> None:
+        """Crash path: watchdog kill OR nonzero exit. Spends attempts only when
+        no recoverable checkpoint exists."""
+        has_ckpt = _last_ckpt(rj.run_dir) is not None
+        st = store.get(rj.job.job_id)
+        if has_ckpt and (st.resumes or 0) < MAX_RESUMES:
+            logger.warning("Re-queuing %s after '%s' (will resume from last.ckpt; resumes=%d)",
+                           rj.job.job_id, reason, st.resumes or 0)
+            store.set(rj.job.job_id, status=STATUS_CRASHED, exit_reason=reason,
+                      ended_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+            pending.append(rj.job)
+            store.set(rj.job.job_id, status=STATUS_QUEUED)
+        elif (st.attempts or 0) < max_attempts:
+            logger.warning("Re-queuing %s after '%s' as fresh attempt %d/%d (no checkpoint)",
+                           rj.job.job_id, reason, st.attempts, max_attempts)
+            store.set(rj.job.job_id, status=STATUS_CRASHED, exit_reason=reason,
+                      ended_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+            pending.append(rj.job)
+            store.set(rj.job.job_id, status=STATUS_QUEUED)
+        else:
+            store.set(rj.job.job_id, status=STATUS_FAILED, exit_reason=reason,
+                      ended_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+    while pending or running:
+        # ----- Shutdown path: kill children, mark them queued, return cleanly.
+        if _SHUTDOWN["requested"]:
+            logger.warning("Shutdown requested; sending SIGTERM to %d running job(s) "
+                           "with %.0fs grace each.", len(running), shutdown_grace)
+            for lane, rj in list(running.items()):
+                kill_running(rj, "orchestrator shutdown", grace_seconds=shutdown_grace)
+                rj.log_file.close()
+                requeue_benign(rj, "orchestrator shutdown")
+                del running[lane]
+            write_heartbeat(output_root, running, len(pending), shutting_down=True)
+            logger.warning("Shutdown complete. State is persisted; restart this script to resume.")
+            return
+
+        disabled, drain = control_snapshot()
+
+        # ----- Honor 'disabled': preempt any running job on a disabled lane.
+        for lane, rj in list(running.items()):
+            if lane in disabled:
+                logger.warning("Lane %s is disabled via control file; preempting %s",
+                               lane, rj.job.job_id)
+                kill_running(rj, "lane disabled", grace_seconds=shutdown_grace)
+                rj.log_file.close()
+                requeue_benign(rj, "lane disabled")
+                del running[lane]
+
+        # ----- Launch into available lanes (drain/disabled excluded).
+        while pending:
+            lane = free_lane(disabled, drain)
+            if lane is None:
+                break
+            j = pending.pop(0)
+            launch_one(j, lane)
+
+        # ----- Poll
+        write_heartbeat(output_root, running, len(pending), shutting_down=False)
+        if not running:
+            # Everything either drained or done — sleep then re-check control file.
+            if not pending:
+                break
+            time.sleep(poll_interval)
+            continue
+
         time.sleep(poll_interval)
+
         for lane in list(running.keys()):
             rj = running[lane]
             rc = rj.proc.poll()
             if rc is None:
                 reason = watchdog_check(rj, watchdog_cfg)
                 if reason is not None:
-                    kill_running(rj, reason)
+                    kill_running(rj, reason, grace_seconds=shutdown_grace)
                     rj.log_file.close()
-                    store.set(rj.job.job_id, status=STATUS_CRASHED, exit_reason=reason,
-                              ended_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
                     del running[lane]
-                    # Retry?
-                    st = store.get(rj.job.job_id)
-                    if st.attempts < max_attempts:
-                        logger.warning("Re-queuing %s (attempt %d/%d)", rj.job.job_id, st.attempts, max_attempts)
-                        pending.append(rj.job)
-                        store.set(rj.job.job_id, status=STATUS_QUEUED)
-                    else:
-                        store.set(rj.job.job_id, status=STATUS_FAILED)
+                    handle_crash(rj, reason)
                 continue
 
             # Process exited on its own
             rj.log_file.close()
             if rc != 0:
                 logger.warning("%s exited with rc=%d", rj.job.job_id, rc)
-                st = store.get(rj.job.job_id)
-                if st.attempts < max_attempts:
-                    store.set(rj.job.job_id, status=STATUS_CRASHED,
-                              exit_reason=f"exit code {rc}",
-                              ended_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
-                    logger.warning("Re-queuing %s (attempt %d/%d)", rj.job.job_id, st.attempts, max_attempts)
-                    pending.append(rj.job)
-                    store.set(rj.job.job_id, status=STATUS_QUEUED)
-                else:
-                    store.set(rj.job.job_id, status=STATUS_FAILED,
-                              exit_reason=f"exit code {rc}",
-                              ended_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
                 del running[lane]
+                handle_crash(rj, f"exit code {rc}")
                 continue
 
             # Success path → locate checkpoints, run test-only twice on the SAME lane (now free briefly)
@@ -776,12 +1029,37 @@ def main() -> int:
                    help="Don't preflight the cache (assume it's ready)")
     p.add_argument("--aggregate-only", action="store_true",
                    help="Skip scheduling; just regenerate the summary CSVs")
+
+    # Dynamic lane control — these mutate the control file and exit. They are
+    # safe to run from a separate shell while the orchestrator is running.
+    p.add_argument("--disable-lane", type=str, default=None,
+                   help="Preempt and disable a lane (e.g. '2,3'). Running job will be SIGTERMed and re-queued.")
+    p.add_argument("--enable-lane", type=str, default=None,
+                   help="Re-enable a previously disabled/drained lane.")
+    p.add_argument("--drain-lane", type=str, default=None,
+                   help="Don't launch new jobs on this lane, but let the current one finish.")
+    p.add_argument("--show-control", action="store_true",
+                   help="Print the current control file and exit.")
     args = p.parse_args()
 
     spec = load_spec(args.spec)
     jobs = build_jobs(spec)
     output_root = REPO_ROOT / spec["output_root"]
     output_root.mkdir(parents=True, exist_ok=True)
+
+    # ----- Lane-control subcommands run without acquiring the orchestrator lock.
+    if args.show_control or args.disable_lane or args.enable_lane or args.drain_lane:
+        if args.disable_lane:
+            mutate_control(output_root, add_disabled=args.disable_lane)
+        if args.enable_lane:
+            mutate_control(output_root, remove_disabled=args.enable_lane,
+                           remove_drain=args.enable_lane)
+        if args.drain_lane:
+            mutate_control(output_root, add_drain=args.drain_lane)
+        cur = read_control(output_root)
+        print(json.dumps(cur, indent=2))
+        return 0
+
     store = StateStore(output_root / "state.json")
 
     if args.dry_run:
@@ -805,11 +1083,15 @@ def main() -> int:
     if not args.aggregate_only:
         if not args.skip_cache_check:
             cache_preflight(Path(spec["base_config"]), force_rebuild=args.rebuild_cache)
-        try:
-            schedule(spec, store, jobs, only=only_set)
-        except KeyboardInterrupt:
-            logger.warning("Interrupted; state is persisted. Restart to resume.")
-            return 130
+        _install_shutdown_handlers()
+        with OrchestratorLock(output_root / "orchestrator.lock"):
+            try:
+                schedule(spec, store, jobs, only=only_set)
+            except KeyboardInterrupt:
+                # Defensive: signal handler should have set _SHUTDOWN and the loop
+                # should have drained cleanly; this is the last-resort path.
+                logger.warning("Interrupted; state is persisted. Restart to resume.")
+                return 130
 
     try:
         aggregate(spec, store, jobs)

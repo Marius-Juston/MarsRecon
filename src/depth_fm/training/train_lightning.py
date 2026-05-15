@@ -463,12 +463,21 @@ def run_single_training(
     # metrics (val/rmse_mean, val/photo_consistency_mean).
     trainer_loggers: list = []
     if config.training.logger == "wandb":
+        # Honor externally-supplied WANDB_RUN_ID / WANDB_RESUME so the ablation
+        # orchestrator (or any wrapper) can resume the same W&B run across
+        # checkpoint-aware restarts. Falls through to fresh runs if unset.
+        _wandb_kwargs = {}
+        _wandb_id = os.environ.get("WANDB_RUN_ID")
+        if _wandb_id:
+            _wandb_kwargs["id"] = _wandb_id
+            _wandb_kwargs["resume"] = os.environ.get("WANDB_RESUME", "allow")
         wandb_logger = WandbLogger(
             project=config.training.project_name,
             name=f"{config.training.run_name}_run{run_idx}",
             save_dir=str(output_dir),
             group=config.training.run_name,
             tags=["mars", "depthfm", "flow-matching"],
+            **_wandb_kwargs,
         )
         trainer_loggers.append(wandb_logger)
     csv_logger = CSVLogger(save_dir=str(output_dir), name="csv")

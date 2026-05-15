@@ -9,7 +9,7 @@
 
 study_name: loss_dropone_v1
 base_config: configs/train_hirise_large.yaml
-output_root: outputs/ablation
+output_root: /home/mjuston2/Documents/MarsRecon/outputs/ablation
 project_name: mars-depthfm-ablation
 group: loss_dropone_v1
 
@@ -67,5 +67,26 @@ watchdog:
   # is calibrated to the dataset's elevation std (~m) — set to None to disable.
   noskill_check_fraction: 0.20
   noskill_rmse_threshold: null   # null disables; orchestrator falls back to "any val/rmse_mean improvement"
-  # Hard retry budget per job before marking failed permanently.
+  # Hard retry budget per job before marking failed permanently. Only spent on
+  # *fresh* failures (no last.ckpt). Restarts from a checkpoint are tracked via
+  # `resumes` instead and don't burn this budget.
   max_attempts: 3
+  # SIGTERM-to-SIGKILL grace period when preempting a running job (shutdown,
+  # lane disable, or watchdog kill). Lightning needs real time under DDP to
+  # flush a multi-GB `last.ckpt`; set generously.
+  shutdown_grace_seconds: 300
+
+# Dynamic lane control: while the orchestrator is running you can release GPUs
+# without losing W&B continuity or burning retry budget.
+#
+#   # release lane 2,3 (current job is SIGTERMed → checkpoints → re-queues)
+#   uv run python scripts/training/run_ablation.py --spec configs/ablation/loss_dropone.yaml --disable-lane "2,3"
+#
+#   # let the current job on 2,3 finish, but don't start anything new there
+#   uv run python scripts/training/run_ablation.py --spec configs/ablation/loss_dropone.yaml --drain-lane "2,3"
+#
+#   # give it back
+#   uv run python scripts/training/run_ablation.py --spec configs/ablation/loss_dropone.yaml --enable-lane "2,3"
+#
+# These subcommands edit <output_root>/control/lanes.json atomically and exit;
+# the running orchestrator re-reads the file each poll tick.
