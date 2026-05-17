@@ -5,7 +5,7 @@ description = "Mars HiRISE dataset manager for crater segmentation"
 requires-python = "==3.12.*"
 dependencies = [
     "aiohttp>=3.9",
-    "huggingface-hub>=1.8.0",
+    "huggingface-hub>=1.15.0",
     "pandas-stubs>=3.0.0.260204",
     "pdr>=1.4.1",
     "pyarrow>=23.0.1",
@@ -39,7 +39,7 @@ depthfm = [
     "lightning>=2.6.1",
     "litdata>=0.2.61",
     "matplotlib>=3.10.8",
-    "numpy>=2.4.4",
+    "numpy>=2.4.5",
     "omegaconf>=2.3.0",
     "opencv-python>=4.13.0.92",
     "pandas>=2.0.1",
@@ -50,7 +50,7 @@ depthfm = [
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
-    "tifffile>=2026.3.3",
+    "tifffile>=2026.5.15",
     "torch-shampoo",
     "torchdiffeq>=0.2.5",
     "torchmetrics>=1.9.0",
