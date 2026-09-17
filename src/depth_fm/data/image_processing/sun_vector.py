@@ -161,8 +161,11 @@ def estimate_sun_vector_irls(
 
         beta_new = torch.linalg.lstsq(H_w, Y_w).solution
 
-        if torch.norm(beta_new - beta, p=2) < tol:
-            beta = beta_new
+        change = torch.norm(beta_new - beta, p=2)
+        # Every successful solve becomes the next IRLS iterate, including
+        # the final update when the iteration budget is exhausted.
+        beta = beta_new
+        if change < tol:
             break
 
     k = beta[:3, 0]
