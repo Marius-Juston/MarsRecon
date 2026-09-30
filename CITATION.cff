@@ -1,0 +1,46 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: MarsRecon
+message: 'If you use this software, please cite it as below.'
+type: software
+authors:
+  - given-names: Marius
+    family-names: Juston
+    email: mjuston2@illinois.edu
+    orcid: 'https://orcid.org/0009-0005-7216-4180'
+    affiliation: CACMS
+  - given-names: Akshay
+    family-names: Naik
+    email: akshayn3@illinois.edu
+    orcid: 'https://orcid.org/0009-0001-2972-6249'
+    affiliation: CACMS
+identifiers:
+  - type: other
+    value: 'arXiv:2609.22379'
+    description: >-
+      MarsRecon: Self-Supervised and Multimodal Surface
+      Representations for Mars
+  - type: other
+    value: 'arXiv:2609.21095v1'
+    description: >-
+      MarsFM: Shading-Regularized Flow Matching for Martian
+      Relief Estimation
+repository-code: 'https://github.com/Marius-Juston/MarsRecon'
+url: 'https://marius-juston.github.io/MarsRecon/'
+abstract: >-
+  HiRISE (High Resolution Imaging Science Experiment) aboard
+  the Mars Reconnaissance Orbiter produces the
+  highest-resolution images of Mars available (~25 cm/pixel
+  RED, ~50 cm/pixel color). This library wraps the HiRISE
+  RDR ( Reduced Data Records) hosted on the NASA PDS Imaging
+  Node as a GeoDataset compatible with TorchGeo's samplers
+  and data loaders.
+keywords:
+  - Mars
+  - torchgeo
+  - HiRISE
+  - flow-matching
+  - clip
+  - digital-terrain mapping
